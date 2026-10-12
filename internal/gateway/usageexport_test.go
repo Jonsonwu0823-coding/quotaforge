@@ -3,15 +3,19 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/fakeupstream"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
 )
 
 // 用 QF 真实写出的日志做输入：日志格式一变，这里就会失败。
@@ -158,5 +162,55 @@ func TestExportUsageFormulaCells(t *testing.T) {
 		if want := values[i]; cell != "'"+want || strings.TrimPrefix(cell, "'") != want {
 			t.Errorf("%s = %q, want %q with one leading quote", col, cell, want)
 		}
+	}
+}
+
+// QF 的非调用日志行（导出出错、指标监听、后台循环、退出时冲刷失败）不能和调用行的字段同名、类型不同：
+// 混进调用日志之后，用量导出的结果不变、非法行为 0，对账读到的证据也不变。调用行新加的 trace_id、span_id、
+// invalid_reason 导出时忽略。
+func TestExportUsageIgnoresOtherLines(t *testing.T) {
+	h := newHarness(t)
+	h.chat(t, `{"model":"shared"}`, "traceparent", sampledParent)
+	h.chat(t, `{"model":"fake-no-usage"}`)
+	h.chat(t, `{"model":"shared","max_tokens":"x"}`)
+	waitFor(t, func() bool { return len(h.logs.lines(t)) == 3 })
+	calls := h.logs.String()
+	if !strings.Contains(calls, `"trace_id"`) || !strings.Contains(calls, `"invalid_reason"`) {
+		t.Fatalf("the call log lacks the new fields: %s", calls)
+	}
+
+	// 真的导出出错：收集端连不上，telemetry 写一行
+	var other syncBuffer
+	tel, flush := telemetry.Setup(config.Telemetry{OTLPEndpoint: "http://127.0.0.1:1", SampleRatio: 1, Instance: "t"},
+		telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} }), slog.New(slog.NewJSONHandler(&other, nil)))
+	_, span := tel.Tracer.Start(context.Background(), "s")
+	span.End()
+	_ = flush()
+	if !strings.Contains(other.String(), `"msg":"telemetry"`) {
+		t.Fatalf("no telemetry line: %q", other.String())
+	}
+	mixed := other.String() +
+		`{"time":"2026-10-12T00:00:00Z","level":"INFO","msg":"metrics","addr":"[::]:9464"}` + "\n" +
+		calls +
+		`{"time":"2026-10-12T00:00:00Z","level":"INFO","msg":"background","released":0,"marked_unknown":0,"purged":0,"unknown_scan_error":"x"}` + "\n" +
+		`{"time":"2026-10-12T00:00:00Z","level":"WARN","msg":"telemetry","error":"context deadline exceeded"}` + "\n"
+
+	var want, got bytes.Buffer
+	if invalid, err := ExportUsage(strings.NewReader(calls), &want); invalid != 0 || err != nil {
+		t.Fatalf("calls alone: invalid %d, %v", invalid, err)
+	}
+	if invalid, err := ExportUsage(strings.NewReader(mixed), &got); invalid != 0 || err != nil {
+		t.Fatalf("mixed: invalid %d, %v", invalid, err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("mixed export\n%s\nwant\n%s", got.String(), want.String())
+	}
+	wantProofs, wantUnknown, err := ReadCallLog(strings.NewReader(calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotProofs, gotUnknown, err := ReadCallLog(strings.NewReader(mixed))
+	if err != nil || gotUnknown != wantUnknown || len(gotProofs) != len(wantProofs) {
+		t.Fatalf("call log evidence: %d proofs, %d unknown, %v; want %d, %d", len(gotProofs), gotUnknown, err, len(wantProofs), wantUnknown)
 	}
 }

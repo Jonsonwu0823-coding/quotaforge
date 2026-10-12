@@ -1,0 +1,43 @@
+# 可观测的演示环境，叠加在 compose.yaml 之上（见 docs/observability.md）：
+#   docker compose -f compose.yaml -f compose.observability.yaml up -d --build --wait
+# 两个实例再叠 compose.two.yaml 和 compose.observability.two.yaml（顺序就是这样）。
+# QF 的指标在 9464 上，只在 Compose 的网络里给 qf-prometheus 抓，不发布到宿主机；span 以 OTLP/JSON 发给 qf-jaeger。
+# Jaeger 和 Prometheus 的界面只发布到本机的 127.0.0.1。服务名带 qf- 前缀：接进 QS 的网络时不和同名服务混淆。
+services:
+  quotaforge:
+    environment:
+      QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9464
+      QUOTAFORGE_OTLP_ENDPOINT: http://qf-jaeger:4318
+      QUOTAFORGE_INSTANCE: quotaforge
+    depends_on:
+      qf-jaeger:
+        condition: service_started # QF 起来时收集端可以还没好：之前的 span 导出失败，只记一行 telemetry 日志
+
+  # Jaeger v2 的 all-in-one：内存存储，接收 OTLP（4318 只在 Compose 的网络里），界面和查询 API 在 16686。
+  qf-jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - 127.0.0.1:16686:16686
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # Prometheus：每 5 秒抓一次，加载 deploy/prometheus/rules.yml。抓哪些实例由挂进来的 targets 文件决定。
+  qf-prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - ./deploy/prometheus/targets/quotaforge.json:/etc/prometheus/targets/quotaforge.json:ro
+    ports:
+      - 127.0.0.1:9090:9090
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]

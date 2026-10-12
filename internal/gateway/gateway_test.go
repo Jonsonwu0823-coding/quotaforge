@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,10 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/fakeupstream"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // 用库的测试按 dbtest 的规则跳过或强制；只用替身的测试不需要 MySQL。
@@ -45,6 +50,8 @@ type harness struct {
 	up       *httptest.Server
 	fake     *fakeupstream.Server
 	logs     *syncBuffer
+	spans    *tracetest.SpanRecorder
+	metrics  *telemetry.Metrics
 	mu       sync.Mutex
 	upBody   []byte
 	upHeader http.Header
@@ -63,10 +70,29 @@ func newHarnessWith(t *testing.T, l Ledger) *harness {
 	return newHarnessLimited(t, l, &stubLimiter{})
 }
 
-// newHarnessLimited 用给定的账本和限流器起 QF。
+// newHarnessLimited 用给定的账本和限流器起 QF。追踪开着、全量采样：结束的 span 在 h.spans 里，指标在 h.metrics 里。
 func newHarnessLimited(t *testing.T, l Ledger, lim Limiter) *harness {
 	t.Helper()
-	h := &harness{fake: fakeupstream.New(), logs: &syncBuffer{}}
+	return newHarnessTelemetry(t, l, lim, tracedAt(1))
+}
+
+// tracedAt 是追踪开着、没有上游 traceparent 时按 ratio 采样的 Telemetry，和生产用同一个 TracerProvider。
+func tracedAt(ratio float64) func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry {
+	return func(sp sdktrace.SpanProcessor, m *telemetry.Metrics) telemetry.Telemetry {
+		return telemetry.Enabled(telemetry.NewTracerProvider(sp, ratio, "test-instance"), m)
+	}
+}
+
+// untraced 是没配导出地址时的 Telemetry。
+func untraced(_ sdktrace.SpanProcessor, m *telemetry.Metrics) telemetry.Telemetry {
+	return telemetry.Disabled(m)
+}
+
+// newHarnessTelemetry 用给定的账本、限流器和 Telemetry 起 QF。
+func newHarnessTelemetry(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry) *harness {
+	t.Helper()
+	h := &harness{fake: fakeupstream.New(), logs: &syncBuffer{}, spans: tracetest.NewSpanRecorder(),
+		metrics: telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} })}
 	h.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -97,7 +123,7 @@ func newHarnessLimited(t *testing.T, l Ledger, lim Limiter) *harness {
 	dead.Close()
 
 	cfg := loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL)
-	h.qf = httptest.NewServer(WithRequestID(New(cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)))))
+	h.qf = httptest.NewServer(WithRequestID(New(cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))))
 	t.Cleanup(h.qf.Close)
 	return h
 }

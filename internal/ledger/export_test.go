@@ -6,6 +6,9 @@ import (
 	"time"
 )
 
+// UnknownBacklogQuery 给外部测试看 UnknownBacklog 用的查询（核对它走的索引）。
+const UnknownBacklogQuery = unknownBacklogQuery
+
 // PurgeBatches 给外部测试看清理怎么翻批：一轮开始时的前两批候选，每条是“账户号/键”。
 func (s *Store) PurgeBatches(ctx context.Context) (first, second []string, err error) {
 	t0, err := s.now(ctx, 2*time.Second)

@@ -8,6 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
+
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
@@ -47,10 +51,25 @@ func (g *gateway) upstreamRequest(c *call, body []byte) (*http.Request, *apiErro
 	return req, nil
 }
 
-// forward 把请求发给上游，不重试。超时从 ctx 派生，但不跟着客户端取消（有界结算）：请求一旦发出，
+// forward 把请求发给上游，包一个客户端 span，记下等上游的时间（QF 自身耗时 = 总耗时 − 它）。
+// 只把 ctx 用于 span：发给上游的请求头在 upstreamRequest 里定好，不注入 traceparent。
+func (g *gateway) forward(ctx context.Context, c *call, req *http.Request) (*ledger.Response, *apiError) {
+	span := g.step(ctx, "upstream", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attrUpstream.String(c.model.Upstream.Name), semconv.HTTPRequestMethodPost))
+	start := time.Now()
+	res, e := g.exchange(ctx, c, req)
+	c.upstreamDuration = time.Since(start)
+	if c.upstreamStatus != 0 {
+		span.SetAttributes(semconv.HTTPResponseStatusCode(c.upstreamStatus))
+	}
+	endStep(span, e)
+	return res, e
+}
+
+// exchange 把请求发给上游，不重试。超时从 ctx 派生，但不跟着客户端取消（有界结算）：请求一旦发出，
 // 就等到上游回答或超时，照常收尾，客户端断开了也一样。上游的请求号、模型名和用量记到 c 上。
 // 2xx 的应答原样交给客户端。
-func (g *gateway) forward(ctx context.Context, c *call, req *http.Request) (*ledger.Response, *apiError) {
+func (g *gateway) exchange(ctx context.Context, c *call, req *http.Request) (*ledger.Response, *apiError) {
 	upCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.Timeout(c.purpose))
 	defer cancel()
 	c.upstreamCalled = true

@@ -15,9 +15,9 @@ func TestParseRequestFindsModelValue(t *testing.T) {
 		{"{\"model\":\"a\"}\n\t ", "a", `"a"`, false},
 	}
 	for _, tc := range cases {
-		p, err := parseRequest([]byte(tc.body))
-		if err != nil {
-			t.Errorf("%s: %v", tc.body, err)
+		p, reason := parseRequest([]byte(tc.body))
+		if reason != "" {
+			t.Errorf("%s: %s", tc.body, reason)
 			continue
 		}
 		if p.model != tc.model || p.stream != tc.stream || tc.body[p.modelStart:p.modelEnd] != tc.value {
@@ -26,25 +26,34 @@ func TestParseRequestFindsModelValue(t *testing.T) {
 	}
 }
 
+// 每种不合格的请求体给出固定的原因（进调用日志的 invalid_reason），不是 encoding/json 的错误原文。
 func TestParseRequestRejects(t *testing.T) {
-	for _, body := range []string{
-		``, `null`, `"model"`, `[{"model":"a"}]`, `{"model":"a"`, `{"model":"a"}x`, `{"model":"a"}{}`,
-		`{}`, `{"model":""}`, `{"model":1}`, `{"model":null}`, `{"model":["a"]}`,
-		`{"model":"a","model":"a"}`, `{"model":"a","stream":true,"stream":false}`, `{"model":"a","stream":"true"}`,
+	cases := map[string]invalidReason{
+		``: reasonNotObject, `null`: reasonNotObject, `"model"`: reasonNotObject, `[{"model":"a"}]`: reasonNotObject,
+		`{"model":"a"`: reasonMalformedJSON, `{"model":"a","t":[1,}`: reasonMalformedJSON, `{"model":"a",}`: reasonMalformedJSON,
+		`{"model":"a"}x`: reasonTrailingData, `{"model":"a"}{}`: reasonTrailingData,
+		`{}`: reasonModelMissing, `{"model":""}`: reasonModelMissing,
+		`{"model":1}`: reasonModelNotString, `{"model":null}`: reasonModelNotString, `{"model":["a"]}`: reasonModelNotString,
+		`{"model":"a","model":"a"}`: reasonAmbiguousField, `{"model":"a","stream":true,"stream":false}`: reasonAmbiguousField,
 		// 只差大小写或 Unicode 折叠（ſ 折叠成 s）的变体键
-		`{"model":"a","MODEL":"b"}`, `{"Model":"a"}`, `{"model":"a","stream":false,"ſtream":true}`, `{"model":"a","t":[1,}`,
-	} {
-		if _, err := parseRequest([]byte(body)); err == nil {
-			t.Errorf("parseRequest(%q) succeeded, want an error", body)
+		`{"model":"a","MODEL":"b"}`: reasonAmbiguousField, `{"Model":"a"}`: reasonAmbiguousField,
+		`{"model":"a","stream":false,"ſtream":true}`: reasonAmbiguousField,
+		`{"model":"a","stream":"true"}`:              reasonStreamNotBoolean,
+		`{"model":"a","max_tokens":1.5}`:             reasonMaxTokensInvalid, `{"model":"a","max_tokens":-1}`: reasonMaxTokensInvalid,
+		`{"model":"a","max_tokens":"8"}`: reasonMaxTokensInvalid, `{"model":"a","max_tokens":2147483648}`: reasonMaxTokensInvalid,
+	}
+	for body, want := range cases {
+		if _, got := parseRequest([]byte(body)); got != want {
+			t.Errorf("parseRequest(%q) = %q, want %q", body, got, want)
 		}
 	}
 }
 
 func TestWithModelChangesOnlyTheValue(t *testing.T) {
 	body := []byte(`{ "a" : "<&>",  "model" :  "alias" , "b":[1, 2.50] }`)
-	p, err := parseRequest(body)
-	if err != nil {
-		t.Fatal(err)
+	p, reason := parseRequest(body)
+	if reason != "" {
+		t.Fatal(reason)
 	}
 	// 上游模型名先做 JSON 编码再写进去。
 	got := string(p.withModel(body, `up"<x>`))

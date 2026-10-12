@@ -262,13 +262,18 @@ func baseURL(literal, envName string, getenv func(string) string) (string, error
 			return "", fmt.Errorf("environment variable %s is not set", envName)
 		}
 	}
-	u, err := url.Parse(literal)
+	return plainURL("base URL", literal)
+}
+
+// plainURL 校验一个 HTTP 服务的地址（上游的 base URL、OTLP 的地址），返回去掉末尾 / 的值。
+// 报错只说是哪一项，不回显地址：里面可能有凭据。
+func plainURL(what, s string) (string, error) {
+	u, err := url.Parse(s)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
 		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		// 不回显地址：里面可能有凭据。
-		return "", errors.New("base URL must be http(s)://host[:port][/path] without credentials, query or fragment")
+		return "", fmt.Errorf("%s must be http(s)://host[:port][/path] without credentials, query or fragment", what)
 	}
-	return strings.TrimRight(literal, "/"), nil
+	return strings.TrimRight(s, "/"), nil
 }
 
 // Secret 取一个机密值（上游 Key、数据库连接串、Redis 地址）：envName（环境变量名）和 file（文件路径）正好给一个。

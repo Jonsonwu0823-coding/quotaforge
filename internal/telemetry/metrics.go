@@ -1,0 +1,122 @@
+package telemetry
+
+import (
+	"database/sql"
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// OverheadSLOSeconds 是延迟 SLO 的门槛：QF 自身耗时不超过它的请求算好。它必须正好是 qf_overhead_seconds 的一个桶边界，
+// SLI 直接按这个桶算，不靠插值（deploy/prometheus/rules.yml 里写的是同一个数）。
+const OverheadSLOSeconds = 0.25
+
+// Metrics 是 QF 的全部指标，名字、标签和桶只在这里定义。标签的值只取固定集合或配置里的名字（接口、HTTP 状态、错误码、
+// 上游名、结局），不用账户、Key、run、调用号，也不用客户端给的原始字符串。
+// 用自己的注册表，不用全局默认的：库不会悄悄挂上别的指标。
+type Metrics struct {
+	reg *prometheus.Registry
+
+	Requests         *prometheus.CounterVec   // endpoint, status, code
+	RequestDuration  *prometheus.HistogramVec // endpoint
+	Overhead         *prometheus.HistogramVec // endpoint
+	UpstreamRequests *prometheus.CounterVec   // upstream, endpoint, result
+	UpstreamDuration *prometheus.HistogramVec // upstream, endpoint
+	Calls            *prometheus.CounterVec   // endpoint, outcome
+	UsageTokens      *prometheus.CounterVec   // endpoint, upstream, type
+	Replays          *prometheus.CounterVec   // endpoint
+	RateLimited      *prometheus.CounterVec   // layer, metric
+	DependencyErrors *prometheus.CounterVec   // dependency, operation
+
+	Reclaimed             *prometheus.CounterVec // result
+	Purged                prometheus.Counter
+	BackgroundErrors      *prometheus.CounterVec // task
+	BackgroundLastSuccess prometheus.Gauge
+	BackgroundInterval    prometheus.Gauge
+	UnknownCalls          prometheus.Gauge
+	UnknownOldestAge      prometheus.Gauge
+
+	TraceErrors prometheus.Counter
+}
+
+// 总耗时和上游耗时的桶：chat 的中位数几秒，上游超时默认 25 秒。
+var slowBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 15, 20, 25, 30}
+
+// QF 自身耗时的桶：没有竞争时约 12 毫秒，OverheadSLOSeconds 是其中一个边界。
+var overheadBuckets = []float64{.001, .0025, .005, .01, .025, .05, .1, OverheadSLOSeconds, .5, 1, 2.5}
+
+// NewMetrics 建好全部指标。dbStats 是账本连接池的统计（ledger.Store.Stats），每次抓取时读。
+func NewMetrics(dbStats func() sql.DBStats) *Metrics {
+	m := &Metrics{reg: prometheus.NewRegistry()}
+	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
+		v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
+		m.reg.MustRegister(v)
+		return v
+	}
+	histogram := func(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
+		v := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
+		m.reg.MustRegister(v)
+		return v
+	}
+	gauge := func(name, help string) prometheus.Gauge {
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
+		m.reg.MustRegister(g)
+		return g
+	}
+
+	m.Requests = counter("qf_requests_total", "Requests by endpoint, HTTP status written (0: the client was gone) and error code.",
+		"endpoint", "status", "code")
+	m.RequestDuration = histogram("qf_request_duration_seconds", "Total time of a request.", slowBuckets, "endpoint")
+	m.Overhead = histogram("qf_overhead_seconds", "Time of a request spent in QF itself: the total minus the wait for the upstream.",
+		overheadBuckets, "endpoint")
+	m.UpstreamRequests = counter("qf_upstream_requests_total", "Upstream calls by result: ok or the upstream error code.",
+		"upstream", "endpoint", "result")
+	m.UpstreamDuration = histogram("qf_upstream_duration_seconds", "Time from sending an upstream request to reading its whole body.",
+		slowBuckets, "upstream", "endpoint")
+	m.Calls = counter("qf_calls_total", "Reserved calls by the gateway's outcome: settled, cancelled or usage_unknown.",
+		"endpoint", "outcome")
+	m.UsageTokens = counter("qf_usage_tokens_total", "Tokens of settled calls; calls with unknown usage are counted in qf_calls_total, not here.",
+		"endpoint", "upstream", "type")
+	m.Replays = counter("qf_idempotent_replays_total", "Requests answered with the stored response of an earlier call.", "endpoint")
+	m.RateLimited = counter("qf_rate_limited_total", "Requests denied by a rate limit bucket.", "layer", "metric")
+	m.DependencyErrors = counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations.", "dependency", "operation")
+
+	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
+	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()
+	m.BackgroundErrors = counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge or unknown_scan.", "task")
+	m.BackgroundLastSuccess = gauge("qf_background_last_success_timestamp_seconds", "When the last background round without errors finished.")
+	m.BackgroundInterval = gauge("qf_background_interval_seconds", "Interval between background rounds.")
+	m.UnknownCalls = gauge("qf_unknown_usage_calls", "Calls with unknown usage that still hold their reservation.")
+	m.UnknownOldestAge = gauge("qf_unknown_usage_oldest_age_seconds", "Age of the oldest call with unknown usage; 0 when there is none.")
+
+	m.TraceErrors = counter("qf_trace_export_errors_total", "Errors reported by the tracing SDK, mostly failed span exports.").WithLabelValues()
+
+	m.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m.registerDBStats(dbStats)
+	return m
+}
+
+// registerDBStats 导出账本连接池的统计。ledger.Store 不暴露 *sql.DB，所以不用 collectors.NewDBStatsCollector，
+// 每个数一个函数，抓取时读 Stats()。
+func (m *Metrics) registerDBStats(stats func() sql.DBStats) {
+	gauge := func(name, help string, f func(sql.DBStats) float64) {
+		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
+	}
+	counter := func(name, help string, f func(sql.DBStats) float64) {
+		m.reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
+	}
+	gauge("qf_db_open_connections", "Open ledger connections.", func(s sql.DBStats) float64 { return float64(s.OpenConnections) })
+	gauge("qf_db_in_use_connections", "Ledger connections in use.", func(s sql.DBStats) float64 { return float64(s.InUse) })
+	gauge("qf_db_idle_connections", "Idle ledger connections.", func(s sql.DBStats) float64 { return float64(s.Idle) })
+	gauge("qf_db_max_open_connections", "Maximum open ledger connections.", func(s sql.DBStats) float64 { return float64(s.MaxOpenConnections) })
+	counter("qf_db_wait_count_total", "Times a request waited for a ledger connection.", func(s sql.DBStats) float64 { return float64(s.WaitCount) })
+	counter("qf_db_wait_duration_seconds_total", "Total time spent waiting for a ledger connection.",
+		func(s sql.DBStats) float64 { return s.WaitDuration.Seconds() })
+}
+
+// Handler 是 /metrics：Prometheus 的文本格式。
+func (m *Metrics) Handler() http.Handler {
+	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
+}

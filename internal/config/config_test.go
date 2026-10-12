@@ -415,3 +415,56 @@ func TestDeployConfigs(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadTelemetry(t *testing.T) {
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok := []struct {
+		env  map[string]string
+		want Telemetry
+	}{
+		{nil, Telemetry{SampleRatio: 1}},
+		{map[string]string{"QUOTAFORGE_METRICS_ADDR": "0.0.0.0:9464"}, Telemetry{MetricsAddr: "0.0.0.0:9464", SampleRatio: 1}},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://qf-jaeger:4318/"},
+			Telemetry{OTLPEndpoint: "http://qf-jaeger:4318", SampleRatio: 1, Instance: host}},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "https://c.test/otlp", "QUOTAFORGE_TRACE_SAMPLE_RATIO": "0.25", "QUOTAFORGE_INSTANCE": "qf-b"},
+			Telemetry{OTLPEndpoint: "https://c.test/otlp", SampleRatio: 0.25, Instance: "qf-b"}},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://c:4318", "QUOTAFORGE_TRACE_SAMPLE_RATIO": "0"},
+			Telemetry{OTLPEndpoint: "http://c:4318", SampleRatio: 0, Instance: host}},
+	}
+	for _, tc := range ok {
+		got, err := LoadTelemetry(env(tc.env))
+		if err != nil || got != tc.want {
+			t.Errorf("%v: got %+v, %v; want %+v", tc.env, got, err, tc.want)
+		}
+	}
+	// 报错说明是哪个变量，不带它的值（地址里可能有凭据）。
+	bad := []struct {
+		env      map[string]string
+		variable string
+	}{
+		{map[string]string{"QUOTAFORGE_METRICS_ADDR": "9464-SECRET"}, "QUOTAFORGE_METRICS_ADDR"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://u:xxx@c:4318"}, "QUOTAFORGE_OTLP_ENDPOINT"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "c:4318-SECRET"}, "QUOTAFORGE_OTLP_ENDPOINT"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://c:4318?k=SECRET"}, "QUOTAFORGE_OTLP_ENDPOINT"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://c:4318", "QUOTAFORGE_TRACE_SAMPLE_RATIO": "1.5"}, "QUOTAFORGE_TRACE_SAMPLE_RATIO"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://c:4318", "QUOTAFORGE_TRACE_SAMPLE_RATIO": "NaN"}, "QUOTAFORGE_TRACE_SAMPLE_RATIO"},
+		{map[string]string{"QUOTAFORGE_OTLP_ENDPOINT": "http://c:4318", "QUOTAFORGE_TRACE_SAMPLE_RATIO": "-0.1"}, "QUOTAFORGE_TRACE_SAMPLE_RATIO"},
+		{map[string]string{"QUOTAFORGE_TRACE_SAMPLE_RATIO": "0.5"}, "QUOTAFORGE_OTLP_ENDPOINT"},
+		{map[string]string{"QUOTAFORGE_INSTANCE": "qf-b"}, "QUOTAFORGE_OTLP_ENDPOINT"},
+	}
+	for _, tc := range bad {
+		_, err := LoadTelemetry(env(tc.env))
+		if err == nil || !strings.Contains(err.Error(), tc.variable) {
+			t.Errorf("%v: err = %v, want one naming %s", tc.env, err, tc.variable)
+			continue
+		}
+		for _, v := range tc.env {
+			if strings.Contains(err.Error(), v) {
+				t.Errorf("%v: err = %v, shows the value", tc.env, err)
+			}
+		}
+	}
+}

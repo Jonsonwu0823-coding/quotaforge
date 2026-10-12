@@ -1,6 +1,12 @@
 # 开发和测试
 
-Go 1.27.1。直接依赖只有两个：MySQL 驱动 `github.com/go-sql-driver/mysql` 和 Redis 客户端 `github.com/redis/go-redis/v9`；间接依赖是 `filippo.io/edwards25519`（驱动的 ed25519 认证插件用）、`github.com/cespare/xxhash/v2`、`go.uber.org/atomic`、`golang.org/x/sys`。都 vendor 在 `vendor/` 里，许可证文件随依赖保留。构建时不联网下载模块。
+Go 1.27.1。直接依赖：
+
+- MySQL 驱动 `github.com/go-sql-driver/mysql`、Redis 客户端 `github.com/redis/go-redis/v9`；
+- 追踪：OpenTelemetry 的 Go SDK（`go.opentelemetry.io/otel`、`otel/trace`、`otel/sdk`，v1.46.0）和它用的 `github.com/go-logr/logr`。导出器是自己写的 OTLP/JSON，不用官方的（它带进 gRPC），见[可观测](observability.md#导出)；
+- 指标：`github.com/prometheus/client_golang`（v1.24.1）。
+
+间接依赖是它们带进来的（`go.mod` 里标着 `// indirect`）。都 vendor 在 `vendor/` 里，许可证文件随依赖保留。构建时不联网下载模块。
 
 本机跑测试：
 

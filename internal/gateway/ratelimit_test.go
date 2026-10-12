@@ -21,19 +21,19 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ratelimit"
 )
 
-// trace 记下限流器和账本被调用的先后。
-type trace struct {
+// callOrder 记下限流器和账本被调用的先后。
+type callOrder struct {
 	mu    sync.Mutex
 	steps []string
 }
 
-func (tr *trace) add(s string) {
+func (tr *callOrder) add(s string) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	tr.steps = append(tr.steps, s)
 }
 
-func (tr *trace) get() []string {
+func (tr *callOrder) get() []string {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
 	return slices.Clone(tr.steps)
@@ -43,7 +43,7 @@ func (tr *trace) get() []string {
 type stubLimiter struct {
 	denial              *ratelimit.Denial
 	admitErr, adjustErr error
-	trace               *trace
+	trace               *callOrder
 
 	mu      sync.Mutex
 	admits  [][]ratelimit.Bucket
@@ -96,7 +96,7 @@ func (s *stubLimiter) calls() (admits, adjusts [][]ratelimit.Bucket) {
 type rated struct {
 	Ledger
 	key, account ledger.Rate
-	trace        *trace
+	trace        *callOrder
 }
 
 func (r *rated) KeyByHash(ctx context.Context, hash string) (*ledger.Key, error) {
@@ -147,7 +147,7 @@ func TestBuckets(t *testing.T) {
 
 // 准入在预留之前；结算之后修正 TPM 桶。
 func TestAdmissionBeforeReservation(t *testing.T) {
-	tr := &trace{}
+	tr := &callOrder{}
 	lim := &stubLimiter{trace: tr}
 	h := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates, trace: tr}, lim)
 	if r := h.chat(t, `{"model":"shared"}`); r.status != 200 {
@@ -175,7 +175,7 @@ func TestAdmissionRejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tr := &trace{}
+			tr := &callOrder{}
 			tc.lim.trace = tr
 			h := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates, trace: tr}, tc.lim)
 			r := h.chat(t, `{"model":"shared"}`)
@@ -572,7 +572,7 @@ func TestRedisHangsGives503(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lim.Close()
-	tr := &trace{}
+	tr := &callOrder{}
 	h := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates, trace: tr}, lim)
 	start := time.Now()
 	r := h.chat(t, `{"model":"shared"}`)

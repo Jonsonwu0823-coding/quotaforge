@@ -35,8 +35,9 @@ flowchart LR
 | M2 额度和幂等 | MySQL 额度账本（预留、结算、释放，`qfctl verify` 校验不变量）；`Idempotency-Key` 的重放、422、409（[额度和账本](docs/ledger.md#额度和账本)、[幂等](docs/api.md#幂等idempotency-key)） |
 | M3 未知用量 | 发送意图、后台回收、调用状态查询 `GET /v1/calls/{id}`，凭账单或日志用 `qfctl reconcile` 对账（[调用状态、回收和对账](docs/ledger.md#调用状态回收和对账未知用量)） |
 | M4 限流和多实例 | Redis 共享令牌桶（Key、账户、上游三层的 RPM、TPM）；两个实例的跨进程检查和压测（[限流](docs/rate-limiting.md)、[两个实例和压测](docs/scaling.md)） |
+| M5 可观测 | OpenTelemetry 追踪（一次调用一棵 span 树，接收 W3C `traceparent`）、Prometheus 指标、SLO 和告警规则、日志按调用号和 `trace_id` 关联；Jaeger 加 Prometheus 的演示环境（[可观测](docs/observability.md)） |
 
-计划中：可观测（指标）、流式、多上游与熔断、Embedding 缓存、用量事件。
+计划中：流式、多上游与熔断、Embedding 缓存、用量事件。
 
 ## 快速开始
 
@@ -67,8 +68,9 @@ docker compose down -v
 | [接口和幂等](docs/api.md) | 接口、错误码、用 curl 调用、`Idempotency-Key` |
 | [额度、账本和未知用量](docs/ledger.md) | 估算、预留、结算，锁的顺序，账本的不变量；调用状态、回收、对账、调用状态查询；数据库和迁移；用量导出 |
 | [限流](docs/rate-limiting.md) | 三层令牌桶、Lua 脚本、TPM 的修正、Redis 不可用时的行为 |
-| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、配置文件、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
+| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
 | [两个实例和压测](docs/scaling.md) | 两个实例怎么共享状态、跨实例的检查、压测方法和结果 |
+| [可观测](docs/observability.md) | span 树、日志关联、指标清单、SLO 和告警、Jaeger 加 Prometheus 的演示环境 |
 | [接 QueryShield](docs/queryshield.md) | 网络和配置、端到端联调、经 QS 的真实演示和对账 |
 | [开发和测试](docs/development.md) | Go 版本和依赖、跑测试、测试库 |
 

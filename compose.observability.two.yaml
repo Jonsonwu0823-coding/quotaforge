@@ -1,0 +1,17 @@
+# 第二个实例的观测设置，叠在 compose.two.yaml 和 compose.observability.yaml 之后：
+#   docker compose -f compose.yaml -f compose.observability.yaml -f compose.two.yaml -f compose.observability.two.yaml up -d --build --wait
+# quotaforge-b 用 extends 从 compose.yaml 带设置，看不到 compose.observability.yaml 给 quotaforge 加的，所以在这里另写一份；
+# Prometheus 多挂一个 targets 文件，开始抓它。
+services:
+  quotaforge-b:
+    environment:
+      QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9464
+      QUOTAFORGE_OTLP_ENDPOINT: http://qf-jaeger:4318
+      QUOTAFORGE_INSTANCE: quotaforge-b
+    depends_on:
+      qf-jaeger:
+        condition: service_started
+
+  qf-prometheus:
+    volumes:
+      - ./deploy/prometheus/targets/quotaforge-b.json:/etc/prometheus/targets/quotaforge-b.json:ro

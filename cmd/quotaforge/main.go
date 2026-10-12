@@ -16,6 +16,7 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/gateway"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ratelimit"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
 )
 
 const defaultAddr = "127.0.0.1:8080"
@@ -122,6 +123,11 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+	telCfg, err := config.LoadTelemetry(os.Getenv)
+	if err != nil {
+		slog.Error("config", "err", err)
+		os.Exit(1)
+	}
 
 	store, err := openLedger(context.Background(), cfg)
 	if err != nil {
@@ -143,22 +149,47 @@ func main() {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
 	}
+	metrics := telemetry.NewMetrics(store.Stats)
+	if telCfg.MetricsAddr != "" {
+		mln, err := net.Listen("tcp", telCfg.MetricsAddr)
+		if err != nil {
+			slog.Error("listen", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("metrics", "addr", mln.Addr().String())
+		defer serveMetrics(mln, metrics)()
+	}
+	tel, flushSpans := telemetry.Setup(telCfg, metrics, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 后台循环和 HTTP 服务一起停：收到退出信号后，等两者都结束才关账本（defer store.Close）。
+	// 退出的顺序：在途请求处理完（最多 ShutdownTimeout）、后台循环也停下之后，才把还没导出的 span 发完（最多
+	// telemetry.FlushTimeout，不占在途请求的时间；到点没发完的 span 丢掉，账本在这之前已经收完尾）；
+	// 然后关指标的监听（排空期间 Prometheus 仍能抓），最后关 Redis 和账本（defer）。
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, logger)
+		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, logger, metrics)
 	}()
 	slog.Info("listening", "addr", ln.Addr().String())
-	err = run(ctx, ln, newHandler(gateway.New(cfg, store, limiter, logger)), cfg.ShutdownTimeout())
+	err = run(ctx, ln, newHandler(gateway.New(cfg, store, limiter, logger, tel)), cfg.ShutdownTimeout())
 	stop()
 	<-done
+	if ferr := flushSpans(); ferr != nil {
+		slog.Warn("telemetry", "error", ferr.Error())
+	}
 	if err != nil {
 		slog.Error("run", "err", err)
 		os.Exit(1)
 	}
+}
+
+// serveMetrics 在 ln 上另起一个只有 GET /metrics 的服务，不放在对外的监听地址上。返回的函数关掉它（立即，不等正在进行的抓取）。
+func serveMetrics(ln net.Listener, m *telemetry.Metrics) (stop func()) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	return func() { _ = srv.Close() }
 }

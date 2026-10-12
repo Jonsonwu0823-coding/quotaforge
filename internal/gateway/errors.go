@@ -93,10 +93,11 @@ type errorBody struct {
 	} `json:"error"`
 }
 
-// writeError 写出 OpenAI 格式的错误体，并把错误码记到本次调用上。
+// writeError 写出 OpenAI 格式的错误体，并把错误码记到本次调用上。没有状态码的错误（客户端已经断开）不写回。
 func writeError(w http.ResponseWriter, c *call, e *apiError) {
 	c.errorCode = e.code
 	if e.status == 0 {
+		c.clientDisconnected = true
 		return
 	}
 	c.status = e.status

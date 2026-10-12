@@ -25,6 +25,7 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/fakeupstream"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
 )
 
 // qfProcess 是一个当 QF 跑起来的子进程（就是这个测试二进制，见 TestMain）。
@@ -217,7 +218,7 @@ func TestBackgroundLoop(t *testing.T) {
 	loopCtx, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
-		background(loopCtx, store, after, time.Hour, slog.New(slog.NewJSONHandler(&logs, nil)))
+		background(loopCtx, store, after, time.Hour, slog.New(slog.NewJSONHandler(&logs, nil)), telemetry.NewMetrics(store.Stats))
 		close(done)
 	}()
 	waitUntil(t, 10*time.Second, func() bool {
@@ -277,7 +278,7 @@ func TestBackgroundPurgeDeadlineIsNotAnError(t *testing.T) {
 	var logs syncLog
 	rounds, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	background(rounds, store, time.Hour, time.Nanosecond, slog.New(slog.NewJSONHandler(&logs, nil)))
+	background(rounds, store, time.Hour, time.Nanosecond, slog.New(slog.NewJSONHandler(&logs, nil)), telemetry.NewMetrics(store.Stats))
 	if n := left(); n != backlog {
 		t.Fatalf("%d keys left after rounds whose deadline had passed, want all %d untouched", n, backlog)
 	}
@@ -289,7 +290,7 @@ func TestBackgroundPurgeDeadlineIsNotAnError(t *testing.T) {
 	loopCtx, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
-		background(loopCtx, store, time.Hour, time.Hour, slog.New(slog.NewJSONHandler(&next, nil)))
+		background(loopCtx, store, time.Hour, time.Hour, slog.New(slog.NewJSONHandler(&next, nil)), telemetry.NewMetrics(store.Stats))
 		close(done)
 	}()
 	waitUntil(t, 10*time.Second, func() bool { return left() == 0 })
@@ -388,7 +389,7 @@ func TestBackgroundLogsPoolWaits(t *testing.T) {
 	var logs syncLog
 	rounds, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	background(rounds, store, time.Hour, 50*time.Millisecond, slog.New(slog.NewJSONHandler(&logs, nil)))
+	background(rounds, store, time.Hour, 50*time.Millisecond, slog.New(slog.NewJSONHandler(&logs, nil)), telemetry.NewMetrics(store.Stats))
 	var pool []int64 // 每一行 db_pool 的等待次数
 	for _, l := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
 		var line struct {

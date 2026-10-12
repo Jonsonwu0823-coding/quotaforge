@@ -696,3 +696,55 @@ func TestReclaimBadCalls(t *testing.T) {
 	}
 	dbtest.Verify(t, f.s)
 }
+
+// UnknownBacklog 数全部账户里还占着预留的未知用量调用，给出最早一条的年龄；查询走 calls_status_created，不扫全表。
+// 库是各个测试共用的（以前跑的这个测试也会留下更老的）：只能断言“至少有自己这一条”“最早的不比自己这条新”。
+func TestUnknownBacklog(t *testing.T) {
+	f := newFixture(t, 1000)
+	r := f.reserve(t, 10)
+	f.finish(t, r, ledger.UsageUnknown, 0)
+	const age = 10 * 365 * 24 * time.Hour // 比别的测试造的都老
+	f.age(t, r, age)
+	other := f.reserve(t, 10)
+	f.finish(t, other, ledger.Settled, 5)
+	f.age(t, other, 2*age) // 已经结算的，再老也不算
+
+	n, oldest, err := f.s.UnknownBacklog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 上界：结算过的那条（两倍年龄）不能算进来；以前留下的未知调用也只比 age 老几天
+	if n < 1 || oldest < int64(age.Seconds())-60 || oldest > int64(1.5*age.Seconds()) {
+		t.Fatalf("backlog %d calls, oldest %d s; want at least 1 and about %d s", n, oldest, int64(age.Seconds()))
+	}
+	if key := explainKey(t, f.admin, ledger.UnknownBacklogQuery); key != "calls_status_created" {
+		t.Fatalf("the query uses index %q, want calls_status_created", key)
+	}
+	dbtest.Verify(t, f.s)
+}
+
+// explainKey 是 EXPLAIN 给出的查询所用的索引（key 列）；没有用索引时为空。
+func explainKey(t *testing.T, db *sql.DB, query string) string {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN " + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	key := ""
+	for rows.Next() {
+		vals := make([]sql.RawBytes, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		if i := slices.Index(cols, "key"); i >= 0 && vals[i] != nil {
+			key = string(vals[i])
+		}
+	}
+	return key
+}

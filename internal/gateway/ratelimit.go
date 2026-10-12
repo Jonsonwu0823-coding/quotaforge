@@ -41,20 +41,22 @@ func buckets(c *call) []ratelimit.Bucket {
 
 // admit 是准入，在预留之前：被限流的请求不碰账本。一个桶都没有就不碰 Redis。
 // 被拒是 429（带 Retry-After），Redis 出错或超时是 503：不放行。
-func (g *gateway) admit(ctx context.Context, c *call) *apiError {
+func (g *gateway) admit(ctx context.Context, c *call) (e *apiError) {
 	bs := buckets(c)
 	if len(bs) == 0 {
 		return nil
 	}
+	span := g.step(ctx, "admit")
+	defer func() { endStep(span, e) }()
 	lctx, cancel := limiterContext(ctx)
 	defer cancel()
 	denial, err := g.limiter.Admit(lctx, bs)
 	switch {
 	case err != nil:
-		c.rateLimiterError = err.Error()
+		g.limiterFailed(c, "admit", err)
 		return errRateLimiterUnavailable
 	case denial != nil:
-		c.rateLimitedBy = denial.Bucket.Name()
+		c.deniedBy = &denial.Bucket
 		return errRateLimited.withRetryAfter(strconv.Itoa(denial.RetryAfter))
 	}
 	c.admitted = bs
@@ -95,9 +97,13 @@ func (g *gateway) adjust(ctx context.Context, c *call) {
 	if len(tpm) == 0 {
 		return
 	}
+	span := g.step(ctx, "adjust")
 	lctx, cancel := limiterContext(ctx)
 	defer cancel()
 	if err := g.limiter.Adjust(lctx, tpm); err != nil {
-		c.rateLimiterError = err.Error()
+		g.limiterFailed(c, "adjust", err)
+		endStep(span, errRateLimiterUnavailable)
+		return
 	}
+	endStep(span, nil)
 }

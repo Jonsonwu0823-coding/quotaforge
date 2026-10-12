@@ -43,23 +43,34 @@ type resolutionBody struct {
 // 属于别的账户、不存在、调用号格式不对都是同一个 404，不透露调用是否存在。不预留、不调上游，日志也不算一次调用。
 func (g *gateway) lookup(w http.ResponseWriter, r *http.Request) {
 	c := &call{id: r.Context().Value(requestIDKey{}).(string), start: time.Now()}
-	id := r.PathValue("id")
-	defer g.logLookup(c, id)
-	if e := g.authenticate(r, c); e != nil {
+	if id := r.PathValue("id"); ledger.ValidCallID(id) {
+		c.lookupOf = id
+	}
+	defer g.record(c, "calls", g.logLookup)
+	e := g.authenticate(r, c)
+	ctx := g.startTrace(r, c, lookupRoute, e)
+	switch {
+	case e != nil:
 		writeError(w, c, e)
-		return
-	}
-	if !ledger.ValidCallID(id) {
+	case c.lookupOf == "":
 		writeError(w, c, errCallNotFound)
-		return
+	default:
+		g.lookupCall(ctx, w, c)
 	}
-	ctx, cancel := ledgerContext(r.Context())
+}
+
+// lookupCall 查账本，写回调用状态或 404。
+func (g *gateway) lookupCall(ctx context.Context, w http.ResponseWriter, c *call) {
+	span := g.step(ctx, "lookup_call")
+	lctx, cancel := ledgerContext(ctx)
 	defer cancel()
-	info, err := g.ledger.Call(ctx, c.key.AccountID, id)
+	info, err := g.ledger.Call(lctx, c.key.AccountID, c.lookupOf)
 	switch {
 	case err != nil:
-		c.ledgerError = err.Error()
+		g.ledgerFailed(c, "lookup_call", err)
+		endStep(span, errLedgerUnavailable)
 		writeError(w, c, errLedgerUnavailable)
+		return
 	case info == nil:
 		writeError(w, c, errCallNotFound)
 	default:
@@ -67,6 +78,7 @@ func (g *gateway) lookup(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(newCallBody(info))
 	}
+	endStep(span, nil)
 }
 
 func newCallBody(c *ledger.CallInfo) callBody {
@@ -96,14 +108,15 @@ func nonEmpty(s string) *string {
 
 // logLookup 每次查询写一行，msg 是 lookup，不是 call：usage-export 和 reconcile -log 都不把它当成一次模型调用。
 // 被查的调用号只记格式合格的。
-func (g *gateway) logLookup(c *call, id string) {
+func (g *gateway) logLookup(c *call, d time.Duration) {
 	attrs := []slog.Attr{
 		slog.String("request_id", c.id),
 		slog.String("endpoint", "calls"),
-		slog.Int64("duration_ms", time.Since(c.start).Milliseconds()),
+		slog.Int64("duration_ms", d.Milliseconds()),
 	}
-	if ledger.ValidCallID(id) {
-		attrs = append(attrs, slog.String("call_id", id))
+	attrs = traceAttrs(attrs, c)
+	if c.lookupOf != "" {
+		attrs = append(attrs, slog.String("call_id", c.lookupOf))
 	}
 	if c.status != 0 {
 		attrs = append(attrs, slog.Int("status", c.status))

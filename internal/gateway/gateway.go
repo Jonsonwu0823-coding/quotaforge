@@ -14,6 +14,7 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
 )
 
 // 请求体上限。QS 最大的请求（约 11,500 字的系统消息、上下文和 6 个工具）远小于它。
@@ -49,27 +50,36 @@ type gateway struct {
 	limiter        Limiter
 	client         *http.Client
 	log            *slog.Logger
+	tel            telemetry.Telemetry
 	quotaExhausted *apiError // 带上按配置算好的 Retry-After
 }
 
 // New 返回两个转发接口和调用状态查询的路由。外面要套 WithRequestID。
-func New(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger) http.Handler {
-	g := &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), log: log,
+func New(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger, tel telemetry.Telemetry) http.Handler {
+	g := &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), log: log, tel: tel,
 		quotaExhausted: errQuotaExhausted.withRetryAfter(retryAfterSeconds(cfg))}
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/chat/completions", g.endpoint(config.Chat))
-	mux.Handle("POST /v1/embeddings", g.endpoint(config.Embeddings))
-	mux.HandleFunc("GET /v1/calls/{id}", g.lookup)
+	mux.Handle("POST "+chatRoute, g.endpoint(config.Chat, chatRoute))
+	mux.Handle("POST "+embeddingsRoute, g.endpoint(config.Embeddings, embeddingsRoute))
+	mux.HandleFunc("GET "+lookupRoute, g.lookup)
 	return mux
 }
 
-// endpoint 是一次调用的全部步骤：鉴权、解析、检查模型、估算、校验幂等键（prepare）→ 准入（限流）→ 预留 → 落发送意图 → 转发
-// → 收尾 → 写回 → 修正限流的 TPM 桶 → 写日志。
+// 路由：注册路由和 span 的名字、http.route 属性用同一份。
+const (
+	chatRoute       = "/v1/chat/completions"
+	embeddingsRoute = "/v1/embeddings"
+	lookupRoute     = "/v1/calls/{id}"
+)
+
+// endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、估算、校验幂等键（prepare）→ 准入（限流）→ 预留 → 落发送意图 → 转发
+// → 收尾 → 写回（deliver）→ 修正限流的 TPM 桶 → 记录（日志、指标、根 span）。
+// 鉴权之后才建根 span（见 startTrace），之后的每一步都挂在它下面。
 // 收尾在写回之前：客户端拿到响应时，账本已经记好了。带幂等键、可以重放时，预留这一步直接给出原来的响应。
 // 请求发出之后不再看客户端：断开了也等上游回答或超时，照常收尾（有界结算），只是不写回。
 // 修正在 defer 里，覆盖准入之后的每个出口；它在 handler 返回之前执行，所以响应要等它做完才发完（通常约 1 毫秒，
 // 最多 config.RateLimitTimeout）。
-func (g *gateway) endpoint(p config.Purpose) http.HandlerFunc {
+func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c := &call{
 			id:              r.Context().Value(requestIDKey{}).(string),
@@ -79,16 +89,21 @@ func (g *gateway) endpoint(p config.Purpose) http.HandlerFunc {
 			runID:           r.Header.Get("X-Run-Id"),
 			idempotencyKey:  r.Header.Get("Idempotency-Key"),
 		}
-		defer g.logCall(c)
-		defer g.adjust(r.Context(), c) // 先于 logCall 执行：日志里要有修正的错误
+		defer g.record(c, string(p), g.logCall)
+		e := g.authenticate(r, c)
+		ctx := g.startTrace(r, c, route, e)
+		defer g.adjust(ctx, c) // 先于 record 执行：日志里要有修正的错误，根 span 要包住修正
 
-		body, e := g.prepare(w, r, c)
+		var body []byte
 		if e == nil {
-			e = g.admit(r.Context(), c)
+			body, e = g.prepare(w, r, c)
+		}
+		if e == nil {
+			e = g.admit(ctx, c)
 		}
 		var replay *ledger.Replay
 		if e == nil {
-			replay, e = g.reserve(r.Context(), c)
+			replay, e = g.reserve(ctx, c)
 		}
 		if e != nil {
 			writeError(w, c, e)
@@ -101,22 +116,27 @@ func (g *gateway) endpoint(p config.Purpose) http.HandlerFunc {
 			writeResponse(w, c, &replay.Response)
 			return
 		}
-		res, e, finish := g.send(r.Context(), c, body)
-		c.outcome, c.evidence = outcome(c, res, e)
-		if finish {
-			g.finish(r.Context(), c, res, e)
+		g.deliver(ctx, w, c, body)
+	}
+}
+
+// deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写回。客户端已经断开就不写回，状态码留 0。
+func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, body []byte) {
+	res, e, finish := g.send(ctx, c, body)
+	c.outcome, c.evidence = outcome(c, res, e)
+	if finish {
+		g.finish(ctx, c, res, e)
+	}
+	switch {
+	case ctx.Err() != nil:
+		c.clientDisconnected = true
+		if e != nil {
+			c.errorCode = e.code
 		}
-		switch {
-		case r.Context().Err() != nil: // 客户端已经断开：不写回，状态码留 0
-			c.clientDisconnected = true
-			if e != nil {
-				c.errorCode = e.code
-			}
-		case e != nil:
-			writeError(w, c, e)
-		default:
-			writeResponse(w, c, res)
-		}
+	case e != nil:
+		writeError(w, c, e)
+	default:
+		writeResponse(w, c, res)
 	}
 }
 
@@ -146,22 +166,24 @@ func writeResponse(w http.ResponseWriter, c *call, resp *ledger.Response) {
 	_, _ = w.Write(resp.Body)
 }
 
-// prepare 鉴权、读请求体、解析、检查模型、估算，带幂等键时校验键、算指纹，返回改写过 model 的请求体。
+// prepare 读请求体、解析、检查模型、估算，带幂等键时校验键、算指纹，返回改写过 model 的请求体。
 func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) ([]byte, *apiError) {
-	if e := g.authenticate(r, c); e != nil {
-		return nil, e
-	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		switch {
+		case errors.As(err, &tooLarge):
 			return nil, errRequestTooLarge
+		case r.Context().Err() != nil:
+			// 请求体没发完客户端就断开了：连接读出错时 net/http 会取消请求的 context。和写回之前断开一样，不写回。
+			// 连接还在、只是分块编码坏了的，context 没有取消，仍是 400。
+			return nil, errClientCanceled
 		}
-		return nil, errInvalidRequest
+		return nil, c.invalid(reasonUnreadableBody)
 	}
-	req, err := parseRequest(body)
-	if err != nil {
-		return nil, errInvalidRequest
+	req, reason := parseRequest(body)
+	if reason != "" {
+		return nil, c.invalid(reason)
 	}
 	c.alias = req.model
 	if c.purpose == config.Chat && req.stream {
@@ -180,7 +202,7 @@ func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) ([]by
 	if key != "" {
 		// 指纹用客户端发来的原始请求体（改写 model 之前的）。
 		if c.fingerprint, err = fingerprint(c.purpose, body); err != nil {
-			return nil, errInvalidRequest
+			return nil, c.invalid(reasonFingerprintFailed)
 		}
 	}
 	out := req.withModel(body, c.model.UpstreamModel)
@@ -199,7 +221,7 @@ func (g *gateway) authenticate(r *http.Request, c *call) *apiError {
 	k, err := g.ledger.KeyByHash(ctx, apikey.Hash(token))
 	switch {
 	case err != nil:
-		c.ledgerError = err.Error()
+		g.ledgerFailed(c, "authenticate", err)
 		return errLedgerUnavailable
 	case k == nil:
 		return errInvalidAPIKey

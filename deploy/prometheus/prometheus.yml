@@ -1,0 +1,14 @@
+# 演示环境的 Prometheus（compose.observability.yaml）：抓 QF 的指标（:9464/metrics，只在 Compose 的网络里），加载 SLO 和告警规则。
+# 抓哪些实例由 targets/ 下的文件决定：单实例的覆盖文件只挂 quotaforge.json，两个实例的再挂 quotaforge-b.json，
+# 所以两种叠法下都没有一直抓不到的目标。
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: quotaforge
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/*.json"]

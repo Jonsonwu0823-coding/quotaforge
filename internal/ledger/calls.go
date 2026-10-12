@@ -81,3 +81,17 @@ func (s *Store) UnknownCalls(ctx context.Context, account string) ([]UnknownCall
 	}
 	return out, rows.Err()
 }
+
+// UnknownBacklog 是还占着预留的未知用量调用（全部账户）：条数，和最早的一条从预留到现在的秒数（没有时为 0），
+// 按数据库的时钟算，和回收一致。给指标用，后台每轮查一次。
+// 走 calls_status_created (status, created_at)：等值加覆盖索引，只扫 USAGE_UNKNOWN 的行，MIN 就是第一条。
+func (s *Store) UnknownBacklog(ctx context.Context) (n, oldestAgeSeconds int64, err error) {
+	err = s.db.QueryRowContext(ctx, unknownBacklogQuery).Scan(&n, &oldestAgeSeconds)
+	if err != nil {
+		return 0, 0, fmt.Errorf("unknown backlog: %w", err)
+	}
+	return n, oldestAgeSeconds, nil
+}
+
+const unknownBacklogQuery = `SELECT COUNT(*), COALESCE(TIMESTAMPDIFF(SECOND, MIN(created_at), UTC_TIMESTAMP(6)), 0)
+	FROM calls WHERE status = 'USAGE_UNKNOWN'`

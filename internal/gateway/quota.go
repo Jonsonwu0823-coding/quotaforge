@@ -62,7 +62,9 @@ func plan(c *call, body []byte, maxTokens *int64) ledger.Reservation {
 
 // reserve 在账本里预留这次调用的额度。额度不够是 429，账本出错是 503，都不调上游。
 // 带幂等键时，账本按这个键已有的记录判断：可能返回要重放的快照，或者 409、422，这些也都不调上游。
-func (g *gateway) reserve(ctx context.Context, c *call) (*ledger.Replay, *apiError) {
+func (g *gateway) reserve(ctx context.Context, c *call) (replay *ledger.Replay, e *apiError) {
+	span := g.step(ctx, "reserve")
+	defer func() { endStep(span, e) }()
 	lctx, cancel := ledgerContext(ctx)
 	defer cancel()
 	replay, err := g.ledger.Reserve(lctx, c.planned)
@@ -80,7 +82,7 @@ func (g *gateway) reserve(ctx context.Context, c *call) (*ledger.Replay, *apiErr
 	case errors.Is(err, ledger.ErrIdempotencyResponseUnavailable):
 		return nil, errIdempotencyResponseUnavailable
 	case err != nil:
-		c.ledgerError = err.Error()
+		g.ledgerFailed(c, "reserve", err)
 		return nil, errLedgerUnavailable
 	case replay != nil:
 		return replay, nil
@@ -91,11 +93,13 @@ func (g *gateway) reserve(ctx context.Context, c *call) (*ledger.Replay, *apiErr
 
 // markSent 落发送意图：调用改成 IN_FLIGHT 并提交之后，才向上游发请求。没落成（账本出错，或者调用已被回收释放）就不发，
 // 回 503，也不收尾：调用留给回收。
-func (g *gateway) markSent(ctx context.Context, c *call) *apiError {
+func (g *gateway) markSent(ctx context.Context, c *call) (e *apiError) {
+	span := g.step(ctx, "mark_sent")
+	defer func() { endStep(span, e) }()
 	lctx, cancel := ledgerContext(ctx)
 	defer cancel()
 	if err := g.ledger.MarkSent(lctx, *c.reservation); err != nil {
-		c.ledgerError = err.Error()
+		g.ledgerFailed(c, "mark_sent", err)
 		return errLedgerUnavailable
 	}
 	c.callStatus = ledger.InFlight
@@ -118,12 +122,15 @@ func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *
 	} else {
 		result.HTTPStatus, result.Response = res.Status, res
 	}
+	span := g.step(ctx, "finish")
 	lctx, cancel := ledgerContext(ctx)
 	defer cancel()
 	if err := g.ledger.Finish(lctx, *c.reservation, result); err != nil {
-		c.ledgerError = err.Error()
+		g.ledgerFailed(c, "finish", err)
+		endStep(span, errLedgerUnavailable)
 		return
 	}
+	endStep(span, nil)
 	c.callStatus = result.Status
 }
 

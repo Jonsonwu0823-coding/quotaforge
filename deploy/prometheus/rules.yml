@@ -1,0 +1,84 @@
+# QF 的 SLO（记录规则）和告警。数字的依据见 docs/observability.md 的“SLO 和告警”。
+# 单元测试：rules_test.yml（promtool test rules）。
+groups:
+  - name: qf-sli
+    rules:
+      # 可用性：QF 自己造成的失败占全部请求的比例。失败 = 5xx 且错误码不是上游的（upstream_*），
+      # 现在就是 ledger_unavailable、rate_limiter_unavailable；分母是全部请求（两个转发接口和调用状态查询，含 4xx 和客户端断开）。
+      - record: qf:availability_errors:ratio_rate5m
+        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[5m])) / sum(rate(qf_requests_total[5m]))
+      - record: qf:availability_errors:ratio_rate30m
+        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[30m])) / sum(rate(qf_requests_total[30m]))
+      - record: qf:availability_errors:ratio_rate1h
+        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[1h])) / sum(rate(qf_requests_total[1h]))
+      - record: qf:availability_errors:ratio_rate6h
+        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[6h])) / sum(rate(qf_requests_total[6h]))
+      # 延迟：chat、embeddings 请求里 QF 自身耗时（总耗时减去等上游的时间）超过 0.25 秒的比例。
+      # 0.25 正好是 qf_overhead_seconds 的一个桶边界，按桶算，不插值。
+      - record: qf:latency_slow:ratio_rate5m
+        expr: 1 - sum(rate(qf_overhead_seconds_bucket{endpoint=~"chat|embeddings",le="0.25"}[5m])) / sum(rate(qf_overhead_seconds_count{endpoint=~"chat|embeddings"}[5m]))
+      - record: qf:latency_slow:ratio_rate30m
+        expr: 1 - sum(rate(qf_overhead_seconds_bucket{endpoint=~"chat|embeddings",le="0.25"}[30m])) / sum(rate(qf_overhead_seconds_count{endpoint=~"chat|embeddings"}[30m]))
+      - record: qf:latency_slow:ratio_rate1h
+        expr: 1 - sum(rate(qf_overhead_seconds_bucket{endpoint=~"chat|embeddings",le="0.25"}[1h])) / sum(rate(qf_overhead_seconds_count{endpoint=~"chat|embeddings"}[1h]))
+      - record: qf:latency_slow:ratio_rate6h
+        expr: 1 - sum(rate(qf_overhead_seconds_bucket{endpoint=~"chat|embeddings",le="0.25"}[6h])) / sum(rate(qf_overhead_seconds_count{endpoint=~"chat|embeddings"}[6h]))
+
+  - name: qf-alerts
+    rules:
+      # 错误预算消耗速率，两档、各两个窗口：长窗口说明烧得多，短窗口说明现在还在烧（恢复后很快解除）。
+      # 可用性目标 99.9%（预算 0.1%），延迟目标 99%（预算 1%），时间窗 30 天。
+      # 14.4 倍：1 小时烧掉 30 天预算的 2%；6 倍：6 小时烧掉 5%。流量很小时一两个错误就能越过阈值。
+      - alert: QFAvailabilityBudgetBurnFast
+        expr: qf:availability_errors:ratio_rate1h > (14.4 * 0.001) and qf:availability_errors:ratio_rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: QF 自己造成的失败在快速消耗可用性的错误预算（1 小时烧掉 2%）
+      - alert: QFAvailabilityBudgetBurnSlow
+        expr: qf:availability_errors:ratio_rate6h > (6 * 0.001) and qf:availability_errors:ratio_rate30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: QF 自己造成的失败在持续消耗可用性的错误预算（6 小时烧掉 5%）
+      - alert: QFLatencyBudgetBurnFast
+        expr: qf:latency_slow:ratio_rate1h > (14.4 * 0.01) and qf:latency_slow:ratio_rate5m > (14.4 * 0.01)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: QF 自身耗时超过 250 毫秒的请求在快速消耗延迟的错误预算（1 小时烧掉 2%）
+      - alert: QFLatencyBudgetBurnSlow
+        expr: qf:latency_slow:ratio_rate6h > (6 * 0.01) and qf:latency_slow:ratio_rate30m > (6 * 0.01)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: QF 自身耗时超过 250 毫秒的请求在持续消耗延迟的错误预算（6 小时烧掉 5%）
+
+      # 后台循环（回收、清理、数未知用量）连续约 10 轮没有一轮成功；间隔随上游超时变，按实例上报的间隔算。
+      - alert: QFBackgroundStalled
+        expr: time() - qf_background_last_success_timestamp_seconds > 10 * qf_background_interval_seconds
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: 实例 {{ $labels.instance }} 的后台循环约 10 轮没有成功
+      # 未知用量的调用超过一天还没对账（对账要人按上游的账单做）。两个实例数的是同一个库，取最大值。
+      - alert: QFUnknownUsageUnreconciled
+        expr: max(qf_unknown_usage_oldest_age_seconds) > 86400
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 有用量未知的调用超过一天没有对账（qfctl unknown、qfctl reconcile）
+      # 账本或限流的 Redis 持续不可用（没有请求时不会出错，也就不告警：没有用户受影响）。
+      - alert: QFDependencyUnavailable
+        expr: sum by (dependency) (rate(qf_dependency_errors_total[2m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.dependency }} 持续出错超过 5 分钟"

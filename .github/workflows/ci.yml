@@ -103,6 +103,9 @@ jobs:
       # 两个实例的跨进程检查（超扣、同键、共享限流、杀掉一个实例由另一个接手、同时回收和清理）
       - name: Two instances
         run: scripts/compose-two-instances.sh
+      # 追踪、指标、告警规则：Jaeger 和 Prometheus 的演示环境（单实例），含 promtool 的规则单元测试
+      - name: Observability
+        run: scripts/compose-observability.sh
       # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
       # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
       - name: Check out QueryShield at the pinned commit
@@ -123,5 +126,6 @@ jobs:
             evidence/compose-smoke-summary.txt
             evidence/compose-qs-fake-check-summary.txt
             evidence/compose-two-instances-summary.txt
+            evidence/compose-observability-summary.txt
             evidence/compose-qs-e2e-summary.txt
           if-no-files-found: warn

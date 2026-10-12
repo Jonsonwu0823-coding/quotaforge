@@ -12,6 +12,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ratelimit"
@@ -34,7 +36,7 @@ type call struct {
 	ledgerError string              // 账本操作失败的原因（驱动的错误文字，不含连接串）
 
 	admitted         []ratelimit.Bucket // 准入放行时扣过的桶；没有桶、被拒、出错时为空
-	rateLimitedBy    string             // 被限流时是哪个桶，例如 key/rpm
+	deniedBy         *ratelimit.Bucket  // 被限流时是哪个桶
 	rateLimiterError string             // 准入或修正时 Redis 的错误文字（不含 URL）
 
 	clientRequestID string
@@ -42,18 +44,30 @@ type call struct {
 	idempotencyKey  string // 请求头的原值，只用来记日志；fingerprint 不为 nil 时它是校验过的键
 	fingerprint     []byte // 请求带了合法的幂等键时才有
 	replayOf        string // 重放时是原来的调用号
+	lookupOf        string // 调用状态查询：被查的调用号，格式合格的才有
 
 	status             int  // 写回客户端的 HTTP 状态；什么都没写回（客户端已断开）时是 0
 	clientDisconnected bool // 写回之前客户端已经断开
 
 	upstreamCalled     bool
+	upstreamDuration   time.Duration // 等上游的时间：发请求到读完正文
 	upstreamStatus     int
 	upstreamXRequestID string
 	upstreamResponseID string
 	upstreamModel      string
 	usage              *ledger.Usage // nil 表示未知
 
-	errorCode string
+	errorCode     string
+	invalidReason invalidReason // 400 invalid_request 的原因
+
+	span         trace.Span   // 根 span；没建时（没通过鉴权）是空实现
+	parentSpanID trace.SpanID // 请求的 traceparent 里调用方的 span id；没带或不合法时为零值
+}
+
+// invalid 记下请求体不合格的原因，返回 400 invalid_request。
+func (c *call) invalid(r invalidReason) *apiError {
+	c.invalidReason = r
+	return errInvalidRequest
 }
 
 // parseUsage 解析上游的 usage，三个数原样用上游的。缺字段、不符合 ledger.Usage.Valid（负数、chat 缺 completion_tokens）
@@ -118,13 +132,14 @@ func appendChecked(attrs []slog.Attr, name, v string) []slog.Attr {
 	}
 }
 
-// logCall 每次调用写一行。不记 Key、上游 Key、请求体和响应体。重放的请求没调上游，所以没有 usage。
-func (g *gateway) logCall(c *call) {
+// logCall 每次调用写一行，d 是总耗时。不记 Key、上游 Key、请求体和响应体。重放的请求没调上游，所以没有 usage。
+func (g *gateway) logCall(c *call, d time.Duration) {
 	attrs := []slog.Attr{
 		slog.String("request_id", c.id),
 		slog.String("endpoint", string(c.purpose)),
-		slog.Int64("duration_ms", time.Since(c.start).Milliseconds()),
+		slog.Int64("duration_ms", d.Milliseconds()),
 	}
+	attrs = traceAttrs(attrs, c)
 	if c.status != 0 {
 		attrs = append(attrs, slog.Int("status", c.status))
 	}
@@ -140,6 +155,9 @@ func (g *gateway) logCall(c *call) {
 	}
 	if c.errorCode != "" {
 		attrs = append(attrs, slog.String("error_code", c.errorCode))
+	}
+	if c.invalidReason != "" {
+		attrs = append(attrs, slog.String("invalid_reason", string(c.invalidReason)))
 	}
 	attrs = appendChecked(attrs, "client_request_id", c.clientRequestID)
 	attrs = appendChecked(attrs, "run_id", c.runID)
@@ -163,8 +181,8 @@ func (g *gateway) logCall(c *call) {
 	if c.ledgerError != "" {
 		attrs = append(attrs, slog.String("ledger_error", c.ledgerError))
 	}
-	if c.rateLimitedBy != "" {
-		attrs = append(attrs, slog.String("rate_limited_by", c.rateLimitedBy))
+	if c.deniedBy != nil {
+		attrs = append(attrs, slog.String("rate_limited_by", c.deniedBy.Name()))
 	}
 	if c.rateLimiterError != "" {
 		attrs = append(attrs, slog.String("rate_limiter_error", c.rateLimiterError))

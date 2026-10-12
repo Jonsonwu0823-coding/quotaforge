@@ -17,6 +17,8 @@
 | `compose.real.yaml` | 叠加在主文件上：`quotaforge` 接入 `qs-qf`，上游是百炼（配置 `deploy/config.real.json`），地址和 Key 来自当前 shell 的环境变量 |
 | `compose.two.yaml` | 叠加在主文件上：第二个实例 `quotaforge-b`（`127.0.0.1:8081`）和压测工具 `qfbench`（只用 `run`），见[两个实例](scaling.md#两个实例) |
 | `compose.bench.yaml` | 再叠加在 `compose.two.yaml` 上：两个实例都换成压测配置 `deploy/config.bench.json`，见[压测](scaling.md#压测) |
+| `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
+| `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
 
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
 - **`qf-redis`**：`redis:8`，不持久化（`--save '' --appendonly no`），不发布端口，不接入 `qs-qf`，健康检查是 `redis-cli ping`。不叫 `redis`，理由和 `qf-mysql` 一样。`quotaforge` 经环境变量 `QF_REDIS_URL=redis://qf-redis:6379/0` 连它（三份 `deploy/` 配置的 `redis.url_env` 都指向这个变量）；它只在 Compose 的内部网络上，不设密码。两个覆盖文件不用改，会继承这些设置。
@@ -29,7 +31,7 @@
 单独运行的命令见 [README 的快速开始](../README.md#快速开始)。
 
 - 端口只发布在 `127.0.0.1:8080`。
-- `stop_grace_period` 是 40 秒，比 QF 的关闭上限（默认 36 秒）长：`docker compose stop` 时，进行中的请求能处理完、收尾记进账本。调大上游超时时，它也要跟着大于关闭上限。
+- `stop_grace_period` 是 40 秒，比 QF 的关闭上限（默认 36 秒）加上冲刷 span 的 2 秒长：`docker compose stop` 时，进行中的请求能处理完、收尾记进账本，之后还没导出的 span 也有时间发完。调大上游超时时，它也要跟着大于这两者之和。
 - `quotaforge`、`qfctl` 的根文件系统只读。只有 `compose.real.yaml` 放开了 `quotaforge` 的，因为 Compose 要把来自环境变量的 secret 复制进容器。
 
 ### 冒烟脚本（bash，Linux 和 CI 用）
@@ -76,6 +78,21 @@ QF 调上游用 Go 默认的 HTTP 客户端，会读 `HTTP_PROXY`、`HTTPS_PROXY
 - 冒烟脚本和 PowerShell 脚本会检查容器里这几个变量设没设，只显示“设置了”或“没设置”，不显示值，因为值里可能有代理的账号密码。
   - 单独运行的冒烟：设了代理而 `NO_PROXY` 不含 `qf-fake-upstream` 就判失败。
 
+## 环境变量
+
+进程和部署层面的设置走环境变量（同一份配置文件可以给两个实例用），业务配置在配置文件里。值不合法时启动就退出，说明是哪个变量，不打印它的值。
+
+| 变量 | 说明 |
+|---|---|
+| `QUOTAFORGE_CONFIG` | 配置文件的路径，必填（见下一节） |
+| `QUOTAFORGE_ADDR` | 监听地址，默认 `127.0.0.1:8080`；镜像里设成 `0.0.0.0:8080`。健康检查子命令也按它去连 |
+| `QUOTAFORGE_METRICS_ADDR` | 指标的监听地址（`主机:端口`，例如 `0.0.0.0:9464`），只有 `GET /metrics`。不设不开 |
+| `QUOTAFORGE_OTLP_ENDPOINT` | OTLP/HTTP 收集端的地址（例如 `http://qf-jaeger:4318`），span 发到它的 `/v1/traces`。规则和上游的 base URL 一样：只许 http、https，要有主机名，不能带账号密码、查询串和片段。不设不追踪 |
+| `QUOTAFORGE_TRACE_SAMPLE_RATIO` | 0 到 1，没有上游 `traceparent` 时的采样比例，默认 1。要和 `QUOTAFORGE_OTLP_ENDPOINT` 一起设 |
+| `QUOTAFORGE_INSTANCE` | span 的资源属性 `service.instance.id`，默认主机名。要和 `QUOTAFORGE_OTLP_ENDPOINT` 一起设 |
+
+追踪和指标的细节见[可观测](observability.md)。
+
 ## 配置文件
 
 路径来自环境变量 `QUOTAFORGE_CONFIG`。启动时一次性校验，有错就退出并说明哪一项错了（不打印 Key、连接串和地址）。不认识的字段也算错，防止拼错的字段悄悄走默认值。Key 不在配置里，在数据库里。
@@ -102,7 +119,7 @@ QF 调上游用 Go 默认的 HTTP 客户端，会读 `HTTP_PROXY`、`HTTPS_PROXY
 
 base URL 只接受 http 和 https，必须有主机名，不能带账号密码、查询串和片段。
 
-优雅退出（SIGINT、SIGTERM）最多等回收的上界 `max(chat 超时, embeddings 超时) + 3 × 2 秒 + 5 秒`，默认 36 秒；容器的停止宽限期要比它长。**调大上游超时时，`stop_grace_period` 也要跟着改**，否则 `docker compose stop` 会在 QF 收尾之前把它杀掉（调用由回收接手，但会多出未知用量）。
+优雅退出（SIGINT、SIGTERM）最多等回收的上界 `max(chat 超时, embeddings 超时) + 3 × 2 秒 + 5 秒`，默认 36 秒；开着追踪时，之后再用最多 2 秒把还没导出的 span 发完（到点没发完的丢掉，账本在这之前已经收完尾）。容器的停止宽限期要比两者之和长。**调大上游超时时，`stop_grace_period` 也要跟着改**，否则 `docker compose stop` 会在 QF 收尾之前把它杀掉（调用由回收接手，但会多出未知用量）。
 
 ## qfctl
 
