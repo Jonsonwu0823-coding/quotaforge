@@ -21,12 +21,13 @@ QF_KEY=$(docker compose run --rm -T --no-deps qfctl key issue -account queryshie
 
 ### 端到端联调（真的 QS，fake-upstream 模式）
 
-QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型，跑 QS 的整套演示，再用 QF 的账本核对 QF 确实收到了请求。不调用任何付费模型。
+QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型，跑 QS 的整套演示，再用 QF 的账本核对 QF 确实收到了请求。QF 开着追踪（叠上 `compose.observability.yaml`），再核对 QS 发来的 `traceparent`。不调用任何付费模型。
 
-- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `979ddbd9caca730c42a44d83df12d02d30e72484`，目录任意；Docker、Python 3。
-  `git clone https://github.com/Jonsonwu0823-coding/queryshield.git ../queryshield && git -C ../queryshield checkout 979ddbd9caca730c42a44d83df12d02d30e72484`
+- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `b6e64855b175c5abd6378be49b0027e7331c18a7`，目录任意；Docker、Python 3。
+  `git clone https://github.com/Jonsonwu0823-coding/queryshield.git ../queryshield && git -C ../queryshield checkout b6e64855b175c5abd6378be49b0027e7331c18a7`
 - **命令**：`scripts/compose-qs-e2e.sh ../queryshield`（也可以用环境变量 `QS_DIR`）。约 1.5 分钟，QS 镜像要首次构建的话再多几分钟。摘要在 `evidence/compose-qs-e2e-summary.txt`，全部 `ok` 才以 0 退出。
-- **不碰本机已有的东西**：QF、QS 各用联调专用的项目名（`qf-e2e-qf`、`qf-e2e-qs`）和镜像标签（`queryshield-app:qf-e2e-979ddbd`），所以结束时的 `down -v` 只删自己的卷，不会动 `queryshield_*` 的开发数据卷。QS 发布到本机的端口默认 18731，避开常用的 8000。联调镜像 `queryshield-app:qf-e2e-979ddbd` 跑完会留着（下次直接用，约 370 MB），不要了用 `docker rmi` 删。开始前发现 `qs-qf` 上已有容器、同名项目在运行、端口被占（QF 的 8080、QS 的 18731，后者用 `QUERYSHIELD_HTTP_PORT` 换）、QS 目录不在固定提交或有改动，就报错退出。QS 的镜像缺了才构建；出口代理会替换证书的环境里，预先自己构建好这个标签即可。
+- **不碰本机已有的东西**：QF、QS 各用联调专用的项目名（`qf-e2e-qf`、`qf-e2e-qs`）和镜像标签（`queryshield-app:qf-e2e-b6e6485`），所以结束时的 `down -v` 只删自己的卷，不会动 `queryshield_*` 的开发数据卷。QS 发布到本机的端口默认 18731，避开常用的 8000。联调镜像 `queryshield-app:qf-e2e-b6e6485` 跑完会留着（下次直接用，约 370 MB），不要了用 `docker rmi` 删。开始前发现 `qs-qf` 上已有容器、同名项目在运行、端口被占（QF 的 8080、QS 的 18731，后者用 `QUERYSHIELD_HTTP_PORT` 换；Jaeger 界面的 16686）、QS 目录不在固定提交或有改动，就报错退出。QS 的镜像缺了才构建；出口代理会替换证书的环境里，预先自己构建好这个标签即可。
+- **追踪也开着**：脚本只起 `quotaforge`，Jaeger（`qf-jaeger`）作为它的依赖跟着起，只在 QF 自己的网络里，不接 `qs-qf`；`qs-qf` 上的成员检查不变。Prometheus 不起。Jaeger 的界面在 `http://127.0.0.1:16686`，联调结束时随 `down -v` 一起删掉。
 - **QS 的四个 Compose 文件顺序不能换**（脚本里按这个顺序，再加 `deploy/compose.qs-e2e-images.yaml` 换镜像名）：`compose.yaml`、`compose.fake-upstream.yaml`、`compose.model-gateway.yaml`、`compose.fake-upstream-gateway.yaml`。顺序反了，`app` 会直连假上游、绕过 QF，而且不报错；脚本的核对（QF 账本里的聊天调用数对不上）会失败。
 - **预期结果**：QS 的摘要 `status` 为 `pass`，`model_names` 只有 `qs-fake-upstream-v1`，13 题 pass、1 题 not_applicable，已知缺口只有 `Q06:rowset_customers_differ`。QF 账本里这个账户有 33 次聊天、15 次嵌入（12 个 run，每个 run 的聊天次数和用量都和摘要一致），全部已结算，已消费约 11.1 万 tokens，已预留 0；`qfctl verify` 输出 `ledger ok`。固定提交里的 QS，run 里的调用（带 `X-Run-Id` 的聊天和查询嵌入）都带 `Idempotency-Key`，run 外的（建知识索引的嵌入）不带：账本里 `calls` 的 `run_id` 和 `idempotency_key` 要么都有、要么都没有，脚本报出两类的条数（预期 44 条带键、4 条不带，不一致就失败）。假上游不触发重试，所以带键的调用都只执行一次。
 - **按 run 核对的规则**（QS 的 `761bc91` 起，摘要每条记录有 `run_id` 和 `usage_total`）：
@@ -36,6 +37,12 @@ QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型，跑 QS 的整套演示�
   - 嵌入不按 run 计数：带 `X-Run-Id` 的都是 200、已结算、用量已知，而且它们的 run 都在摘要里；不带的（第一次检索时建知识索引的那批，4 次）必须都在第一次带 `X-Run-Id` 的嵌入之前。
   - 账户整体：每次调用都有 `X-Client-Request-Id`，全部已结算，已消费等于用量合计、已预留为 0；至少比到 1 个 `usage_total` 为 `known` 的 run（`not_run` 不算，两种模式都要求），至少有 1 次带 `X-Run-Id` 的嵌入（避免空集合上的检查“空真”：嵌入都不带 `X-Run-Id` 时，上面两条嵌入检查没有对象可查）。
   - 单元测试：`python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'`（不需要 Docker）。
+- **`traceparent` 的三项检查**（QS 的 `b6e6485` 起，QS 每个聊天、嵌入请求都带 `traceparent`，摘要每条记录有 `trace_id`；约定见 [可观测](observability.md) 和 QS 仓库的说明）：
+  - 规则由 `scripts/check_qs_runs.py --e2e --qf-log <QF 的日志>` 做，只在联调里查，经 QS 的真实演示不开追踪、不查。数据读 QF 的调用日志（`msg` 是 `call`、`account` 是联调账户的行；账本不记 trace），只输出条数，不打印日志行。
+  - 一，每一行调用日志都有合法的 `parent_span_id` 和 `trace_id`（小写十六进制、不全是 0）：每个请求都带了合法的 `traceparent`。
+  - 二，带 `X-Run-Id` 的调用，`trace_id` 都等于摘要里那个 run 的 `trace_id`；摘要里没有这个 run 或没有它的 `trace_id`，也算失败。
+  - 三，不带 `X-Run-Id` 的调用（建知识索引的嵌入），`trace_id` 不和任何 run 的相同；至少要有一次这样的调用，避免空集合上的检查“空真”。
+  - 一次运行的预期：48 行调用日志都有 `parent_span_id`；12 个 run 的 44 次调用和摘要一致；run 外 4 次，都不在 run 的 trace 上。
 - **数据从哪读**：QF 的账本（`calls` 表）。`check_qs_runs.py` 按 Compose 的标签找到项目的 `qf-mysql` 容器，在里面用容器内的 secret 文件做只读查询，密码不出容器。
 
 ## 经 QS 的真实演示和对账（本机，会花钱）

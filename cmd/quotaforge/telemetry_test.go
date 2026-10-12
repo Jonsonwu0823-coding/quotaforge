@@ -164,7 +164,7 @@ func TestBackgroundMetrics(t *testing.T) {
 func TestProcessWithTelemetry(t *testing.T) {
 	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
 	collector, exported := spanSink(t)
-	cfgPath, key := processConfig(t)
+	cfgPath, key, _ := processConfig(t)
 	p := startObservedQF(t, cfgPath, collector)
 	api, metricsAddr := p.addr(t, "listening"), p.addr(t, "metrics")
 
@@ -200,6 +200,75 @@ func TestProcessWithTelemetry(t *testing.T) {
 	}
 }
 
+// 退出的顺序：收到信号时有请求在途，先等它处理完，再冲刷 span；这个请求的根 span 和 upstream 都要导出。
+// 先冲刷（和排空同时进行）的话，在途请求的 span 在批处理器关掉之后才结束，会丢。
+//
+// 全程等确定的事件：假上游挂住了这个请求（它确实在途）；信号之后监听已关（QF 进入排空）；然后再放开上游。
+// 唯一一处限时的等待是“收集端有没有在放开之前收到过东西”：先冲刷的实现几毫秒内就会发出第一批，限时只决定能不能抓到它，
+// 正确的实现不管等多久都通过。不在 Windows 上跑：Go 在那里发不了 SIGTERM。
+func TestProcessDrainsInFlightRequestBeforeFlushing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Go cannot send SIGTERM on Windows")
+	}
+	collector, exported := spanSink(t)
+	cfgPath, key, upstream := processConfig(t)
+	p := startObservedQF(t, cfgPath, collector)
+	api := p.addr(t, "listening")
+
+	status := chatStatus(api, key, "hold")
+	waitUntil(t, 20*time.Second, func() bool { return upstream.Stats().Held == 1 })
+
+	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 20*time.Second, func() bool { return !listening(api) })
+	for deadline := time.Now().Add(2 * time.Second); exported() == "" && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	}
+	upstream.Release()
+
+	select {
+	case code := <-status:
+		if code != http.StatusOK {
+			t.Fatalf("the in-flight request got %d, want 200", code)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the in-flight request did not finish")
+	}
+	p.waitExit(t)
+	for _, want := range []string{`"name":"POST /v1/chat/completions"`, `"name":"upstream"`} {
+		if !strings.Contains(exported(), want) {
+			t.Errorf("the spans exported on exit lack %s", want)
+		}
+	}
+}
+
+// chatStatus 在另一个 goroutine 里发一个 chat 请求，把响应的状态码送进返回的通道（请求失败是 -1）。
+func chatStatus(api, key, model string) <-chan int {
+	status := make(chan int, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+api+"/v1/chat/completions", strings.NewReader(`{"model":"`+model+`"}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			status <- -1
+			return
+		}
+		resp.Body.Close()
+		status <- resp.StatusCode
+	}()
+	return status
+}
+
+// listening 说 addr 上现在连得上吗。
+func listening(addr string) bool {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 // spanSink 是一个记下收到的正文的假收集端；返回它的地址和读出已收到内容的函数。
 func spanSink(t *testing.T) (url string, received func() string) {
 	var mu sync.Mutex
@@ -218,24 +287,27 @@ func spanSink(t *testing.T) (url string, received func() string) {
 	}
 }
 
-// processConfig 写一份接假上游的配置，建账户、发 Key；返回配置文件的路径和 Key。
-func processConfig(t *testing.T) (cfgPath, key string) {
-	up := httptest.NewServer(fakeupstream.New())
+// processConfig 写一份接假上游的配置（别名 m 正常回答，hold 被假上游挂住直到 Release），建账户、发 Key；
+// 返回配置文件的路径、Key 和假上游。
+func processConfig(t *testing.T) (cfgPath, key string, upstream *fakeupstream.Server) {
+	upstream = fakeupstream.New()
+	up := httptest.NewServer(upstream)
 	t.Cleanup(up.Close)
 	cfgPath = filepath.Join(t.TempDir(), "config.json")
 	cfgJSON := fmt.Sprintf(`{"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
-		"models":[{"alias":"m","purpose":"chat","upstream":"fake","upstream_model":"fake-chat","default_max_tokens":16}],
+		"models":[{"alias":"m","purpose":"chat","upstream":"fake","upstream_model":"fake-chat","default_max_tokens":16},
+			{"alias":"hold","purpose":"chat","upstream":"fake","upstream_model":"fake-hold","default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("QF_KILL_UPSTREAM_KEY", "test-only-upstream-key")
 	store := dbtest.Store(t)
-	issued, err := store.IssueKey(context.Background(), dbtest.Account(t, store, 1_000_000), []string{"m"}, ledger.Rate{})
+	issued, err := store.IssueKey(context.Background(), dbtest.Account(t, store, 1_000_000), []string{"m", "hold"}, ledger.Rate{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return cfgPath, issued.Secret
+	return cfgPath, issued.Secret, upstream
 }
 
 // observedQF 是开着追踪和指标的 QF 子进程，记下它的每一行日志（不是 JSON 的记成 not_json）。
@@ -296,6 +368,19 @@ func (p *observedQF) addr(t *testing.T, msg string) string {
 	return addr
 }
 
+// waitExit 等 QF 退出，退出码必须是 0。
+func (p *observedQF) waitExit(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-p.exited:
+		if err != nil {
+			t.Fatalf("QF exited with %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("QF did not exit")
+	}
+}
+
 // stop 让 QF 退出，之后 flushed 必须成立。Linux 上发 SIGTERM：批处理器 5 秒才到点，这么快退出还导出了，就是退出时冲刷的；
 // Windows 上 Go 发不了 SIGTERM，等 flushed 成立再杀掉进程。
 func (p *observedQF) stop(t *testing.T, flushed func() bool) {
@@ -307,14 +392,7 @@ func (p *observedQF) stop(t *testing.T, flushed func() bool) {
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-p.exited:
-		if err != nil {
-			t.Fatalf("QF exited with %v", err)
-		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("QF did not exit")
-	}
+	p.waitExit(t)
 	if !flushed() {
 		t.Fatal("the spans were not flushed on exit")
 	}

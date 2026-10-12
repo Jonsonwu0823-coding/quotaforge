@@ -253,7 +253,9 @@ race_logs() { for svc in quotaforge quotaforge-b; do dc logs --no-log-prefix --s
 # reclaimed <调用号前缀>、purged <键前缀>：这一批都处理完了
 reclaimed() { [ "$(sql -e "SELECT COUNT(*) FROM calls WHERE id LIKE '$1%' AND status IN ('RESERVED', 'IN_FLIGHT')")" = 0 ]; }
 purged() { [ "$(sql -e "SELECT COUNT(*) FROM idempotency_keys WHERE idem_key LIKE '$1%'")" = 0 ]; }
-no_background_errors() { ! grep -qE 'reclaim_error|purge_error|1213' "$work"/*.reclaim*.log "$work"/*.purge*.log; }
+# 回收、清理两轮的日志里有几行带这个错误：后台循环的失败写成 reclaim_error、purge_error；死锁是驱动的文字 "Error 1213 (40001)"。
+# 不能只搜 1213：它会匹配日志里任何一串数字（纳秒时间戳、耗时、计数）。
+error_lines() { cat "$work"/*.reclaim*.log "$work"/*.purge*.log | grep -cE -- "$1" || true; }
 
 # reclaim_try <次数>：300 个遗留调用（一半 RESERVED、一半 IN_FLIGHT）；两边都动过时返回 0
 reclaim_try() {
@@ -305,7 +307,9 @@ for round in reclaim purge; do
   done
   check "race $round: both instances took part (in one of up to 3 tries)" [ "$both" = 1 ]
 done
-check "race: no reclaim or purge errors in any try (so no 1213)" no_background_errors
+reclaim_errors=$(error_lines reclaim_error) purge_errors=$(error_lines purge_error) deadlocks=$(error_lines 'Error 1213')
+check "race: no reclaim or purge errors in any try (lines with reclaim_error $reclaim_errors, purge_error $purge_errors, Error 1213 $deadlocks)" \
+  [ $((reclaim_errors + purge_errors + deadlocks)) = 0 ]
 check "race: qfctl verify passes" verify_ok
 
 say "== logs"

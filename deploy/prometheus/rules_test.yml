@@ -85,7 +85,7 @@ tests:
       - eval_time: 70m
         alertname: QFAvailabilityBudgetBurnFast
 
-  # 0.65%：超过慢速一档的 0.6%，不到快速一档；持续 15 分钟以上就触发。
+  # 0.65%：超过慢速一档的 0.6%，不到快速一档；条件从头一直成立，持续满 15 分钟才触发：14 分钟时还在等，18 分钟时已触发。
   - interval: 1m
     input_series:
       - series: qf_requests_total{endpoint="calls",status="200",code=""}
@@ -93,6 +93,13 @@ tests:
       - series: qf_requests_total{endpoint="calls",status="503",code="ledger_unavailable"}
         values: 0+6.5x400
     alert_rule_test:
+      - eval_time: 14m
+        alertname: QFAvailabilityBudgetBurnSlow
+      - eval_time: 18m
+        alertname: QFAvailabilityBudgetBurnSlow
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "QF 自己造成的失败在持续消耗可用性的错误预算（6 小时烧掉 5%）"}
       - eval_time: 20m
         alertname: QFAvailabilityBudgetBurnSlow
         exp_alerts:
@@ -276,3 +283,270 @@ tests:
     alert_rule_test:
       - eval_time: 12m
         alertname: QFDependencyUnavailable
+
+  # ---- 下面的情形盯住上面没有细查的规则：多实例聚合、各类失败怎么算、窗口和 for、没有失败时的 0 ----
+
+  # 两个实例：b 上 QF 自己的失败 4%（ledger_unavailable），a 上没有，合起来 2% > 1.44%，快速一档触发，标签里没有实例
+  # （按全部实例聚合）。上游的 5xx（含 503 的 upstream_rate_limited、504 的 upstream_timeout）、客户端断开（status 0）
+  # 和 4xx 只进分母：记录规则的值正好是 40 / 2000 = 0.02。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{instance="a",endpoint="chat",status="200",code=""}
+        values: 0+700x80
+      - series: qf_requests_total{instance="a",endpoint="chat",status="503",code="upstream_rate_limited"}
+        values: 0+200x80
+      - series: qf_requests_total{instance="a",endpoint="embeddings",status="504",code="upstream_timeout"}
+        values: 0+50x80
+      - series: qf_requests_total{instance="a",endpoint="chat",status="0",code="client_canceled"}
+        values: 0+30x80
+      - series: qf_requests_total{instance="a",endpoint="calls",status="404",code="call_not_found"}
+        values: 0+20x80
+      - series: qf_requests_total{instance="b",endpoint="chat",status="200",code=""}
+        values: 0+960x80
+      - series: qf_requests_total{instance="b",endpoint="chat",status="503",code="ledger_unavailable"}
+        values: 0+40x80
+    promql_expr_test:
+      - expr: qf:availability_errors:ratio_rate1h
+        eval_time: 70m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate1h
+            value: 0.02
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: QFAvailabilityBudgetBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: {summary: "QF 自己造成的失败在快速消耗可用性的错误预算（1 小时烧掉 2%）"}
+
+  # 同样的流量，b 上换成 503 的 upstream_rate_limited：没有 QF 自己的失败，两档都不触发。
+  # 分子没有任何序列（QF 还没出过 5xx），记录规则的值是 0，不是空：有请求、没失败。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{instance="a",endpoint="chat",status="200",code=""}
+        values: 0+700x80
+      - series: qf_requests_total{instance="b",endpoint="chat",status="200",code=""}
+        values: 0+960x80
+      - series: qf_requests_total{instance="b",endpoint="chat",status="503",code="upstream_rate_limited"}
+        values: 0+340x80
+    promql_expr_test:
+      - expr: qf:availability_errors:ratio_rate1h
+        eval_time: 70m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate1h
+            value: 0
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: QFAvailabilityBudgetBurnFast
+      - eval_time: 70m
+        alertname: QFAvailabilityBudgetBurnSlow
+
+  # 只有 2xx：四个窗口的比值都是 0（不是空），两档告警都不触发。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{endpoint="chat",status="200",code=""}
+        values: 0+500x400
+      - series: qf_requests_total{endpoint="embeddings",status="200",code=""}
+        values: 0+100x400
+    promql_expr_test:
+      - expr: qf:availability_errors:ratio_rate5m
+        eval_time: 400m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate5m
+            value: 0
+      - expr: qf:availability_errors:ratio_rate30m
+        eval_time: 400m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate30m
+            value: 0
+      - expr: qf:availability_errors:ratio_rate1h
+        eval_time: 400m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate1h
+            value: 0
+      - expr: qf:availability_errors:ratio_rate6h
+        eval_time: 400m
+        exp_samples:
+          - labels: qf:availability_errors:ratio_rate6h
+            value: 0
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: QFAvailabilityBudgetBurnFast
+      - eval_time: 400m
+        alertname: QFAvailabilityBudgetBurnSlow
+
+  # 一个请求都没有（没有任何 qf_requests_total 序列）：比值没有值，不是 0。
+  - interval: 1m
+    input_series:
+      - series: qf_background_interval_seconds{instance="a"}
+        values: 9x80
+    promql_expr_test:
+      - expr: qf:availability_errors:ratio_rate5m
+        eval_time: 70m
+        exp_samples: []
+      - expr: qf:availability_errors:ratio_rate6h
+        eval_time: 70m
+        exp_samples: []
+
+  # QF 自己的 500（错误码为空，例如以后的内部错误）也算失败：2% > 1.44%，快速一档触发。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{endpoint="chat",status="200",code=""}
+        values: 0+980x80
+      - series: qf_requests_total{endpoint="chat",status="500",code=""}
+        values: 0+20x80
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: QFAvailabilityBudgetBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: {summary: "QF 自己造成的失败在快速消耗可用性的错误预算（1 小时烧掉 2%）"}
+
+  # 慢速一档：6 小时里只有最近 55 分钟有 1% 的失败。30 分钟窗口 1% > 0.6%，6 小时窗口约 0.15% < 0.6%：不触发。
+  # （1 小时窗口约 0.9%，36 分钟起就超过 0.6%，长窗口换成 1 小时就会误报。）
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{endpoint="chat",status="200",code=""}
+        values: 0+1000x345 345000+990x55
+      - series: qf_requests_total{endpoint="chat",status="503",code="ledger_unavailable"}
+        values: 0x345 0+10x55
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: QFAvailabilityBudgetBurnSlow
+
+  # 快速一档的 for 2m：71 分钟起突然一半失败，72 分钟左右条件成立；73 分钟时还在等，75 分钟时触发。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{endpoint="chat",status="200",code=""}
+        values: 0+1000x80
+      - series: qf_requests_total{endpoint="chat",status="503",code="ledger_unavailable"}
+        values: 0x70 0+1000x10
+    alert_rule_test:
+      - eval_time: 73m
+        alertname: QFAvailabilityBudgetBurnFast
+      - eval_time: 75m
+        alertname: QFAvailabilityBudgetBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: {summary: "QF 自己造成的失败在快速消耗可用性的错误预算（1 小时烧掉 2%）"}
+
+  # 延迟：正好 0.25 秒算好（le 是“小于等于”）；只看 0.25 那个桶，0.5 的桶不影响；两个实例合起来算。
+  # chat 在 a 上 1000 个里 850 个 ≤ 0.25，embeddings 在 b 上 1000 个里 950 个：慢的比例 (150 + 50) / 2000 = 0.1，
+  # 低于 14.4%，快速一档不触发；高于 6%，慢速一档触发。
+  - interval: 1m
+    input_series:
+      - series: qf_overhead_seconds_bucket{instance="a",endpoint="chat",le="0.25"}
+        values: 0+850x400
+      - series: qf_overhead_seconds_bucket{instance="a",endpoint="chat",le="0.5"}
+        values: 0+1000x400
+      - series: qf_overhead_seconds_count{instance="a",endpoint="chat"}
+        values: 0+1000x400
+      - series: qf_overhead_seconds_bucket{instance="b",endpoint="embeddings",le="0.25"}
+        values: 0+950x400
+      - series: qf_overhead_seconds_bucket{instance="b",endpoint="embeddings",le="0.5"}
+        values: 0+1000x400
+      - series: qf_overhead_seconds_count{instance="b",endpoint="embeddings"}
+        values: 0+1000x400
+    promql_expr_test:
+      - expr: round(qf:latency_slow:ratio_rate6h, 0.0001)
+        eval_time: 400m
+        exp_samples:
+          - labels: '{}'
+            value: 0.1
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: QFLatencyBudgetBurnFast
+      - eval_time: 400m
+        alertname: QFLatencyBudgetBurnSlow
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "QF 自身耗时超过 250 毫秒的请求在持续消耗延迟的错误预算（6 小时烧掉 5%）"}
+
+  # 延迟的慢速一档：最近 40 分钟 10% 慢，6 小时窗口约 1.1% < 6%：不触发（and 换成 or 就会误报）。
+  - interval: 1m
+    input_series:
+      - series: qf_overhead_seconds_bucket{endpoint="chat",le="0.25"}
+        values: 0+1000x360 360000+900x40
+      - series: qf_overhead_seconds_count{endpoint="chat"}
+        values: 0+1000x400
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: QFLatencyBudgetBurnSlow
+
+  # 后台循环：实例 c 起来之后第一轮就没成功过（时间戳一直是 0）。90 秒之后条件成立，再满 1 分钟触发：
+  # 2 分钟时还没有，3 分钟时触发（和“卡住了”一样处理）。
+  - interval: 15s
+    input_series:
+      - series: qf_background_last_success_timestamp_seconds{instance="c"}
+        values: 0x20
+      - series: qf_background_interval_seconds{instance="c"}
+        values: 9x20
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: QFBackgroundStalled
+      - eval_time: 3m
+        alertname: QFBackgroundStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: c}
+            exp_annotations: {summary: "实例 c 的后台循环约 10 轮没有成功"}
+
+  # 依赖：两个实例都报限流出错，账本只在一个实例上偶尔一次；按依赖各一条告警，没有实例标签。
+  - interval: 1m
+    input_series:
+      - series: qf_dependency_errors_total{instance="a",dependency="rate_limiter",operation="admit"}
+        values: 0+3x20
+      - series: qf_dependency_errors_total{instance="b",dependency="rate_limiter",operation="adjust"}
+        values: 0+1x20
+      - series: qf_dependency_errors_total{instance="b",dependency="ledger",operation="finish"}
+        values: 0x10 1x10
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QFDependencyUnavailable
+        exp_alerts:
+          - exp_labels: {severity: critical, dependency: rate_limiter}
+            exp_annotations: {summary: "rate_limiter 持续出错超过 5 分钟"}
+
+  # 延迟快速一档的 for 2m：25% 慢从头一直成立，2 分钟时还在等，5 分钟时已触发。
+  - interval: 1m
+    input_series:
+      - series: qf_overhead_seconds_bucket{endpoint="chat",le="0.25"}
+        values: 0+750x20
+      - series: qf_overhead_seconds_count{endpoint="chat"}
+        values: 0+1000x20
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: QFLatencyBudgetBurnFast
+      - eval_time: 5m
+        alertname: QFLatencyBudgetBurnFast
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations: {summary: "QF 自身耗时超过 250 毫秒的请求在快速消耗延迟的错误预算（1 小时烧掉 2%）"}
+
+  # 延迟慢速一档的短窗口是 30 分钟：前 5 小时 8% 慢（6 小时窗口一直超过 6%），中间 36 分钟全快，最近 22 分钟又是 7% 慢。
+  # 358 分钟时 30 分钟窗口只有 22/30 × 7% ≈ 5.1% < 6%，不触发；5 分钟窗口从第 4 分钟起就超过 6%，已经连续 17 分钟以上，
+  # 短窗口若换成 5 分钟，满 15 分钟就会误报。
+  - interval: 1m
+    input_series:
+      - series: qf_overhead_seconds_bucket{endpoint="chat",le="0.25"}
+        values: 0+920x300 277000+1000x35 312930+930x21
+      - series: qf_overhead_seconds_count{endpoint="chat"}
+        values: 0+1000x358
+    alert_rule_test:
+      - eval_time: 358m
+        alertname: QFLatencyBudgetBurnSlow
+
+  # 可用性 5 分钟的记录规则，分子和分母的窗口都是 5 分钟：70 分钟时窗口 (65, 70] 里 QF 自己的 503 只在最近两个点上有增量（各 100）。
+  # 失败的序列窗口里第一个点是 0，rate 不向前外推（外推到零点就是窗口起点）：增量 200 / 300 秒 = 2/3 次/秒；
+  # 成功的序列外推满 5 分钟：4000 × 5/4 / 300 秒 = 50/3 次/秒；比值 (2/3) / (50/3 + 2/3) = 2/52 ≈ 0.0385。
+  # 分子若换成 3 分钟窗口，增量照样是 200、窗口只有 180 秒，值会变大（实测 0.0641）。
+  - interval: 1m
+    input_series:
+      - series: qf_requests_total{endpoint="chat",status="200",code=""}
+        values: 0+1000x80
+      - series: qf_requests_total{endpoint="chat",status="503",code="ledger_unavailable"}
+        values: 0x67 0+100x13
+    promql_expr_test:
+      - expr: round(qf:availability_errors:ratio_rate5m, 0.0001)
+        eval_time: 70m
+        exp_samples:
+          - labels: '{}'
+            value: 0.0385

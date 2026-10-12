@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -167,6 +168,21 @@ func TestExporterObeysContext(t *testing.T) {
 	}
 	if exportTimeout >= batchExportTimeout {
 		t.Fatalf("the HTTP timeout %v must be shorter than the batch processor's %v", exportTimeout, batchExportTimeout)
+	}
+}
+
+// 收集端收下连接却一直不回：先到的是导出器自己的 HTTP 超时，不是传进来的 ctx。批处理器给的 ctx 是它自己的 5 秒导出上限，
+// 靠它兜底就等于没有这一层超时。ctx 给得比 exportTimeout 长得多，返回时它必须还没到期。
+func TestExporterHTTPClientTimesOut(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := newExporter(hangingCollector(t)).ExportSpans(ctx, fixedSpans(t))
+	var netErr net.Error
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("err = %v, want the HTTP client's timeout", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the export returned only when the context expired: the HTTP client has no timeout of its own")
 	}
 }
 

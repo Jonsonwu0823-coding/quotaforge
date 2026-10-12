@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """逐个 run 核对：QS 的 demo-summary.json 对 QF 账本（联调和经 QS 的真实演示共用，用法见 docs/queryshield.md）。
 
-  check_qs_runs.py [--e2e] --project <QF 的 Compose 项目名> --account <账户名> <demo-summary.json>
+  check_qs_runs.py [--e2e [--qf-log <QF 的日志文件>]] --project <QF 的 Compose 项目名> --account <账户名> <demo-summary.json>
 
 默认是真实模式：只对 usage_total 为 known 的 run 比次数和用量，unknown 的列出来（skip），不算失败。
 --e2e 是联调模式（fake-upstream，不花钱），规则更严：每个 run 都得是 known，账户里的每次调用都得对得上。
 防“空真”：两种模式都要求至少比到 1 个 usage_total 为 known 的 run（not_run 不算）；联调另要求至少 1 次带 X-Run-Id 的嵌入，
 而且带 X-Run-Id 的嵌入属于摘要里的 run。
+--qf-log（只能和 --e2e 一起用）是联调里 QF 开着追踪时的日志（docker compose logs --no-log-prefix）：再核对调用日志里的 trace_id、
+parent_span_id 和摘要里每个 run 的 trace_id（账本不记 trace，所以读日志）。经 QS 的真实演示不开追踪，不用它。
 退出码：0 全部 ok；1 有 FAIL；2 跑不了（找不到容器、摘要不合法等）。
 
 只用标准库，Python 3.10 起可用。账本在 qf-mysql 容器里用 root 只读查询，root 密码只在容器的 secret 文件里。
@@ -22,6 +24,8 @@ from collections import Counter, defaultdict
 USAGE_KEYS = (("prompt", "prompt_tokens"), ("completion", "completion_tokens"), ("total", "total_tokens"))
 USAGE_STATUSES = ("known", "unknown", "not_run")
 NAME = re.compile(r"[A-Za-z0-9_.-]+")
+TRACE_ID = re.compile(r"[0-9a-f]{32}")  # W3C Trace Context：小写十六进制，不能全是 0
+SPAN_ID = re.compile(r"[0-9a-f]{16}")
 COLUMNS = "id purpose status http prompt completion total client run created".split()
 INT_COLUMNS = ("http", "prompt", "completion", "total")
 CALLS_SQL = (
@@ -88,6 +92,28 @@ def read_ledger(project, account):
     return parse_calls(sql(project, CALLS_SQL.format(account=account))), (int(budget[0]), int(budget[1]))
 
 
+def valid_id(pattern, value):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None and value.strip("0") != ""
+
+
+def read_call_log(path, account):
+    """账户的调用日志行（msg 是 call），只留 run_id、trace_id、parent_span_id。不是 JSON 的行（启动之外的杂项输出）跳过。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError as err:
+        raise CannotRun(f"cannot read the QF log: {type(err).__name__}")
+    rows = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("msg") == "call" and entry.get("account") == account:
+            rows.append({key: entry.get(key) for key in ("run_id", "trace_id", "parent_span_id")})
+    return rows
+
+
 # ---- 读摘要 ----------------------------------------------------------------------------------------------------
 
 
@@ -108,6 +134,8 @@ def load_summary(path):
     for record in summary["records"]:
         if not isinstance(record, dict):
             raise CannotRun("summary record is not an object")
+        if record.get("trace_id") is not None and not valid_id(TRACE_ID, record["trace_id"]):
+            raise CannotRun("summary has a trace_id that is not 32 lowercase hex digits")
         run_id = record.get("run_id")
         if run_id is None:
             continue
@@ -252,23 +280,54 @@ def reconcile(summary, calls, budget, e2e):
     return out
 
 
+def trace_checks(summary, log_rows):
+    """联调的三项 trace 检查（纯函数：摘要和日志行进，结果行出）。每个 run 的 trace_id 以摘要为准，QF 不从 run 反推。"""
+    out = []
+
+    def check(ok, text):
+        out.append(("ok" if ok else "FAIL", text))
+
+    run_trace = {record["run_id"]: record.get("trace_id") for record in summary["records"] if record.get("run_id")}
+    in_run = [row for row in log_rows if row["run_id"]]
+    outside = [row for row in log_rows if not row["run_id"]]
+
+    bad = [row for row in log_rows if not (valid_id(SPAN_ID, row["parent_span_id"]) and valid_id(TRACE_ID, row["trace_id"]))]
+    check(log_rows and not bad, f"trace: every call log line has a valid parent_span_id and trace_id ({len(log_rows)} lines, {len(bad)} without)")
+
+    wrong = [row for row in in_run if not run_trace.get(row["run_id"]) or row["trace_id"] != run_trace[row["run_id"]]]
+    runs = len({row["run_id"] for row in in_run})
+    check(in_run and not wrong, f"trace: {len(in_run)} calls of {runs} runs carry the trace_id of their run in the summary ({len(wrong)} do not)")
+
+    run_traces = {trace for trace in run_trace.values() if trace}
+    shared = [row for row in outside if row["trace_id"] in run_traces]
+    traces = len({row["trace_id"] for row in outside})
+    check(outside and not shared, f"trace: {len(outside)} calls without X-Run-Id are on {traces} traces, none of them a run's ({len(shared)} are)")
+    return out
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description="Reconcile a QS demo-summary.json with the QF ledger, run by run.")
     parser.add_argument("--e2e", action="store_true", help="strict mode for the fake-upstream end-to-end run")
     parser.add_argument("--project", required=True, help="Compose project name of QF")
     parser.add_argument("--account", required=True, help="QF account name")
+    parser.add_argument("--qf-log", help="QF's log (docker compose logs --no-log-prefix), adds the trace checks; needs --e2e")
     parser.add_argument("summary", help="path of QS's demo-summary.json")
     args = parser.parse_args(argv)
+    if args.qf_log and not args.e2e:
+        parser.error("--qf-log needs --e2e: only the end-to-end run has tracing on")
     try:
         for value in (args.project, args.account):
             if not NAME.fullmatch(value):
                 raise CannotRun("project and account names may only contain letters, digits, '_', '.', '-'")
         summary = load_summary(args.summary)
         calls, budget = read_ledger(args.project, args.account)
+        log_rows = read_call_log(args.qf_log, args.account) if args.qf_log else None
     except CannotRun as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
     results = reconcile(summary, calls, budget, args.e2e)
+    if log_rows is not None:
+        results += trace_checks(summary, log_rows)
     for level, text in results:
         print(f"{level:<4} {text}")
     failed = sum(1 for level, _ in results if level == "FAIL")

@@ -4,6 +4,8 @@
 #   用法：scripts/compose-qs-e2e.sh <QS 公开仓库的本地目录>      （也可以用环境变量 QS_DIR）
 # QS 目录必须干净地检出在固定提交上；脚本不往里写任何文件。QS 的镜像缺了才构建，已有同名镜像时直接用。
 # 核对（QS 摘要对 QF 账本，逐个 run）由 scripts/check_qs_runs.py 做，和经 QS 的真实演示的对账共用同一份代码。
+# QF 开着追踪（compose.observability.yaml，只起 quotaforge 和它依赖的 qf-jaeger）：同一份代码再按 QF 的调用日志核对
+# traceparent（账本不记 trace）。经 QS 的真实演示不开追踪，也就不查。
 # 联调用自己的项目名、镜像标签和端口，不碰本机已有的 QF、QS 环境；开始前发现冲突就报错退出，只删自己建的东西。
 # QF 的 Key 由 qfctl 现发，只经环境变量交给 QS，不写文件、不打印。摘要写到 evidence/compose-qs-e2e-summary.txt。
 # qfctl 的 stderr 写进临时目录，脚本失败时打印出来（Key 在 stdout，不在 stderr）。
@@ -20,7 +22,7 @@ native() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
 QS_DIR=$(native "$(cd "${1:-${QS_DIR:?用法：$0 <QS 公开仓库的本地目录>}}" && pwd)")
 cd "$(dirname "$0")/.."
 
-readonly QS_COMMIT=979ddbd9caca730c42a44d83df12d02d30e72484
+readonly QS_COMMIT=b6e64855b175c5abd6378be49b0027e7331c18a7
 readonly QF_PROJECT=qf-e2e-qf QS_PROJECT=qf-e2e-qs
 readonly ACCOUNT=e2e
 # 额度 100 万 tokens：整套演示实测消费约 11.1 万（33 次聊天、15 次嵌入），留足余量；且远大于一次预留（请求字节数加 default_max_tokens 1024）。
@@ -56,7 +58,7 @@ qs() {
       -f "$images_file" "$@"
   )
 }
-qf() { docker compose -p "$QF_PROJECT" -f compose.yaml -f compose.qs-fake.yaml --progress plain "$@"; }
+qf() { docker compose -p "$QF_PROJECT" -f compose.yaml -f compose.qs-fake.yaml -f compose.observability.yaml --progress plain "$@"; }
 qfctl() { qf run --rm -T --no-deps qfctl "$@" 2>>"$work/qfctl.err"; }
 # 只读 SQL：root 密码在容器里的 secret 文件中，经进程环境变量交给 mysql，不出现在命令行、输出和宿主机上。
 # shellcheck disable=SC2016 # $(...) 要在容器里展开，所以用单引号
@@ -84,10 +86,10 @@ for project in "$QF_PROJECT" "$QS_PROJECT"; do
   [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" ] || die "同名项目 $project 已有容器"
   [ -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$project")" ] || die "同名项目 $project 已有数据卷"
 done
-for port in 8080 "$QUERYSHIELD_HTTP_PORT"; do
+for port in 8080 "$QUERYSHIELD_HTTP_PORT" 16686; do # 16686：Jaeger 的界面
   # 连得上 127.0.0.1 的这个端口就是被占（监听在 0.0.0.0 的也算）。不用 bind 试探：Windows 上它分不出 0.0.0.0 的占用。
   if "$PY" -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=3).close()' "$port" 2>/dev/null; then
-    die "本机端口 $port 被占用（QS 的端口可用 QUERYSHIELD_HTTP_PORT 换）"
+    die "本机端口 $port 被占用（QS 的端口可用 QUERYSHIELD_HTTP_PORT 换；8080 是 QF，16686 是 Jaeger 的界面）"
   fi
 done
 if docker network inspect qs-qf >/dev/null 2>&1; then
@@ -122,8 +124,10 @@ qs exec -T app python scripts/demo_run.py --mode fake-upstream --base-url http:/
 say "demo took $((SECONDS - start)) s"
 qs exec -T app cat /tmp/evidence-gateway/demo-summary.json >"$work/summary.json" 2>/dev/null || die "取不到 demo-summary.json，演示输出最后一行：$(tail -n 1 "$work/demo.out" | redact)"
 
-echo "== 核对（逐个 run，规则在 check_qs_runs.py 里）"
-"$PY" scripts/check_qs_runs.py --e2e --project "$QF_PROJECT" --account "$ACCOUNT" "$work/summary.json" | tee -a "$SUMMARY" || failures=$((failures + 1))
+echo "== 核对（逐个 run 和 trace，规则在 check_qs_runs.py 里）"
+# 日志只交给核对脚本，不打印；脚本只输出题号、run_id 和条数。
+qf logs --no-log-prefix quotaforge >"$work/qf.log" 2>/dev/null || die "取不到 QF 的日志（docker compose logs 失败）"
+"$PY" scripts/check_qs_runs.py --e2e --qf-log "$work/qf.log" --project "$QF_PROJECT" --account "$ACCOUNT" "$work/summary.json" | tee -a "$SUMMARY" || failures=$((failures + 1))
 
 # 固定提交里的 QS，run 里的调用（带 X-Run-Id）都带 Idempotency-Key，run 外的（建索引的嵌入）都不带。QF 把两者存在 calls 里。
 idempotency_keys_match() { [ "$keyed_in_run" -gt 0 ] && [ "$keyless_in_run" = 0 ] && [ "$keyed_outside_run" = 0 ]; }

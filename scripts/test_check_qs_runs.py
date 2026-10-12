@@ -356,6 +356,139 @@ class KnownRunGuard(Cases):
             self.assertIn(("ok", "at least one run with known usage_total was compared (11)"), self.results(summary, calls, budget, e2e))
 
 
+def trace_world():
+    """world() 加上 trace：摘要里每个 run 一个 trace_id（建 run 之外的记录是 null，Q04b 没有这个键）；日志行一条对一次调用，
+    带 run 的用它的 run 的 trace，不带的各自一条新 trace，每次尝试一个新的 parent_span_id。"""
+    summary, calls, budget = world()
+    traces = {}
+    for n, record in enumerate(summary["records"], start=1):
+        if record.get("run_id"):
+            traces[record["run_id"]] = f"{n:032x}"
+            record["trace_id"] = traces[record["run_id"]]
+        elif record.get("id") == "Q12":
+            record["trace_id"] = None
+    rows = []
+    for n, call in enumerate(calls, start=1):
+        trace = traces[call["run"]] if call["run"] else f"{1000 + n:032x}"
+        rows.append({"run_id": call["run"], "trace_id": trace, "parent_span_id": f"{n:016x}"})
+    return summary, rows
+
+
+def fresh_trace():
+    return f"{0xabc:032x}"
+
+
+class TraceChecks(unittest.TestCase):
+    def fails(self, summary, rows):
+        return [text for level, text in cq.trace_checks(summary, rows) if level == "FAIL"]
+
+    def test_clean_world_passes_all_three_checks_and_reports_the_counts(self):
+        summary, rows = trace_world()
+        results = cq.trace_checks(summary, rows)
+        self.assertEqual([level for level, _ in results], ["ok", "ok", "ok"])
+        self.assertEqual(
+            [text for _, text in results],
+            [
+                "trace: every call log line has a valid parent_span_id and trace_id (" + str(len(rows)) + " lines, 0 without)",
+                "trace: 34 calls of 12 runs carry the trace_id of their run in the summary (0 do not)",
+                "trace: 2 calls without X-Run-Id are on 2 traces, none of them a run's (0 are)",
+            ],
+        )
+
+    def test_a_line_without_parent_span_id_fails_only_the_first_check(self):
+        for bad in (None, "", "A" * 16, "0" * 16, "ab" * 7, "ab" * 9, 7):
+            summary, rows = trace_world()
+            rows[5]["parent_span_id"] = bad
+            (fail,) = self.fails(summary, rows)
+            self.assertIn("1 without", fail, bad)
+
+    def test_a_line_without_a_valid_trace_id_fails_the_first_check(self):
+        for bad in (None, "0" * 32, "F" * 32, "ab" * 15):
+            summary, rows = trace_world()
+            rows[5]["trace_id"] = bad
+            self.assertIn("1 without", self.fails(summary, rows)[0], bad)
+
+    def test_a_run_call_on_another_trace_fails_only_the_second_check(self):
+        summary, rows = trace_world()
+        next(row for row in rows if row["run_id"] == RUN_IDS[2])["trace_id"] = fresh_trace()
+        (fail,) = self.fails(summary, rows)
+        self.assertIn("(1 do not)", fail)
+
+    def test_a_run_call_on_another_runs_trace_fails_only_the_second_check(self):
+        summary, rows = trace_world()
+        other = record_of(summary, RUN_IDS[1])["trace_id"]
+        next(row for row in rows if row["run_id"] == RUN_IDS[2])["trace_id"] = other
+        (fail,) = self.fails(summary, rows)
+        self.assertIn("(1 do not)", fail)
+
+    def test_a_run_whose_summary_has_no_trace_id_fails_the_second_check(self):
+        for edit in (lambda r: r.update(trace_id=None), lambda r: r.pop("trace_id")):
+            summary, rows = trace_world()
+            edit(record_of(summary, RUN_IDS[2]))
+            self.assertIn("do not", self.fails(summary, rows)[0])
+            self.assertEqual(len(self.fails(summary, rows)), 1)
+
+    def test_a_call_of_a_run_that_is_not_in_the_summary_fails_the_second_check(self):
+        summary, rows = trace_world()
+        rows.append({"run_id": "run-9999", "trace_id": fresh_trace(), "parent_span_id": f"{99:016x}"})
+        (fail,) = self.fails(summary, rows)
+        self.assertIn("(1 do not)", fail)
+
+    def test_a_call_outside_runs_on_a_runs_trace_fails_only_the_third_check(self):
+        summary, rows = trace_world()
+        outside = next(row for row in rows if not row["run_id"])
+        outside["trace_id"] = record_of(summary, RUN_IDS[0])["trace_id"]
+        (fail,) = self.fails(summary, rows)
+        self.assertIn("(1 are)", fail)
+
+    def test_calls_outside_runs_may_share_a_trace_with_each_other(self):
+        summary, rows = trace_world()
+        outside = [row for row in rows if not row["run_id"]]
+        outside[1]["trace_id"] = outside[0]["trace_id"]
+        self.assertEqual(self.fails(summary, rows), [])
+
+    def test_empty_groups_do_not_pass(self):
+        summary, rows = trace_world()
+        self.assertEqual(len(self.fails(summary, [])), 3)
+        self.assertEqual(len(self.fails(summary, [row for row in rows if row["run_id"]])), 1)  # 没有 run 外的调用
+        self.assertEqual(len(self.fails(summary, [row for row in rows if not row["run_id"]])), 1)  # 没有 run 内的调用
+
+    def test_output_is_ascii(self):
+        summary, rows = trace_world()
+        for _, text in cq.trace_checks(summary, rows):
+            text.encode("ascii")
+
+
+class CallLog(unittest.TestCase):
+    def read(self, text, account="e2e"):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8", newline="")
+        handle.write(text)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return cq.read_call_log(handle.name, account)
+
+    def line(self, **fields):
+        return json.dumps({"time": "t", "level": "INFO", "msg": "call", "account": "e2e", **fields}) + "\r\n"
+
+    def test_only_call_lines_of_the_account_are_kept_with_the_three_fields(self):
+        text = (
+            self.line(run_id="r1", trace_id="t1", parent_span_id="p1", request_id="x", key_id=1)
+            + self.line(trace_id="t2")
+            + self.line(account="other", run_id="r9", trace_id="t9", parent_span_id="p9")
+            + self.line(msg="lookup", trace_id="t3")
+            + "not json at all\r\n[1, 2]\r\n\r\n"
+            + json.dumps({"msg": "listening", "addr": "x"}) + "\n"
+        )
+        self.assertEqual(
+            self.read(text),
+            [{"run_id": "r1", "trace_id": "t1", "parent_span_id": "p1"}, {"run_id": None, "trace_id": "t2", "parent_span_id": None}],
+        )
+
+    def test_an_unreadable_log_cannot_run(self):
+        with self.assertRaises(cq.CannotRun):
+            cq.read_call_log(os.path.join(tempfile.gettempdir(), "no-such-qf.log"), "e2e")
+
+
 class Inputs(unittest.TestCase):
     def write(self, content):
         handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
@@ -388,6 +521,9 @@ class Inputs(unittest.TestCase):
             "bad status": self.bad_summary(lambda s: s["records"][0]["usage_total"].update(status="done")),
             "known without numbers": self.bad_summary(lambda s: s["records"][0]["usage_total"].update(total_tokens=None)),
             "record not an object": self.bad_summary(lambda s: s["records"].append(3)),
+            "trace_id upper case": self.bad_summary(lambda s: s["records"][0].update(trace_id="A" * 32)),
+            "trace_id all zero": self.bad_summary(lambda s: s["records"][0].update(trace_id="0" * 32)),
+            "trace_id not a string": self.bad_summary(lambda s: s["records"][0].update(trace_id=5)),
         }
         for name, path in cases.items():
             code, out, err, read = self.run_main(path, ledger=([], [0, 0]))
@@ -412,6 +548,42 @@ class Inputs(unittest.TestCase):
         code, out, _, _ = self.run_main(path, ledger=(calls, tuple(budget)))
         self.assertEqual((code, out.splitlines()[-1]), (0, "check_qs_runs: 0 failed"))
         self.assertTrue(all(line.startswith(("ok", "FAIL", "skip", "info", "check_qs_runs")) for line in out.splitlines()))
+
+    def test_summaries_without_trace_ids_still_load(self):
+        cq.load_summary(self.write(world()[0]))  # QS 带 traceparent 之前的摘要
+        cq.load_summary(self.write(trace_world()[0]))
+
+    def test_qf_log_needs_e2e(self):
+        summary, rows = trace_world()
+        path = self.write(summary)
+        with contextlib.redirect_stderr(io.StringIO()) as err, mock.patch.object(cq, "read_ledger") as read:
+            with self.assertRaises(SystemExit) as ctx:
+                cq.main(["--project", "p", "--account", "a", "--qf-log", "x.log", path])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--qf-log needs --e2e", err.getvalue())
+        self.assertFalse(read.called)
+
+    def test_the_trace_checks_are_appended_and_count_in_the_exit_code(self):
+        summary, rows = trace_world()
+        _, calls, budget = world()
+        path = self.write(summary)
+        with mock.patch.object(cq, "read_call_log", return_value=rows) as read:
+            code, out, _, _ = self.run_main(path, "--e2e", "--qf-log", "qf.log", ledger=(calls, tuple(budget)))
+        self.assertEqual((code, out.splitlines()[-1]), (0, "check_qs_runs: 0 failed"))
+        self.assertEqual(read.call_args.args, ("qf.log", "a"))
+        self.assertEqual(sum(line.startswith("ok   trace:") for line in out.splitlines()), 3)
+        rows[0]["parent_span_id"] = None
+        with mock.patch.object(cq, "read_call_log", return_value=rows):
+            code, out, _, _ = self.run_main(path, "--e2e", "--qf-log", "qf.log", ledger=(calls, tuple(budget)))
+        self.assertEqual((code, out.splitlines()[-1]), (1, "check_qs_runs: 1 failed"))
+        code, out, _, _ = self.run_main(path, "--e2e", ledger=(calls, tuple(budget)))  # 不给 --qf-log：不查 trace
+        self.assertEqual(sum("trace:" in line for line in out.splitlines()), 0)
+
+    def test_an_unreadable_qf_log_exits_2(self):
+        path = self.write(trace_world()[0])
+        code, out, err, _ = self.run_main(path, "--e2e", "--qf-log", os.path.join(tempfile.gettempdir(), "no-such-qf.log"), ledger=([], (0, 0)))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("error: cannot read the QF log", err)
 
     def test_a_ledger_that_cannot_be_read_exits_2(self):
         path = self.write(world()[0])

@@ -112,7 +112,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Jonsonwu0823-coding/queryshield
-          ref: 979ddbd9caca730c42a44d83df12d02d30e72484
+          ref: b6e64855b175c5abd6378be49b0027e7331c18a7
           path: queryshield
           persist-credentials: false # QS 的检出里不留本仓库的令牌
       - name: QS end to end (fake upstream)

@@ -5,14 +5,16 @@ groups:
     rules:
       # 可用性：QF 自己造成的失败占全部请求的比例。失败 = 5xx 且错误码不是上游的（upstream_*），
       # 现在就是 ledger_unavailable、rate_limiter_unavailable；分母是全部请求（两个转发接口和调用状态查询，含 4xx 和客户端断开）。
+      # 分子加 `or vector(0)`：QF 还没出过 5xx 时没有那条序列，sum() 是空向量，比值也是空，看板显示“无数据”；补成 0 才是“有请求、没失败”。
+      # 两边都没有标签（sum 不分组），所以补的 0 和空向量的标签对得上。一个请求都没有时分母是空的，比值仍然没有值。
       - record: qf:availability_errors:ratio_rate5m
-        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[5m])) / sum(rate(qf_requests_total[5m]))
+        expr: (sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[5m])) or vector(0)) / sum(rate(qf_requests_total[5m]))
       - record: qf:availability_errors:ratio_rate30m
-        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[30m])) / sum(rate(qf_requests_total[30m]))
+        expr: (sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[30m])) or vector(0)) / sum(rate(qf_requests_total[30m]))
       - record: qf:availability_errors:ratio_rate1h
-        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[1h])) / sum(rate(qf_requests_total[1h]))
+        expr: (sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[1h])) or vector(0)) / sum(rate(qf_requests_total[1h]))
       - record: qf:availability_errors:ratio_rate6h
-        expr: sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[6h])) / sum(rate(qf_requests_total[6h]))
+        expr: (sum(rate(qf_requests_total{status=~"5..",code!~"upstream_.*"}[6h])) or vector(0)) / sum(rate(qf_requests_total[6h]))
       # 延迟：chat、embeddings 请求里 QF 自身耗时（总耗时减去等上游的时间）超过 0.25 秒的比例。
       # 0.25 正好是 qf_overhead_seconds 的一个桶边界，按桶算，不插值。
       - record: qf:latency_slow:ratio_rate5m
