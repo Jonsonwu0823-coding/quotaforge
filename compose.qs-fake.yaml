@@ -1,0 +1,12 @@
+# 接 QS 的假上游：quotaforge 接入外部网络 qs-qf，上游是 QS 的 fake-upstream（http://fake-upstream:8000/v1）。
+# 只有 quotaforge 接 qs-qf；qf-mysql、qfctl 不接。Key 用 qfctl 发（见 docs/queryshield.md）。
+services:
+  quotaforge:
+    volumes:
+      # 目标路径和 compose.yaml 相同，所以是替换。
+      - ./deploy/config.qs-fake.json:/etc/quotaforge/config.json:ro
+    networks: [default, qs-qf]
+
+networks:
+  qs-qf:
+    external: true

@@ -1,0 +1,106 @@
+# 单独运行：QF、账本数据库、迁移、限流用的 Redis 和 QF 自己的假上游，不依赖 QS。docker compose up -d --build --wait
+# 接 QS 时叠加 compose.qs-fake.yaml 或 compose.real.yaml（见 docs/queryshield.md）。
+#
+# 数据库的密码只在三个 secret 文件里：root_password、migrate_dsn、app_dsn。默认用 deploy/test-only-db/ 下
+# 写明仅测试的文件；真实模式由 scripts/compose-real.ps1 每次随机生成，经 QF_DB_SECRETS_DIR 指过来。
+name: quotaforge
+
+services:
+  quotaforge:
+    build:
+      context: .
+      target: quotaforge
+    image: quotaforge:local
+    environment:
+      QUOTAFORGE_CONFIG: /etc/quotaforge/config.json
+      QF_FAKE_UPSTREAM_KEY: test-only-upstream-key # 仅测试：QF 的假上游不校验它
+      QF_REDIS_URL: redis://qf-redis:6379/0 # 配置里 redis.url_env 指向它；qf-redis 只在 Compose 的内部网络上，不设密码
+    volumes:
+      - ./deploy/config.compose.json:/etc/quotaforge/config.json:ro
+    secrets:
+      - app_dsn # 只能增删改查的账号；配置里 database.dsn_file 指向它
+    depends_on:
+      qfctl:
+        condition: service_completed_successfully # 迁移成功后才启动；版本不对 QF 会拒绝启动
+      qf-redis:
+        condition: service_healthy # 只是起得干净；QF 启动时不连 Redis，Redis 之后停了只让要限流的请求得到 503
+    ports:
+      - 127.0.0.1:8080:8080
+    # 比 QF 的关闭上限（较大的上游超时 + 3 次账本操作各 2 秒 + 余量 5 秒，默认 36 秒）长，进行中的请求能完整收尾。
+    stop_grace_period: 40s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # 一次性服务：数据库健康后执行迁移，成功就退出。脚本也用它执行别的管理命令：
+  # docker compose run --rm -T qfctl account create -name NAME -limit TOKENS
+  qfctl:
+    build:
+      context: .
+      target: qfctl
+    image: quotaforge-qfctl:local
+    environment:
+      QFCTL_MYSQL_DSN_FILE: /run/secrets/migrate_dsn
+    secrets:
+      - migrate_dsn # 能建表的账号，只有 qfctl 用
+    depends_on:
+      qf-mysql:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  # 账本数据库：不发布端口，不接入 qs-qf；数据在匿名卷里，down -v 时删掉。
+  # 不叫 mysql：同名服务接进同一个网络后，按服务名解析会混淆。
+  qf-mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      MYSQL_DATABASE: quotaforge
+    volumes:
+      # 首次初始化时建 qf_migrate、qf_app 两个账号，密码取自两个连接串 secret
+      - ./deploy/mysql-init.sh:/docker-entrypoint-initdb.d/qf-accounts.sh:ro
+    secrets:
+      - mysql_root_password
+      - migrate_dsn
+      - app_dsn
+    # 初始化阶段的临时服务器不监听 TCP，所以经 127.0.0.1 ping 通时初始化已经完成。
+    # mysqladmin ping 只看服务器在不在，不需要密码。
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+      start_interval: 1s
+
+  # 限流用的 Redis：不持久化（限流的状态丢了只会让桶变满），不发布端口，不接入 qs-qf。
+  # 不叫 redis：同名服务接进同一个网络后，按服务名解析会混淆。
+  qf-redis:
+    image: redis:8
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+
+  # 不写 depends_on：QF 启动时不连上游，覆盖文件可以不起它。
+  qf-fake-upstream:
+    build:
+      context: .
+      target: fakeupstream
+    image: quotaforge-fakeupstream:local
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+secrets:
+  mysql_root_password:
+    file: ${QF_DB_SECRETS_DIR:-./deploy/test-only-db}/root_password
+  migrate_dsn:
+    file: ${QF_DB_SECRETS_DIR:-./deploy/test-only-db}/migrate_dsn
+  app_dsn:
+    file: ${QF_DB_SECRETS_DIR:-./deploy/test-only-db}/app_dsn

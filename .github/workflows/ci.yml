@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支有新的运行时，取消还在跑的旧运行；main 上不取消，每次推送都跑完。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: .
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 127.0.0.1:3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 --silent"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8
+        ports:
+          - 127.0.0.1:6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install clients
+        run: sudo apt-get install -y --no-install-recommends mysql-client redis-tools
+      - name: Create test database and accounts
+        run: |
+          migrate_pw=$(openssl rand -hex 16)
+          app_pw=$(openssl rand -hex 16)
+          echo "::add-mask::$migrate_pw"
+          echo "::add-mask::$app_pw"
+          QF_MIGRATE_PASSWORD=$migrate_pw QF_APP_PASSWORD=$app_pw \
+            scripts/create_test_db.sh mysql -uroot -h127.0.0.1
+          {
+            echo "QF_APP_PASSWORD=$app_pw"
+            echo "QUOTAFORGE_TEST_MYSQL_MIGRATE_DSN=qf_migrate:$migrate_pw@tcp(127.0.0.1:3306)/quotaforge_test?parseTime=true"
+            echo "QUOTAFORGE_TEST_MYSQL_DSN=qf_app:$app_pw@tcp(127.0.0.1:3306)/quotaforge_test?parseTime=true"
+            echo "QUOTAFORGE_TEST_REDIS_ADDR=127.0.0.1:6379"
+          } >>"$GITHUB_ENV"
+      # vendor/ 要和 go.mod、go.sum 一致：重新生成后没有任何差异，也没有多出的文件。
+      - name: vendor/ matches go.mod and go.sum
+        run: |
+          go mod vendor
+          git diff --exit-code -- go.mod go.sum vendor
+          test -z "$(git status --porcelain -- vendor)"
+      - run: go vet ./...
+      # 联调和真实演示对账共用的核对脚本：纯标准库、不需要 Docker，几秒钟；放在 test 任务里，草稿 PR 也会跑。
+      - name: check_qs_runs unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'
+      # 要 MySQL 的测试在这里不许跳过：缺连接串就失败。
+      - run: go test -race ./...
+        env:
+          QUOTAFORGE_TEST_REQUIRE_DB: "1"
+      - name: Connectivity
+        run: |
+          export MYSQL_PWD=$QF_APP_PASSWORD
+          mysql -uqf_app -h127.0.0.1 quotaforge_test -N -e 'SELECT 1'
+          if mysql -uqf_app -h127.0.0.1 quotaforge_test -e 'CREATE TABLE ci_probe (id INT)'; then
+            echo "qf_app 不应有建表权限" >&2
+            exit 1
+          fi
+          redis-cli -h 127.0.0.1 ping
+
+  # Compose 冒烟要构建镜像、起容器，为省分钟数只在手动触发、推送到 main、PR 不是草稿时跑。
+  compose-smoke:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck
+        run: shellcheck scripts/*.sh deploy/mysql-init.sh
+      - name: Standalone smoke
+        run: scripts/compose-smoke.sh
+      - name: qs-fake override with a stand-in upstream
+        run: scripts/compose-qs-fake-check.sh
+      # 两个实例的跨进程检查（超扣、同键、共享限流、杀掉一个实例由另一个接手、同时回收和清理）
+      - name: Two instances
+        run: scripts/compose-two-instances.sh
+      # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
+      # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
+      - name: Check out QueryShield at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: Jonsonwu0823-coding/queryshield
+          ref: 979ddbd9caca730c42a44d83df12d02d30e72484
+          path: queryshield
+          persist-credentials: false # QS 的检出里不留本仓库的令牌
+      - name: QS end to end (fake upstream)
+        run: scripts/compose-qs-e2e.sh "$GITHUB_WORKSPACE/queryshield"
+      - name: Upload summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-summaries
+          path: |
+            evidence/compose-smoke-summary.txt
+            evidence/compose-qs-fake-check-summary.txt
+            evidence/compose-two-instances-summary.txt
+            evidence/compose-qs-e2e-summary.txt
+          if-no-files-found: warn

@@ -1,0 +1,242 @@
+{
+  "direct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 9312,
+    "warmup_requests": 1552,
+    "ok_per_second": 310.4,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 9312,
+        "p50_ms": 51.494,
+        "p95_ms": 52.52,
+        "p99_ms": 54.307,
+        "max_ms": 78.38
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 9312
+    }
+  },
+  "direct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 37227,
+    "warmup_requests": 6242,
+    "ok_per_second": 1240.9,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 37227,
+        "p50_ms": 51.296,
+        "p95_ms": 53.482,
+        "p99_ms": 56.129,
+        "max_ms": 69.161
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 37227
+    }
+  },
+  "one-1acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4612,
+    "warmup_requests": 806,
+    "ok_per_second": 153.73333333333332,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4612,
+        "p50_ms": 99.558,
+        "p95_ms": 137.66,
+        "p99_ms": 159.176,
+        "max_ms": 202.187
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 4612
+    }
+  },
+  "one-1acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4479,
+    "warmup_requests": 844,
+    "ok_per_second": 149.3,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4479,
+        "p50_ms": 412.593,
+        "p95_ms": 601.725,
+        "p99_ms": 709.629,
+        "max_ms": 1211.455
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 4479
+    }
+  },
+  "one-16acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 6220,
+    "warmup_requests": 1054,
+    "ok_per_second": 207.33333333333334,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 6220,
+        "p50_ms": 74.934,
+        "p95_ms": 100.557,
+        "p99_ms": 118.985,
+        "max_ms": 142.955
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 6220
+    }
+  },
+  "one-16acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 11610,
+    "warmup_requests": 2038,
+    "ok_per_second": 387,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 11610,
+        "p50_ms": 157.261,
+        "p95_ms": 247.908,
+        "p99_ms": 310.375,
+        "max_ms": 411.047
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 11610
+    }
+  }
+}

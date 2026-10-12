@@ -1,0 +1,10 @@
+# 脚本写的摘要（冒烟、两个实例、联调）
+/evidence/
+# 构建产物
+/bin/
+# 本机环境文件（.env.example 除外）
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/

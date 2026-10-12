@@ -1,0 +1,41 @@
+== one-1acct-c16 (run 1): calls rows at start 0
+-- docker stats (mid-run)
+qf-bench-qf-fake-upstream-1 cpu 12.35% mem 8.504MiB / 15.72GiB
+qf-bench-qf-mysql-1 cpu 108.10% mem 503.5MiB / 15.72GiB
+qf-bench-qf-redis-1 cpu 7.18% mem 6.398MiB / 15.72GiB
+qf-bench-qfbench-run-69a079737753 cpu 7.81% mem 7.746MiB / 15.72GiB
+qf-bench-quotaforge-1 cpu 100.66% mem 8.848MiB / 15.72GiB
+-- MySQL (mid-run): row lock waits now 21, threads connected 17, running 7
+-- MySQL connections of the QF account by client, command and state, and row lock waits (5 samples, 1 s apart)
+  1: 172.18.0.6 Sleep - 11;172.18.0.6 Execute statistics 3;172.18.0.6 Execute updating 2; lock waits 15
+  2: 172.18.0.6 Sleep - 12;172.18.0.6 Execute updating 2;172.18.0.6 Execute statistics 2; lock waits 0
+  3: 172.18.0.6 Sleep - 14;172.18.0.6 Execute statistics 1;172.18.0.6 Execute updating 1; lock waits 15
+  4: 172.18.0.6 Sleep - 7;172.18.0.6 Execute statistics 5;172.18.0.6 Execute updating 4; lock waits 21
+  5: 172.18.0.6 Sleep - 15;172.18.0.6 Execute updating 1; lock waits 21
+-- QF -> fake upstream sockets (mid-run): quotaforge established 16, time_wait 0; quotaforge-b 
+-- counters over the measured period (about 30s): row lock waits 12561, row lock wait ms 84169, redo log fsyncs 277, deadlocks 0, commits 13514, mean commit 0.267 ms
+-- QF db_pool lines
+(none)
+
+== one-1acct-c64 (run 1): calls rows at start 7808
+-- docker stats (mid-run)
+qf-bench-qf-fake-upstream-1 cpu 13.25% mem 10.75MiB / 15.72GiB
+qf-bench-qf-mysql-1 cpu 111.19% mem 521MiB / 15.72GiB
+qf-bench-qf-redis-1 cpu 7.07% mem 6.52MiB / 15.72GiB
+qf-bench-qfbench-run-34f90b4f2c85 cpu 8.91% mem 9.531MiB / 15.72GiB
+qf-bench-quotaforge-1 cpu 97.92% mem 13.02MiB / 15.72GiB
+-- MySQL (mid-run): row lock waits now 465, threads connected 33, running 33
+-- MySQL connections of the QF account by client, command and state, and row lock waits (5 samples, 1 s apart)
+  1: 172.18.0.6 Execute statistics 15;172.18.0.6 Execute updating 15;172.18.0.6 Sleep - 2; lock waits 496
+  2: 172.18.0.6 Execute updating 16;172.18.0.6 Execute statistics 15;172.18.0.6 Query waiting for handler commit 1; lock waits 496
+  3: 172.18.0.6 Execute statistics 16;172.18.0.6 Execute updating 14;172.18.0.6 Sleep - 2; lock waits 465
+  4: 172.18.0.6 Execute statistics 15;172.18.0.6 Execute updating 15;172.18.0.6 Sleep - 1;172.18.0.6 Execute Opening tables 1; lock waits 496
+  5: 172.18.0.6 Execute statistics 16;172.18.0.6 Execute updating 15;172.18.0.6 Sleep - 1; lock waits 465
+-- QF -> fake upstream sockets (mid-run): quotaforge established 41, time_wait 0; quotaforge-b 
+-- counters over the measured period (about 30s): row lock waits 13629, row lock wait ms 922332, redo log fsyncs 326, deadlocks 0, commits 13660, mean commit 0.282 ms
+-- QF db_pool lines
+{"time":"2026-10-11T01:23:54.55981498Z","level":"INFO","msg":"db_pool","waits":1908,"wait_ms":45127,"in_use":32,"open":32,"max_open":32}
+{"time":"2026-10-11T01:24:03.523713183Z","level":"INFO","msg":"db_pool","waits":8220,"wait_ms":179679,"in_use":32,"open":32,"max_open":32}
+{"time":"2026-10-11T01:24:12.546284309Z","level":"INFO","msg":"db_pool","waits":8331,"wait_ms":179480,"in_use":32,"open":32,"max_open":32}
+{"time":"2026-10-11T01:24:21.651499746Z","level":"INFO","msg":"db_pool","waits":7585,"wait_ms":192258,"in_use":32,"open":32,"max_open":32}
+

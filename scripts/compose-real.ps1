@@ -1,0 +1,292 @@
+﻿[CmdletBinding()]
+param(
+    [switch]$Check,
+    [switch]$Stop,
+    [string]$UpstreamBaseUrl,
+    [string]$Reconcile
+)
+
+# 本机用（Windows PowerShell 5.1 起）：以真实上游（百炼）起 QF 和它的账本数据库，接入外部网络 qs-qf，
+# 用 qfctl 给 QS 建账户、发一把 QF Key。
+#
+#   .\scripts\compose-real.ps1           输入百炼地址和 Key，起 QF，QF Key 放进这个窗口的环境变量 QUERYSHIELD_MODEL_API_KEY
+#   .\scripts\compose-real.ps1 -Check    同上，再经 QF 发一次聊天、一次嵌入（花费很少），只显示状态码、模型名、usage、x-request-id，
+#                                        出错时显示状态码和错误码；聊天带一个新生成的 Idempotency-Key，再用同一个键发一遍，
+#                                        显示第二次是重放、已消费没有增加（不多花钱）；最后显示这个账户的额度（上限、已消费、剩余），
+#                                        以及这把 Key 和账户的限流限额（每分钟的请求数和 token 数）。
+#                                        任何一次请求不是 2xx，或者重放的核对不成立（x-request-id、正文和第一次不同，或者已消费变了），
+#                                        就在额度那一行之后报错退出（throw）；QF 还开着，QUERYSHIELD_MODEL_API_KEY 仍然设着
+#   .\scripts\compose-real.ps1 -Stop     停掉 QF，连数据库的数据一起删掉，删掉临时目录，清掉 QUERYSHIELD_MODEL_API_KEY
+#   .\scripts\compose-real.ps1 -Reconcile <QS 的 demo-summary.json>
+#                                        经 QS 跑完真实演示之后：把 QS 的摘要和正在运行的 QF 的账本逐个 run 对账
+#                                        （check_qs_runs.py，真实模式），再跑一次 qfctl verify。不启动、不清理任何东西；
+#                                        退出码：0 全部对上；1 有对不上的 run、账本校验失败，或本脚本报错（QF 没在运行、找不到
+#                                        Python 等）；2 核对脚本跑不了（摘要不合法、读不了账本）。不能和 -Check、-Stop 一起用
+#
+# -UpstreamBaseUrl 显式指定上游地址，不再询问。用来把“真实”上游指向别的 OpenAI 兼容服务
+# （例如 QF 自己的假上游），在不花钱的情况下检查脚本流程。
+#
+# 百炼 Key 只放在本进程的环境变量里，经 Compose secrets 挂成容器里的文件；不打印、不写文件，
+# 脚本结束时恢复这三个环境变量。QF Key 只放进当前 PowerShell 进程的环境变量 QUERYSHIELD_MODEL_API_KEY（不显示，不写文件，
+# 库里只有它的哈希），脚本结束后留着，给同一个窗口里随后运行的 QS 的 compose-real-demo.ps1 读取（它在网关模式下先读这个变量，
+# 有值就不提示）；-Stop 清掉。再次启动时新 Key 直接覆盖旧值；-Reconcile 不碰它。
+#
+# 数据库每次都是新的：每次启动随机生成数据库密码，写进系统临时目录下 quotaforge-real\db 的三个文件，
+# 经 Compose secrets 挂进容器（不进环境变量、docker inspect 和任何输出）。-Stop 时连数据和这个目录一起删掉。
+# 上一次没有 -Stop 就再次启动时，先自动清掉上一次的容器、数据卷和临时文件，否则旧库里的密码和新生成的对不上。
+#
+# docker compose 都带 --progress plain --ansi never：让 docker 的输出是逐行的纯文本，不带进度动画和颜色。
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue' # 5.1 的 Invoke-WebRequest 进度条写回窗口顶部几行时会弄乱中文（-Check 用到）；只在本脚本的作用域里生效
+$summaryPath = $null
+if ($PSBoundParameters.ContainsKey('Reconcile')) {
+    if ($Check -or $Stop) { throw '-Reconcile 不能和 -Check、-Stop 一起用。' }
+    if (-not $Reconcile -or -not (Test-Path -LiteralPath $Reconcile -PathType Leaf)) { throw "找不到 QS 的摘要文件：$Reconcile" }
+    # 下面会切到 QF 目录，所以先把相对路径变成完整路径。
+    $summaryPath = (Resolve-Path -LiteralPath $Reconcile).ProviderPath
+}
+$qfDir = Split-Path -Parent $PSScriptRoot
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) 'quotaforge-real'
+$dbDir = Join-Path $tempDir 'db'
+$envNames = @('QF_UPSTREAM_API_KEY', 'QF_UPSTREAM_BASE_URL', 'QF_DB_SECRETS_DIR')
+$account = 'queryshield'
+$project = 'quotaforge' # compose.yaml 里的 name:，所有 docker compose 命令靠它找到这套栈
+$accountLimit = 1000000
+# 限流限额（每分钟）：远高于演示的用量（3 分钟 54 次请求，单次聊天的估算最多约 17,300 tokens）。
+$accountRate = @('-rpm', '600', '-tpm', '2000000')
+$keyRate = @('-rpm', '300', '-tpm', '1000000')
+
+# 原生命令的失败看退出码；不把它的 stderr 转成 PowerShell 错误（5.1 下 2>&1 会这样）。
+function Invoke-Native {
+    param([string]$What, [scriptblock]$Command)
+    & $Command
+    if ($LASTEXITCODE -ne 0) { throw "$What 失败（退出码 $LASTEXITCODE）" }
+}
+
+function Read-HiddenSecret {
+    param([string]$Prompt)
+    $secure = Read-Host -Prompt $Prompt -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+# 所有 docker compose 调用都经这里，带同一组全局参数。不带 -f 时只用主文件：qfctl、ps、down 不需要真实覆盖文件。
+function Invoke-Compose {
+    param([string[]]$Arguments)
+    docker compose --progress plain --ansi never @Arguments
+}
+
+# 32 个十六进制字符的随机密码。
+function New-HexSecret {
+    $bytes = New-Object byte[] 16
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+# 写三个数据库 secret 文件（UTF-8 无 BOM），返回给 Compose 用的目录（正斜杠）。
+function New-DatabaseSecrets {
+    New-Item -ItemType Directory -Force -Path $dbDir | Out-Null
+    $utf8 = New-Object Text.UTF8Encoding $false
+    $files = @{
+        'root_password' = New-HexSecret
+        'migrate_dsn'   = "qf_migrate:$(New-HexSecret)@tcp(qf-mysql:3306)/quotaforge"
+        'app_dsn'       = "qf_app:$(New-HexSecret)@tcp(qf-mysql:3306)/quotaforge"
+    }
+    foreach ($name in $files.Keys) {
+        [IO.File]::WriteAllText((Join-Path $dbDir $name), $files[$name] + "`n", $utf8)
+    }
+    return $dbDir.Replace('\', '/')
+}
+
+# 删掉容器、数据卷（数据库的数据）和临时目录。-Stop 和发现上一次的残留时都用它。
+function Remove-Previous {
+    Invoke-Native 'docker compose down' { Invoke-Compose @('down', '-v', '--remove-orphans') }
+    Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
+}
+
+function Invoke-Qfctl {
+    param([string[]]$Arguments)
+    $output = Invoke-Compose (@('run', '--rm', '-T', '--no-deps', 'qfctl') + $Arguments)
+    if ($LASTEXITCODE -ne 0) { throw "qfctl $($Arguments[0]) $($Arguments[1]) 失败（退出码 $LASTEXITCODE）" }
+    return $output
+}
+
+# 只显示代理变量设没设：值里可能有代理的账号密码。
+function Show-ProxyVariables {
+    $containerId = Invoke-Compose @('ps', '-q', 'quotaforge')
+    $containerEnv = docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' $containerId
+    foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy') {
+        $state = '未设置'
+        if ($containerEnv -cmatch "^$name=") { $state = '已设置' }
+        Write-Host "  ${name}：$state"
+    }
+}
+
+# 发一次请求，显示结果；成功时返回响应（给重放演示比对），失败时返回 $null。
+function Invoke-QF {
+    param([string]$Path, [string]$Key, [string]$Body, [string]$IdempotencyKey)
+    $headers = @{ Authorization = "Bearer $Key" }
+    if ($IdempotencyKey) { $headers['Idempotency-Key'] = $IdempotencyKey }
+    $request = @{
+        Uri             = "http://127.0.0.1:8080$Path"
+        Method          = 'Post'
+        Headers         = $headers
+        ContentType     = 'application/json'
+        Body            = [Text.Encoding]::UTF8.GetBytes($Body)
+        UseBasicParsing = $true
+    }
+    try {
+        $response = Invoke-WebRequest @request
+    }
+    catch {
+        # 非 2xx 会抛异常（5.1 和 7 的异常类型不同，都带 Response，正文在 ErrorDetails.Message）。
+        # 显示状态码和 QF 的错误码，例如 upstream_auth_failed（Key 错）和 upstream_unavailable（地址错）；
+        # 正文不是 QF 的错误 JSON 时只显示状态码。对应的调用号在 QF 日志里。
+        $err = $_
+        $failed = $err.Exception.Response
+        if ($null -eq $failed) { throw }
+        $code = $null
+        try { $code = ($err.ErrorDetails.Message | ConvertFrom-Json).error.code } catch { }
+        if ($code) {
+            Write-Host "  ${Path}：状态 $([int]$failed.StatusCode)，错误码 $code"
+        }
+        else {
+            Write-Host "  ${Path}：状态 $([int]$failed.StatusCode)"
+        }
+        return $null
+    }
+    $json = $response.Content | ConvertFrom-Json
+    $replayed = ''
+    if ($response.Headers['Idempotent-Replayed']) { $replayed = "，重放（Idempotent-Replayed: $($response.Headers['Idempotent-Replayed'])）" }
+    Write-Host "  ${Path}：状态 $([int]$response.StatusCode)，模型 $($json.model)，usage $($json.usage | ConvertTo-Json -Compress)，x-request-id $($response.Headers['x-request-id'])$replayed"
+    return $response
+}
+
+# 这个账户已消费的 token 数：qfctl usage 第二行的第 4 列（制表符分隔）。
+function Get-Consumed {
+    $row = (Invoke-Qfctl @('usage', '-account', $account) | Select-Object -Skip 1 -First 1) -split "`t"
+    return $row[3]
+}
+
+# Python 3.10 起能跑核对脚本。Windows 上的 python 可能只是应用商店的占位程序，所以要真的运行一下。
+function Find-Python {
+    foreach ($name in 'python', 'python3', 'py') {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command) { continue }
+        $null = & $command.Source -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
+        if ($LASTEXITCODE -eq 0) { return $command.Source }
+    }
+    throw '找不到 Python 3.10 或更新的版本（python、python3、py 都不能用）。请先安装 Python；核对脚本只用标准库，不需要装包。'
+}
+
+# 逐个 run 对账，再校验账本。返回退出码：1 表示对不上或校验失败，2 表示核对跑不了。
+function Invoke-Reconcile {
+    param([string]$SummaryPath)
+    $containerId = Invoke-Compose @('ps', '--status', 'running', '-q', 'quotaforge') | Select-Object -First 1
+    if (-not $containerId -or -not (Test-Path $dbDir)) {
+        throw '真实栈没有在运行：请先用 .\scripts\compose-real.ps1 起 QF，再跑 QS 的真实演示。'
+    }
+    $python = Find-Python
+    Write-Host "== QS 摘要对 QF 账本，逐个 run（项目 $project，账户 $account）"
+    & $python (Join-Path $PSScriptRoot 'check_qs_runs.py') --project $project --account $account $SummaryPath | Out-Host
+    $exitCode = $LASTEXITCODE
+    $env:QF_DB_SECRETS_DIR = $dbDir.Replace('\', '/')
+    Write-Host '== qfctl verify'
+    $verify = Invoke-Compose @('run', '--rm', '-T', '--no-deps', 'qfctl', 'verify')
+    $verifyExit = $LASTEXITCODE
+    $verify | ForEach-Object { Write-Host "  $_" }
+    if ($exitCode -eq 0 -and $verifyExit -ne 0) { $exitCode = 1 }
+    return $exitCode
+}
+
+$previousLocation = Get-Location
+$previousEnv = @{}
+foreach ($name in $envNames) { $previousEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+Set-Location $qfDir
+try {
+    docker info --format '{{.ServerVersion}}' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Docker 没有运行：请先启动 Docker Desktop。' }
+
+    if ($summaryPath) {
+        exit (Invoke-Reconcile $summaryPath)
+    }
+    if ($Stop) {
+        Remove-Previous
+        Remove-Item Env:QUERYSHIELD_MODEL_API_KEY -ErrorAction SilentlyContinue # 不管原来有没有值
+        Write-Host '已停止 QF，数据库的数据和临时目录已删除，QUERYSHIELD_MODEL_API_KEY 已清掉。'
+        return
+    }
+    if ((Invoke-Compose @('ps', '-a', '-q')) -or (Test-Path $tempDir)) {
+        Write-Host '发现上一次没有 -Stop 的残留，先清理（容器、数据库的数据、临时目录），再重新开始。'
+        Remove-Previous
+    }
+    if (-not (docker network ls --filter 'name=^qs-qf$' --format '{{.Name}}')) {
+        Invoke-Native '创建网络 qs-qf' { docker network create qs-qf | Out-Null }
+    }
+
+    if (-not $UpstreamBaseUrl) {
+        $UpstreamBaseUrl = Read-Host -Prompt '百炼的 base URL（例如 https://dashscope.aliyuncs.com/compatible-mode/v1）'
+    }
+    if (-not $UpstreamBaseUrl) { throw '上游地址为空。' }
+    $env:QF_UPSTREAM_BASE_URL = $UpstreamBaseUrl
+    $env:QF_UPSTREAM_API_KEY = Read-HiddenSecret -Prompt '百炼 Key（输入不显示）'
+    if (-not $env:QF_UPSTREAM_API_KEY) { throw '百炼 Key 为空。' }
+
+    $env:QF_DB_SECRETS_DIR = New-DatabaseSecrets
+
+    Invoke-Native '构建 QF 镜像' { Invoke-Compose @('build', 'quotaforge', 'qfctl') }
+    Invoke-Native '启动 QF' { Invoke-Compose @('-f', 'compose.yaml', '-f', 'compose.real.yaml', 'up', '-d', '--wait', 'quotaforge') }
+    Invoke-Qfctl (@('account', 'create', '-name', $account, '-limit', "$accountLimit") + $accountRate) | Out-Null
+    $issued = Invoke-Qfctl (@('key', 'issue', '-account', $account, '-models', 'qwen-plus,text-embedding-v4') + $keyRate)
+    $qfKey = ($issued | Where-Object { $_ -like 'key: *' }) -replace '^key: ', ''
+    if (-not $qfKey) { throw 'qfctl key issue 的输出格式不对' }
+    $env:QUERYSHIELD_MODEL_API_KEY = $qfKey # 不在 $envNames 里：脚本结束时不恢复，留给同一个窗口里的 QS 脚本
+    Write-Host 'QF 已启动：本机 http://127.0.0.1:8080/v1，qs-qf 网络上 http://quotaforge:8080/v1。'
+    Write-Host "账户 $account 的额度上限 $accountLimit tokens。"
+    Write-Host 'QF Key 已放进这个窗口的环境变量 QUERYSHIELD_MODEL_API_KEY（不显示，只在这个窗口里有效）。在同一个窗口里运行 QS 的 compose-real-demo.ps1，它会直接读取，不用粘贴；-Stop 时清掉。'
+    Write-Host 'quotaforge 容器里的代理变量（只显示设没设）：'
+    Show-ProxyVariables
+
+    if ($Check) {
+        Write-Host '经 QF 各发一次聊天和嵌入（聊天带一个新的 Idempotency-Key）：'
+        $chatBody = '{"model":"qwen-plus","messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}'
+        $idempotencyKey = "real-check-$([guid]::NewGuid().ToString('N'))"
+        $first = Invoke-QF -Path '/v1/chat/completions' -Key $qfKey -Body $chatBody -IdempotencyKey $idempotencyKey
+        $embedding = Invoke-QF -Path '/v1/embeddings' -Key $qfKey -Body '{"model":"text-embedding-v4","input":["ok"]}'
+        $checkPassed = [bool]$first -and [bool]$embedding # 任何一次请求不是 2xx 就没通过（Invoke-QF 返回 $null）
+        if ($first) {
+            # 同一个键、同样的请求体再发一遍：QF 重放第一次的响应，不调上游、不扣额度。
+            $consumedBefore = Get-Consumed
+            Write-Host '用同一个 Idempotency-Key 再发一遍聊天：'
+            $second = Invoke-QF -Path '/v1/chat/completions' -Key $qfKey -Body $chatBody -IdempotencyKey $idempotencyKey
+            $consumedAfter = Get-Consumed
+            $checkPassed = $checkPassed -and [bool]$second -and ($consumedAfter -eq $consumedBefore)
+            if ($second) {
+                $sameId = "$($second.Headers['x-request-id'])" -eq "$($first.Headers['x-request-id'])"
+                $sameBody = $second.Content -eq $first.Content
+                Write-Host "  重放：Idempotent-Replayed $($second.Headers['Idempotent-Replayed'])，x-request-id 和第一次相同 $sameId，正文相同 $sameBody；已消费 $consumedBefore → $consumedAfter"
+                $checkPassed = $checkPassed -and $sameId -and $sameBody
+            }
+        }
+        # qfctl usage 的第二行：account limit reserved consumed remaining 和各状态的调用数，以制表符分隔
+        $row = (Invoke-Qfctl @('usage', '-account', $account) | Select-Object -Skip 1 -First 1) -split "`t"
+        Write-Host "账户 $account 的额度：上限 $($row[1])，已消费 $($row[3])，剩余 $($row[4]) tokens"
+        # 限流限额是 qfctl key list、usage 的最后两列：rpm_limit、tpm_limit（0 表示不限）
+        $keyRow = (Invoke-Qfctl @('key', 'list', '-account', $account) | Select-Object -Skip 1 -First 1) -split "`t"
+        Write-Host "限流（每分钟）：这把 Key 最多 $($keyRow[4]) 个请求、$($keyRow[5]) tokens；账户最多 $($row[10]) 个请求、$($row[11]) tokens"
+        if (-not $checkPassed) {
+            throw '-Check 没有全部通过，见上面的输出。QF 还开着，看完日志再运行 -Stop。'
+        }
+    }
+}
+finally {
+    # 原来没设的要真正删除：PowerShell 7.6 上 SetEnvironmentVariable(名字, $null) 只把值设成空串，变量还在。
+    foreach ($name in $envNames) {
+        if ($null -eq $previousEnv[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable($name, $previousEnv[$name], 'Process') }
+    }
+    Set-Location $previousLocation
+}

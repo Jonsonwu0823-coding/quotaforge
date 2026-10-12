@@ -1,0 +1,232 @@
+package gateway
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/ratelimit"
+)
+
+// call 是一次调用的记录，处理过程中逐步填写，结束时写成一行日志。
+type call struct {
+	id      string
+	start   time.Time
+	purpose config.Purpose
+	key     *ledger.Key
+	alias   string
+	model   *config.Model
+
+	planned     ledger.Reservation  // prepare 建好的预留（估算见 estimate）；准入的 TPM 花费和预留量都是它的 Amount
+	reservation *ledger.Reservation // 预留成功后才有，指向 planned
+	callStatus  ledger.Status       // 账本里记下的调用状态；收尾失败时还是收尾前的状态
+	outcome     ledger.Status       // 网关自己判定的结局（见 outcome），和账本写没写成功无关；预留成功后才有
+	evidence    ledger.Evidence     // 结清时凭的证据
+	ledgerError string              // 账本操作失败的原因（驱动的错误文字，不含连接串）
+
+	admitted         []ratelimit.Bucket // 准入放行时扣过的桶；没有桶、被拒、出错时为空
+	rateLimitedBy    string             // 被限流时是哪个桶，例如 key/rpm
+	rateLimiterError string             // 准入或修正时 Redis 的错误文字（不含 URL）
+
+	clientRequestID string
+	runID           string
+	idempotencyKey  string // 请求头的原值，只用来记日志；fingerprint 不为 nil 时它是校验过的键
+	fingerprint     []byte // 请求带了合法的幂等键时才有
+	replayOf        string // 重放时是原来的调用号
+
+	status             int  // 写回客户端的 HTTP 状态；什么都没写回（客户端已断开）时是 0
+	clientDisconnected bool // 写回之前客户端已经断开
+
+	upstreamCalled     bool
+	upstreamStatus     int
+	upstreamXRequestID string
+	upstreamResponseID string
+	upstreamModel      string
+	usage              *ledger.Usage // nil 表示未知
+
+	errorCode string
+}
+
+// parseUsage 解析上游的 usage，三个数原样用上游的。缺字段、不符合 ledger.Usage.Valid（负数、chat 缺 completion_tokens）
+// 都算未知（nil），不补 0。
+func parseUsage(raw json.RawMessage, p config.Purpose) *ledger.Usage {
+	if u := decodeUsage(raw); u != nil && u.Valid(string(p)) {
+		return u
+	}
+	return nil
+}
+
+// decodeUsage 读出 usage 对象里的三个数；不是对象、缺 prompt_tokens 或 total_tokens 时返回 nil。
+// 上游的响应和调用日志里的 usage（usageAttr 写的）是同一个形状。
+func decodeUsage(raw json.RawMessage) *ledger.Usage {
+	var u struct {
+		Prompt     *int64 `json:"prompt_tokens"`
+		Completion *int64 `json:"completion_tokens"`
+		Total      *int64 `json:"total_tokens"`
+	}
+	if json.Unmarshal(raw, &u) != nil || u.Prompt == nil || u.Total == nil {
+		return nil
+	}
+	usage := ledger.Usage{Prompt: *u.Prompt, Total: *u.Total}
+	if u.Completion != nil {
+		usage.Completion, usage.HasCompletion = *u.Completion, true
+	}
+	return &usage
+}
+
+// 客户端头、模型别名和上游给的请求号进日志前的统一规则：合法 UTF-8、不超过 128 个字符、没有控制字符。
+const maxLoggedLen = 128
+
+func loggable(s string) bool {
+	if !utf8.ValidString(s) || utf8.RuneCountInString(s) > maxLoggedLen {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// checked 返回符合 loggable 的值，不符合的返回空串。外部来的值进账本前都经过它，和日志同一条规则。
+func checked(s string) string {
+	if !loggable(s) {
+		return ""
+	}
+	return s
+}
+
+// appendChecked 记下一个外部来的值：空的不记；合法的记原值；不合法的不记值，只标 <name>_invalid。
+func appendChecked(attrs []slog.Attr, name, v string) []slog.Attr {
+	switch {
+	case v == "":
+		return attrs
+	case loggable(v):
+		return append(attrs, slog.String(name, v))
+	default:
+		return append(attrs, slog.Bool(name+"_invalid", true))
+	}
+}
+
+// logCall 每次调用写一行。不记 Key、上游 Key、请求体和响应体。重放的请求没调上游，所以没有 usage。
+func (g *gateway) logCall(c *call) {
+	attrs := []slog.Attr{
+		slog.String("request_id", c.id),
+		slog.String("endpoint", string(c.purpose)),
+		slog.Int64("duration_ms", time.Since(c.start).Milliseconds()),
+	}
+	if c.status != 0 {
+		attrs = append(attrs, slog.Int("status", c.status))
+	}
+	if c.key != nil {
+		attrs = append(attrs, slog.Int64("key_id", c.key.ID), slog.String("account", c.key.Account))
+	}
+	attrs = appendChecked(attrs, "model_alias", c.alias)
+	if c.model != nil {
+		attrs = append(attrs, slog.String("upstream", c.model.Upstream.Name))
+	}
+	if c.upstreamStatus != 0 {
+		attrs = append(attrs, slog.Int("upstream_status", c.upstreamStatus))
+	}
+	if c.errorCode != "" {
+		attrs = append(attrs, slog.String("error_code", c.errorCode))
+	}
+	attrs = appendChecked(attrs, "client_request_id", c.clientRequestID)
+	attrs = appendChecked(attrs, "run_id", c.runID)
+	attrs = appendChecked(attrs, "idempotency_key", c.idempotencyKey)
+	if c.replayOf != "" {
+		attrs = append(attrs, slog.String("replay_of", c.replayOf))
+	}
+	attrs = appendChecked(attrs, "upstream_x_request_id", c.upstreamXRequestID)
+	attrs = appendChecked(attrs, "upstream_response_id", c.upstreamResponseID)
+	attrs = appendChecked(attrs, "upstream_model", c.upstreamModel)
+	if c.upstreamCalled {
+		attrs = append(attrs, usageAttr(c.usage))
+	}
+	if c.reservation != nil {
+		attrs = append(attrs, slog.String("call_status", string(c.callStatus)), slog.String("outcome", string(c.outcome)),
+			slog.Int64("reserved_tokens", c.reservation.Amount()))
+	}
+	if c.clientDisconnected {
+		attrs = append(attrs, slog.Bool("client_disconnected", true))
+	}
+	if c.ledgerError != "" {
+		attrs = append(attrs, slog.String("ledger_error", c.ledgerError))
+	}
+	if c.rateLimitedBy != "" {
+		attrs = append(attrs, slog.String("rate_limited_by", c.rateLimitedBy))
+	}
+	if c.rateLimiterError != "" {
+		attrs = append(attrs, slog.String("rate_limiter_error", c.rateLimiterError))
+	}
+	g.log.LogAttrs(context.Background(), slog.LevelInfo, "call", attrs...)
+}
+
+func usageAttr(u *ledger.Usage) slog.Attr {
+	if u == nil {
+		return slog.String("usage", "unknown")
+	}
+	fields := []any{slog.Int64("prompt_tokens", u.Prompt)}
+	if u.HasCompletion {
+		fields = append(fields, slog.Int64("completion_tokens", u.Completion))
+	}
+	return slog.Group("usage", append(fields, slog.Int64("total_tokens", u.Total))...)
+}
+
+// logProof 是调用日志里当证据用的字段。
+type logProof struct {
+	Msg       string          `json:"msg"`
+	RequestID string          `json:"request_id"`
+	Outcome   ledger.Status   `json:"outcome"`
+	Usage     json.RawMessage `json:"usage"`
+}
+
+// ReadCallLog 从 QF 的调用日志（每行一个 JSON，docker compose logs --no-log-prefix 的原样输出）里取出证据。
+// 只看预留过的调用（有 outcome 的 msg=call 行）：outcome 是 SETTLED 且 usage 是对象的，凭日志里的用量结算；
+// outcome 是 CANCELLED 的（确定没发出、上游 4xx）释放。outcome 是 USAGE_UNKNOWN 的不算证据，只计数（unknown）。
+// 别的行（启动日志、查询、鉴权失败、重放）跳过。不是 JSON 的行、字段不对的调用行、同一个调用号出现两次，返回 ledger.ErrBadEvidence。
+func ReadCallLog(r io.Reader) (proofs []ledger.Proof, unknown int, err error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for n := 1; sc.Scan(); n++ {
+		if len(bytes.TrimSpace(sc.Bytes())) == 0 {
+			continue
+		}
+		var l logProof
+		if err := json.Unmarshal(sc.Bytes(), &l); err != nil {
+			return nil, 0, fmt.Errorf("%w: line %d is not a JSON log line", ledger.ErrBadEvidence, n)
+		}
+		if l.Msg != "call" || l.Outcome == "" {
+			continue
+		}
+		p := ledger.Proof{CallID: l.RequestID, Line: n, Status: l.Outcome, Source: ledger.CallLog}
+		switch {
+		case !ledger.ValidCallID(l.RequestID):
+			return nil, 0, fmt.Errorf("%w: line %d: request_id is not a QF call id", ledger.ErrBadEvidence, n)
+		case l.Outcome == ledger.UsageUnknown:
+			unknown++
+			continue
+		case l.Outcome == ledger.Settled:
+			if p.Usage = decodeUsage(l.Usage); p.Usage == nil {
+				return nil, 0, fmt.Errorf("%w: line %d: a SETTLED outcome without usage", ledger.ErrBadEvidence, n)
+			}
+		case l.Outcome != ledger.Cancelled:
+			return nil, 0, fmt.Errorf("%w: line %d: unknown outcome %q", ledger.ErrBadEvidence, n, l.Outcome)
+		}
+		proofs = append(proofs, p)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, 0, fmt.Errorf("%w: %v", ledger.ErrBadEvidence, err)
+	}
+	return proofs, unknown, ledger.CheckDistinct(proofs)
+}

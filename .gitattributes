@@ -1,0 +1,5 @@
+# 文本文件一律用 LF：Windows 上 core.autocrlf=true 克隆，bash 脚本也不会变成 CRLF、跑不起来。
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gz binary

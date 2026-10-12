@@ -1,0 +1,17 @@
+{
+  "upstreams": [
+    {
+      "name": "bailian",
+      "base_url_env": "QF_UPSTREAM_BASE_URL",
+      "api_key_file": "/run/secrets/upstream_api_key",
+      "rpm": 600,
+      "tpm": 2000000
+    }
+  ],
+  "models": [
+    {"alias": "qwen-plus", "purpose": "chat", "upstream": "bailian", "upstream_model": "qwen-plus", "default_max_tokens": 32768},
+    {"alias": "text-embedding-v4", "purpose": "embeddings", "upstream": "bailian", "upstream_model": "text-embedding-v4"}
+  ],
+  "database": {"dsn_file": "/run/secrets/app_dsn"},
+  "redis": {"url_env": "QF_REDIS_URL"}
+}

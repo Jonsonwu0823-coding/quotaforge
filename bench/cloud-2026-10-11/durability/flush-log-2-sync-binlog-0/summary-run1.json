@@ -1,0 +1,82 @@
+{
+  "one-1acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 6703,
+    "warmup_requests": 1105,
+    "ok_per_second": 223.43333333333334,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 6703,
+        "p50_ms": 68.198,
+        "p95_ms": 94.473,
+        "p99_ms": 107.754,
+        "max_ms": 135.569
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 6703
+    }
+  },
+  "one-1acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 6736,
+    "warmup_requests": 1156,
+    "ok_per_second": 224.53333333333333,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 6736,
+        "p50_ms": 273.963,
+        "p95_ms": 397.1,
+        "p99_ms": 473.91,
+        "max_ms": 704.533
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 6736
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# 压测用的配置（deploy/config.bench.json），叠加在 compose.yaml、compose.two.yaml 之上，只换两个实例的配置文件。
+# 用法见 scripts/compose-bench.sh。
+services:
+  quotaforge:
+    volumes: !override
+      - ./deploy/config.bench.json:/etc/quotaforge/config.json:ro
+  quotaforge-b:
+    volumes: !override
+      - ./deploy/config.bench.json:/etc/quotaforge/config.json:ro

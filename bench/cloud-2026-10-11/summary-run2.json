@@ -1,0 +1,526 @@
+{
+  "direct-c1": {
+    "mode": "sustain",
+    "concurrency": 1,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 586,
+    "warmup_requests": 98,
+    "ok_per_second": 19.533333333333335,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 586,
+        "p50_ms": 51.14,
+        "p95_ms": 51.498,
+        "p99_ms": "insufficient samples",
+        "max_ms": 84.994
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 586
+    }
+  },
+  "direct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 9312,
+    "warmup_requests": 1568,
+    "ok_per_second": 310.4,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 9312,
+        "p50_ms": 51.507,
+        "p95_ms": 52.347,
+        "p99_ms": 53.097,
+        "max_ms": 54.193
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 9312
+    }
+  },
+  "direct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 37151,
+    "warmup_requests": 6208,
+    "ok_per_second": 1238.3666666666666,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 37151,
+        "p50_ms": 51.428,
+        "p95_ms": 53.584,
+        "p99_ms": 55.89,
+        "max_ms": 74.739
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 37151
+    }
+  },
+  "one-1acct-c1": {
+    "mode": "sustain",
+    "concurrency": 1,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 472,
+    "warmup_requests": 79,
+    "ok_per_second": 15.733333333333333,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 472,
+        "p50_ms": 63.05,
+        "p95_ms": 66.108,
+        "p99_ms": "insufficient samples",
+        "max_ms": 85.452
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 472
+    }
+  },
+  "one-1acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4588,
+    "warmup_requests": 812,
+    "ok_per_second": 152.93333333333334,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4588,
+        "p50_ms": 97.945,
+        "p95_ms": 148.78,
+        "p99_ms": 178.682,
+        "max_ms": 211.66
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 4588
+    }
+  },
+  "one-1acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4411,
+    "warmup_requests": 743,
+    "ok_per_second": 147.03333333333333,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4411,
+        "p50_ms": 420.283,
+        "p95_ms": 611.307,
+        "p99_ms": 712.13,
+        "max_ms": 882.972
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 4411
+    }
+  },
+  "one-16acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 6230,
+    "warmup_requests": 1066,
+    "ok_per_second": 207.66666666666666,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 6230,
+        "p50_ms": 73.94,
+        "p95_ms": 103.911,
+        "p99_ms": 125.617,
+        "max_ms": 179.755
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 6230
+    }
+  },
+  "one-16acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 11102,
+    "warmup_requests": 2025,
+    "ok_per_second": 370.06666666666666,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 11102,
+        "p50_ms": 162.6,
+        "p95_ms": 267.647,
+        "p99_ms": 332.544,
+        "max_ms": 488.25
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 11102
+    }
+  },
+  "one-16acct-idem-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 9119,
+    "warmup_requests": 1628,
+    "ok_per_second": 303.96666666666664,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 9119,
+        "p50_ms": 200.599,
+        "p95_ms": 324.409,
+        "p99_ms": 398.936,
+        "max_ms": 543.265
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 9119
+    }
+  },
+  "two-1acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4305,
+    "warmup_requests": 772,
+    "ok_per_second": 143.5,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4305,
+        "p50_ms": 102.786,
+        "p95_ms": 164.323,
+        "p99_ms": 191.161,
+        "max_ms": 252.037
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 2153,
+      "1": 2152
+    }
+  },
+  "two-1acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 4204,
+    "warmup_requests": 798,
+    "ok_per_second": 140.13333333333333,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 4204,
+        "p50_ms": 439.406,
+        "p95_ms": 627.613,
+        "p99_ms": 737.337,
+        "max_ms": 783.027
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 2102,
+      "1": 2102
+    }
+  },
+  "two-16acct-c16": {
+    "mode": "sustain",
+    "concurrency": 16,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 5833,
+    "warmup_requests": 1042,
+    "ok_per_second": 194.43333333333334,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 5833,
+        "p50_ms": 78.739,
+        "p95_ms": 113.428,
+        "p99_ms": 133.882,
+        "max_ms": 165.955
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 2917,
+      "1": 2916
+    }
+  },
+  "two-16acct-c64": {
+    "mode": "sustain",
+    "concurrency": 64,
+    "warmup_ms": 5000,
+    "duration_ms": 30000,
+    "requests": 9179,
+    "warmup_requests": 1639,
+    "ok_per_second": 305.96666666666664,
+    "classes": {
+      "5xx": {
+        "count": 0
+      },
+      "client_error": {
+        "count": 0
+      },
+      "client_timeout": {
+        "count": 0
+      },
+      "ok": {
+        "count": 9179,
+        "p50_ms": 189.691,
+        "p95_ms": 369.898,
+        "p99_ms": 530.129,
+        "max_ms": 778.432
+      },
+      "other_4xx": {
+        "count": 0
+      },
+      "quota_exhausted": {
+        "count": 0
+      },
+      "rate_limited": {
+        "count": 0
+      }
+    },
+    "codes": {},
+    "targets": {
+      "0": 4589,
+      "1": 4590
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "upstreams": [
+    {
+      "name": "qf-fake",
+      "base_url": "http://qf-fake-upstream:8081/v1",
+      "api_key_env": "QF_FAKE_UPSTREAM_KEY",
+      "rpm": 1000000000,
+      "tpm": 1000000000000
+    }
+  ],
+  "models": [
+    {"alias": "fake-slow-50", "purpose": "chat", "upstream": "qf-fake", "upstream_model": "fake-slow-50", "default_max_tokens": 16}
+  ],
+  "database": {"dsn_file": "/run/secrets/app_dsn"},
+  "redis": {"url_env": "QF_REDIS_URL"}
+}

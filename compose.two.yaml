@@ -1,0 +1,27 @@
+# 第二个 QF 实例和压测工具，叠加在 compose.yaml 之上（见 docs/scaling.md 的“两个实例”）：
+#   docker compose -f compose.yaml -f compose.two.yaml up -d --build --wait
+# quotaforge-b 和 quotaforge 是同一个镜像、同一份配置、同一个 app_dsn，共用 qf-mysql、qf-redis；各自跑后台的回收和清理。
+# 安全设置、依赖、secret、stop_grace_period 都由 extends 从 compose.yaml 的 quotaforge 带过来，只写一份。
+# extends 要写明 file：它只看那个文件，不看合并之后的项目。build 去掉：用 quotaforge 构建的同一个镜像，不重复构建。
+# 不接 qs-qf：QS 的覆盖文件只改 quotaforge。没有负载均衡器，测试和压测工具自己轮流发给两个实例。
+services:
+  quotaforge-b:
+    extends:
+      file: compose.yaml
+      service: quotaforge
+    build: !reset null
+    ports: !override
+      - 127.0.0.1:8081:8080
+
+  # 压测和齐发工具（cmd/qfbench），只用 docker compose run；profile 让 up 不起它。从 Compose 网络里发，
+  # 地址是 http://quotaforge:8080、http://quotaforge-b:8080、http://qf-fake-upstream:8081。Key 从 stdin 读，原始数据写 stdout。
+  # 先 docker compose --profile tools build qfbench：run 在镜像缺的时候会现场构建，构建的输出会混进 stdout。
+  qfbench:
+    build:
+      context: .
+      target: qfbench
+    image: quotaforge-qfbench:local
+    profiles: [tools]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]

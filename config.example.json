@@ -1,0 +1,22 @@
+{
+  "timeouts": {
+    "chat_ms": 25000,
+    "embeddings_ms": 25000
+  },
+  "upstreams": [
+    {
+      "name": "qf-fake",
+      "base_url": "http://127.0.0.1:8081/v1",
+      "api_key_env": "QF_FAKE_UPSTREAM_KEY"
+    }
+  ],
+  "models": [
+    {"alias": "qs-fake-upstream-v1", "purpose": "chat", "upstream": "qf-fake", "upstream_model": "fake-chat", "default_max_tokens": 1024},
+    {"alias": "qs-fake-upstream-v1", "purpose": "embeddings", "upstream": "qf-fake", "upstream_model": "fake-embed"},
+    {"alias": "fake-tool-call", "purpose": "chat", "upstream": "qf-fake", "upstream_model": "fake-tool-call", "default_max_tokens": 1024},
+    {"alias": "fake-no-usage", "purpose": "chat", "upstream": "qf-fake", "upstream_model": "fake-no-usage", "default_max_tokens": 1024},
+    {"alias": "fake-500", "purpose": "chat", "upstream": "qf-fake", "upstream_model": "fake-500", "default_max_tokens": 1024}
+  ],
+  "database": {"dsn_env": "QUOTAFORGE_MYSQL_DSN"},
+  "redis": {"url_env": "QUOTAFORGE_REDIS_URL"}
+}
