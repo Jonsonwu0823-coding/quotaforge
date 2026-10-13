@@ -45,8 +45,9 @@ func (v Violation) String() string {
 // 幂等记录级（见 verifyIdempotency）：
 //   - idem_call：记录指向的调用属于同一个账户，而且那次调用记的键就是这个键；
 //   - idem_snapshot：有快照的记录，调用是 SETTLED 或 USAGE_UNKNOWN，状态码是 2xx 且等于调用的 http_status，
-//     正文长度对得上：不超过上限的存了正文，超过的正文为空；没有快照的记录，快照的几列都是空的；
-//   - idem_settled_snapshot：指向 SETTLED 调用的记录有快照（或者标明正文超过上限）；
+//     正文长度对得上：不超过上限的存了正文，超过的正文为空；结算了的流只有状态码（流式的标记），调用必须是 SETTLED；
+//     没有快照的记录，快照的几列都是空的；
+//   - idem_settled_snapshot：指向 SETTLED 调用的记录有快照（或者标明正文超过上限、是流式的标记）；
 //     只有凭证据由 reconcile 结算的调用可以没有（QF 没拿到或没存下响应）。
 func (s *Store) Verify(ctx context.Context) ([]Violation, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
@@ -233,14 +234,21 @@ func (e idemEntry) check() []Violation {
 		}
 		return out
 	}
-	kept := !e.bodyNull && e.bytes.Valid && e.bodyLen.Int64 == e.bytes.Int64 && e.bytes.Int64 <= MaxSnapshotBody
-	tooLarge := e.bodyNull && e.bytes.Valid && e.bytes.Int64 > MaxSnapshotBody
-	if (e.callStatus != Settled && e.callStatus != UsageUnknown) || e.status.Int64 < 200 || e.status.Int64 > 299 ||
-		e.callHTTPStatus != e.status || !(kept || tooLarge) {
+	if !e.snapshotOK() {
 		add("idem_snapshot", "%s call (http %s), snapshot status %d, bytes %s, body length %s",
 			e.callStatus, nullInt(e.callHTTPStatus), e.status.Int64, nullInt(e.bytes), nullInt(e.bodyLen))
 	}
 	return out
+}
+
+// snapshotOK 是有状态码的记录的 idem_snapshot：快照的形状是三种之一（存了正文、正文超过上限、结算了的流的标记），
+// 调用的状态和它相配（标记只挂在 SETTLED 上），状态码是 2xx 且等于调用的 http_status。
+func (e idemEntry) snapshotOK() bool {
+	kept := !e.bodyNull && e.bytes.Valid && e.bodyLen.Int64 == e.bytes.Int64 && e.bytes.Int64 <= MaxSnapshotBody
+	tooLarge := e.bodyNull && e.bytes.Valid && e.bytes.Int64 > MaxSnapshotBody
+	streamed := e.bodyNull && !e.bytes.Valid && e.contentTypeNull
+	callOK := e.callStatus == Settled || (e.callStatus == UsageUnknown && !streamed)
+	return callOK && e.status.Int64 >= 200 && e.status.Int64 <= 299 && e.callHTTPStatus == e.status && (kept || tooLarge || streamed)
 }
 
 func nullInt(v sql.NullInt64) string {

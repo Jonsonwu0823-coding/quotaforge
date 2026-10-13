@@ -25,7 +25,7 @@ POST /v1/chat/completions      SERVER  整个请求，起点是请求进来的�
 ├── admit                      INTERNAL  Redis 准入（有限流桶时）
 ├── reserve                    INTERNAL  账本预留（带幂等键时可能直接给出重放）
 ├── mark_sent                  INTERNAL  落发送意图
-├── upstream                   CLIENT    发请求到读完正文
+├── upstream                   CLIENT    发请求到读完正文（流式：整个流，含写给客户端的时间）
 ├── finish                     INTERNAL  账本收尾
 └── adjust                     INTERNAL  修正 TPM 桶（有 TPM 桶时）
 
@@ -38,7 +38,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | span | 属性 |
 |---|---|
-| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型之后才有）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号） |
+| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型之后才有）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有） |
 | `upstream` | `qf.upstream`、`http.request.method`、`http.response.status_code`（上游的） |
 | 出错的子 span | `error.type` |
 
@@ -69,8 +69,9 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 - 写不写这三个字段看 QF 自己的根 span 是不是在记录，不看 `traceparent` 里的 sampled 标志；没开追踪时 QF 根本不解析 `traceparent`。所以日志里的 `span_id` 一定是 QF 的 span，不会是客户端的。
 - 从调用号找 trace：在 Jaeger 里按标签 `qf.request_id=<x-request-id>` 搜；或者先在日志里按 `request_id` 找到那一行，取它的 `trace_id`。
 - 从 trace 找日志：根 span 的 `qf.request_id` 就是日志的 `request_id`；或者按 `trace_id` 搜日志。
-- 400 `invalid_request` 的调用行有 `invalid_reason`，取值固定：`unreadable_body`、`not_object`、`malformed_json`、`trailing_data`、`ambiguous_field`、`model_not_string`、`model_missing`、`stream_not_boolean`、`max_tokens_invalid`、`fingerprint_failed`。不写 `encoding/json` 的错误原文：它会带上请求体里的字符。
-- 请求体没发完客户端就断开时，和写回之前断开一样：日志没有 `status`，有 `client_disconnected: true`，错误码 `client_canceled`。
+- 400 `invalid_request` 的调用行有 `invalid_reason`，取值固定：`unreadable_body`、`not_object`、`malformed_json`、`trailing_data`、`ambiguous_field`、`model_not_string`、`model_missing`、`stream_not_boolean`、`max_tokens_invalid`、`fingerprint_failed`、`stream_options_invalid`（流式请求的 `stream_options` 不是对象或 null，或者 `include_usage` 不是布尔值或 null）。不写 `encoding/json` 的错误原文：它会带上请求体里的字符。
+- 请求体没发完客户端就断开时，和写回之前断开一样：日志没有 `status`，有 `client_disconnected: true`，错误码 `client_canceled`。请求体超过读整个请求的上限（30 秒，见[运行](operations.md#配置文件)）还没发完的，连接已被服务器断开，也这样记。
+- 流式的调用行有 `stream: true`、`first_event_ms`。流开始之后中途断开的，`status` 是已经写出的 200，加上 `client_disconnected: true`；客户端不读、写超过期限的另有 `write_timeout: true`。流截断时 `error_code` 是补给客户端的错误事件里的那个（`upstream_timeout`、`upstream_error`、`upstream_invalid_response`），流里的内容一律不记。
 
 ## 指标
 
@@ -82,9 +83,11 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_request_duration_seconds` | histogram | `endpoint` | 总耗时 |
 | `qf_overhead_seconds` | histogram | `endpoint` | QF 自身耗时 = 总耗时 − 等上游的时间（没调上游的就是总耗时）。0.25 秒是一个桶边界，延迟 SLO 按它算 |
 | `qf_upstream_requests_total` | counter | `upstream`、`endpoint`、`result` | 调过上游的调用；`result` 是 `ok` 或上游这一步的错误码（`upstream_*`） |
-| `qf_upstream_duration_seconds` | histogram | `upstream`、`endpoint` | 发请求到读完正文 |
+| `qf_upstream_duration_seconds` | histogram | `upstream`、`endpoint` | 发请求到读完正文（流式：整个流） |
 | `qf_calls_total` | counter | `endpoint`、`outcome` | 预留过的调用按网关的判定：`settled`、`cancelled`、`usage_unknown` |
 | `qf_usage_tokens_total` | counter | `endpoint`、`upstream`、`type`（prompt、completion、total） | 只计结算的调用；用量未知的不计成 0，数在 `qf_calls_total{outcome="usage_unknown"}` 里 |
+| `qf_streams_total` | counter | `result`（`ok`、`upstream_error`、`upstream_timeout`、`upstream_invalid_response`）、`client`（`connected`、`disconnected`、`write_timeout`） | 上游回了 2xx 的流式调用，按流怎么结束、客户端有没有读完 |
+| `qf_stream_first_event_seconds` | histogram | `endpoint` | 流式：从调用开始到收到上游第一个事件 |
 | `qf_idempotent_replays_total` | counter | `endpoint` | 重放。幂等的几种拒绝看 `qf_requests_total` 的 `code` |
 | `qf_rate_limited_total` | counter | `layer`（key、account、upstream）、`metric`（rpm、tpm） | 限流拒绝 |
 | `qf_dependency_errors_total` | counter | `dependency`（ledger、rate_limiter）、`operation` | 账本、Redis 操作失败，含不改变响应的收尾、修正失败 |
@@ -99,6 +102,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_db_*` | gauge、counter | — | 账本连接池：`open`、`in_use`、`idle`、`max_open` 的连接数，等连接的次数和总时长 |
 | `go_*`、`process_*` | — | — | Go 运行时和进程 |
 
+- 流式中途截断的调用，`qf_requests_total` 里是 `status="200"` 加上错误码（例如 `code="upstream_timeout"`）：响应头已经写出，错误码在补给客户端的错误事件里。可用性只数 5xx，这类不算 QF 的失败，和上游的其它失败一样单独看。
 - 未知用量的两个数由后台循环每轮查一次（默认 9 秒）：一条 `COUNT` 加 `MIN(created_at)`，走索引 `calls_status_created (status, created_at)`，只扫 `USAGE_UNKNOWN` 的行（平时很少，对账后就离开这个状态）。两个实例数的是同一个库，值相同。
 - 后台的 `db_pool` 日志行（这期间有请求等过连接时记一行）和 `qf_db_*` 并存：压测脚本按那一行取证，没部署 Prometheus 时也看得到。
 
@@ -117,6 +121,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 **延迟：99% 的 chat、embeddings 请求，QF 自身耗时 ≤ 250 毫秒。**
 
 - 分子：`qf_overhead_seconds` 里大于 0.25 秒的（按 `le="0.25"` 的桶，不插值）；分母：chat、embeddings 的全部请求。调用状态查询不算。
+- 流式照样算，口径不变：自身耗时 = 总耗时 − `upstream` 这一步的时间。流式的 `upstream` 包住整个流（读上游、转发、等客户端），减掉之后剩下的是 QF 自己的步骤（鉴权、准入、预留、发送意图、收尾、修正），和非流式可以直接比，慢客户端也不算到 QF 头上。代价：QF 解析、转发每个事件的 CPU 时间也算进了 `upstream`；基准测试量过，一个 14 个事件的流在 QF 里约 40 微秒（每个事件约 3 微秒，非流式处理同样的回答约 5 微秒），比 250 毫秒的门槛小四个数量级。规则不用改。
 - 依据（[压测](scaling.md#压测)，假上游固定约 50 毫秒，扣掉直连假上游的约 53 毫秒粗算）：并发 16 时自身耗时的 p99 约 70–125 毫秒；并发 64、16 个账户时约 260–280 毫秒，已经越过 250；一个账户、并发 64 时 p50 就有约 350–370 毫秒（额度行是热点）。所以 250 毫秒在正常负载下有一倍左右的余量；并发到 64 时错误预算开始消耗，热点账户排队时快速消耗的告警会响。
 
 **消耗速率告警**（两档，每档两个窗口：长窗口说明烧得多，短窗口说明现在还在烧，恢复后很快解除）：

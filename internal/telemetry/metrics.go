@@ -29,6 +29,8 @@ type Metrics struct {
 	Replays          *prometheus.CounterVec   // endpoint
 	RateLimited      *prometheus.CounterVec   // layer, metric
 	DependencyErrors *prometheus.CounterVec   // dependency, operation
+	Streams          *prometheus.CounterVec   // result, client
+	StreamFirstEvent *prometheus.HistogramVec // endpoint
 
 	Reclaimed             *prometheus.CounterVec // result
 	Purged                prometheus.Counter
@@ -82,6 +84,10 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 	m.Replays = counter("qf_idempotent_replays_total", "Requests answered with the stored response of an earlier call.", "endpoint")
 	m.RateLimited = counter("qf_rate_limited_total", "Requests denied by a rate limit bucket.", "layer", "metric")
 	m.DependencyErrors = counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations.", "dependency", "operation")
+	m.Streams = counter("qf_streams_total", "Streams the upstream started, by how they ended (ok or the upstream error code) "+
+		"and the client (connected, disconnected, write_timeout).", "result", "client")
+	m.StreamFirstEvent = histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
+		slowBuckets, "endpoint")
 
 	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
 	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()

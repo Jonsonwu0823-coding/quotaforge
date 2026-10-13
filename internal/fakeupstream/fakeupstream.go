@@ -12,6 +12,9 @@
 //	fake-billed-hang 收到就按正常回答的用量记账，然后一直不回，直到请求被取消：上游照样计费，调用方却拿不到结果
 //	其它任意名        正常回答
 //
+// chat 带 "stream": true 时按 SSE 回答（见 stream.go）：上面的错误、挂住和延迟场景在流开始之前照旧，正常回答改成事件流，
+// 另有几个只对流式有意义的场景（fake-stream-*）。
+//
 // usage 按字符数算，并带 "fake": true 标明是假的数。GET /_fake/stats 返回计数和当前挂住的请求数。响应里的 model 是请求的名字加上版本后缀，
 // 模拟上游返回带版本号的实际模型名。
 //
@@ -46,17 +49,19 @@ const defaultDimensions = 8
 // OveruseTokens 是 fake-overuse 报的 prompt_tokens。
 const OveruseTokens = 1_000_000
 
-// Stats 是收到的请求数、在处理中途被取消的请求数，以及当前被 fake-hold 挂住的请求数。
+// Stats 是收到的请求数、在处理中途被取消的请求数、当前被 fake-hold（或 fake-stream-step）挂住的请求数，
+// 以及流式回答已经写出并刷新的事件数。
 type Stats struct {
 	ChatCompletions int64 `json:"chat_completions"`
 	Embeddings      int64 `json:"embeddings"`
 	Canceled        int64 `json:"canceled"`
 	Held            int64 `json:"held"`
+	StreamEvents    int64 `json:"stream_events"`
 }
 
 type Server struct {
-	mux                              *http.ServeMux
-	chat, embeddings, canceled, held atomic.Int64
+	mux                                    *http.ServeMux
+	chat, embeddings, canceled, held, sent atomic.Int64
 
 	mu      sync.Mutex
 	release chan struct{} // fake-hold 等它关闭；Release 关掉它并换一个新的
@@ -124,7 +129,7 @@ func (s *Server) charge(r *http.Request, u *usage) {
 }
 
 // serve 按场景处理一个已经解析好的请求，并记账：fake-billed-hang 先记 yes 再挂住；错误场景和被取消的记 no；
-// 其余记 yes 之后由 answer 正常回答。
+// 其余由 answer 记账并回答（非流式先记 yes 再回答，流式按实际生成的记）。
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, model string, u usage, answer func()) {
 	switch {
 	case model == "fake-billed-hang":
@@ -134,7 +139,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, model string, u u
 	case s.scenario(w, r, model):
 		s.charge(r, nil)
 	default:
-		s.charge(r, &u)
 		answer()
 	}
 }
@@ -142,7 +146,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, model string, u u
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 func (s *Server) Stats() Stats {
-	return Stats{ChatCompletions: s.chat.Load(), Embeddings: s.embeddings.Load(), Canceled: s.canceled.Load(), Held: s.held.Load()}
+	return Stats{ChatCompletions: s.chat.Load(), Embeddings: s.embeddings.Load(), Canceled: s.canceled.Load(), Held: s.held.Load(),
+		StreamEvents: s.sent.Load()}
 }
 
 // Release 放开当前被 fake-hold 挂住的全部请求；之后来的 fake-hold 请求等下一次 Release。
@@ -154,7 +159,11 @@ func (s *Server) Release() {
 }
 
 type chatRequest struct {
-	Model    string `json:"model"`
+	Model         string `json:"model"`
+	Stream        bool   `json:"stream"`
+	StreamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
 	Messages []struct {
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
@@ -185,7 +194,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		prompt = OveruseTokens
 	}
 	u := usage{prompt: prompt, completion: 10, chat: true} // 固定规则：每次回答记 10 个
+	if req.Stream {
+		s.serve(w, r, req.Model, u, func() { s.stream(w, r, req, n, prompt) })
+		return
+	}
 	s.serve(w, r, req.Model, u, func() {
+		s.charge(r, &u)
 		message := map[string]any{"role": "assistant", "content": "fake reply"}
 		finish := "stop"
 		if req.Model == "fake-tool-call" {
@@ -247,6 +261,7 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	u := usage{prompt: prompt}
 	s.serve(w, r, req.Model, u, func() {
+		s.charge(r, &u)
 		dims := req.Dimensions
 		if dims == 0 {
 			dims = defaultDimensions
@@ -289,7 +304,7 @@ func (s *Server) scenario(w http.ResponseWriter, r *http.Request, model string) 
 		return true
 	case model == "fake-hold":
 		return s.hold(r.Context())
-	case strings.HasPrefix(model, "fake-slow-"):
+	case strings.HasPrefix(model, "fake-slow-"): // 流式的事件间延迟是 fake-stream-slow-，不在这里
 		ms, err := strconv.Atoi(strings.TrimPrefix(model, "fake-slow-"))
 		if err != nil || ms < 0 {
 			writeFakeError(w, http.StatusBadRequest)

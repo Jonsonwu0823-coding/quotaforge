@@ -97,6 +97,33 @@ func TestSnapshotTooLarge(t *testing.T) {
 	dbtest.Verify(t, f.s)
 }
 
+// 结算了的流：记录里只记状态码当标记（其余三列 NULL），不存正文；同一个键再来返回 ErrIdempotencyResponseUnavailable，
+// 不执行、不预留；账本校验认这个标记。
+func TestStreamedMarker(t *testing.T) {
+	f := newFixture(t, 1<<40)
+	r := f.keyed(10, "stream", "req")
+	if _, err := f.s.Reserve(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	f.settleWith(t, r, ledger.Response{Status: 200, ContentType: []string{"text/event-stream"}, Body: []byte("ignored"), Streamed: true})
+	var status int64
+	var nulls int
+	if err := f.admin.QueryRow(`SELECT response_status, (response_bytes IS NULL) + (response_content_type IS NULL) + (response_body IS NULL)
+		FROM idempotency_keys WHERE account_id = ? AND idem_key = 'stream'`, f.key.AccountID).Scan(&status, &nulls); err != nil {
+		t.Fatal(err)
+	}
+	if status != 200 || nulls != 3 {
+		t.Fatalf("record: status %d, %d of the other three columns are NULL", status, nulls)
+	}
+	if _, err := f.s.Reserve(ctx, f.keyed(10, "stream", "req")); !errors.Is(err, ledger.ErrIdempotencyResponseUnavailable) {
+		t.Fatalf("retry = %v", err)
+	}
+	if _, reserved, consumed := f.budget(t); reserved != 0 || consumed != 1 {
+		t.Fatalf("reserved, consumed = %d, %d, want 0, 1", reserved, consumed)
+	}
+	dbtest.Verify(t, f.s)
+}
+
 // 调用卡在 RESERVED 期间记录过期、被新请求改指向：旧调用收尾时不能把快照写到新的记录上。
 func TestLateFinishDoesNotOverwriteRepointedRecord(t *testing.T) {
 	f := newFixture(t, 1<<40)
@@ -515,6 +542,18 @@ func TestVerifyFindsIdempotencyTampering(t *testing.T) {
 			[]string{"idem_snapshot"}},
 		{"settled without a snapshot", []string{set("settled", "response_status = NULL, response_bytes = NULL, response_content_type = NULL, response_body = NULL")},
 			[]string{"idem_settled_snapshot"}},
+		{"settled stream without its marker", []string{set("streamed", "response_status = NULL")},
+			[]string{"idem_settled_snapshot"}},
+		{"stream marker with another status", []string{set("streamed", "response_status = 201")},
+			[]string{"idem_snapshot"}},
+		{"stream marker with a Content-Type", []string{set("streamed", "response_content_type = 'text/event-stream'")},
+			[]string{"idem_snapshot"}},
+		{"stream marker on an unknown call", []string{"UPDATE calls SET http_status = 200 WHERE account_id = ? AND idempotency_key = 'unknown'",
+			set("unknown", "response_status = 200")}, []string{"idem_snapshot"}},
+		{"stream marker on a cancelled call", []string{set("cancelled", "response_status = 200")},
+			[]string{"idem_snapshot"}},
+		{"non-stream snapshot reduced to a status", []string{set("settled", "response_bytes = NULL, response_content_type = NULL, response_body = NULL")},
+			nil},
 	}
 	other := newFixture(t, 1<<40) // 另一个账户：一个带键 other 的调用
 	t.Cleanup(func() { deleteAccount(t, other) })
@@ -526,13 +565,15 @@ func TestVerifyFindsIdempotencyTampering(t *testing.T) {
 			f := newFixture(t, 1<<40)
 			t.Cleanup(func() { deleteAccount(t, f) })
 			settled, cancelled, unknown, big := f.keyed(1, "settled", "r"), f.keyed(1, "cancelled", "r"), f.keyed(1, "unknown", "r"), f.keyed(1, "big", "r")
-			for _, r := range []ledger.Reservation{settled, cancelled, unknown, big} {
+			streamed := f.keyed(1, "streamed", "r")
+			for _, r := range []ledger.Reservation{settled, cancelled, unknown, big, streamed} {
 				if _, err := f.s.Reserve(ctx, r); err != nil {
 					t.Fatal(err)
 				}
 			}
 			f.settleWith(t, settled, ledger.Response{Status: 200, ContentType: []string{"application/json"}, Body: []byte(`{"ok":true}`)})
 			f.settleWith(t, big, ledger.Response{Status: 200, Body: bytes.Repeat([]byte("x"), ledger.MaxSnapshotBody+1)})
+			f.settleWith(t, streamed, ledger.Response{Status: 200, Streamed: true})
 			f.finish(t, cancelled, ledger.Cancelled, 0)
 			f.sent(t, unknown)
 			if err := f.s.Finish(ctx, unknown, ledger.Result{Status: ledger.UsageUnknown, HTTPStatus: 502}); err != nil {

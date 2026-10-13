@@ -39,6 +39,9 @@ var (
 	attrTotalTokens    = attribute.Key("qf.usage.total_tokens")
 	attrDisconnected   = attribute.Key("qf.client_disconnected")
 	attrRateLimitedBy  = attribute.Key("qf.rate_limited_by")
+	attrStream         = attribute.Key("qf.stream")
+	attrFirstEventMS   = attribute.Key("qf.stream.first_event_ms")
+	attrWriteTimeout   = attribute.Key("qf.stream.write_timeout")
 )
 
 // startTrace 在鉴权之后建根 span：起点回填成 c.start（和日志的 duration_ms 同一个起点），鉴权的子 span 也按显式的起止时间补上。
@@ -119,6 +122,12 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 	if c.reservation != nil {
 		m.Calls.WithLabelValues(endpoint, strings.ToLower(string(c.outcome))).Inc()
 	}
+	if c.stream && c.upstreamStatus >= 200 && c.upstreamStatus < 300 { // 上游开始了流的调用
+		m.Streams.WithLabelValues(streamResult(c), streamClient(c)).Inc()
+	}
+	if c.firstEvent != 0 {
+		m.StreamFirstEvent.WithLabelValues(endpoint).Observe(c.firstEvent.Seconds())
+	}
 	if c.outcome == ledger.Settled { // 结算的一定有用量；未知用量的不计成 0，数在 qf_calls_total 里
 		up := c.model.Upstream.Name
 		m.UsageTokens.WithLabelValues(endpoint, up, "prompt").Add(float64(c.usage.Prompt))
@@ -126,6 +135,26 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 			m.UsageTokens.WithLabelValues(endpoint, up, "completion").Add(float64(c.usage.Completion))
 		}
 		m.UsageTokens.WithLabelValues(endpoint, up, "total").Add(float64(c.usage.Total))
+	}
+}
+
+// streamResult 是 qf_streams_total 的 result：ok，或者流没有正常结束时的错误码（upstream_*，取值固定）。
+func streamResult(c *call) string {
+	if c.errorCode == "" {
+		return "ok"
+	}
+	return c.errorCode
+}
+
+// streamClient 是 qf_streams_total 的 client：connected、disconnected，或者 write_timeout（客户端不读，写超过了期限）。
+func streamClient(c *call) string {
+	switch {
+	case c.writeTimeout:
+		return "write_timeout"
+	case c.clientDisconnected:
+		return "disconnected"
+	default:
+		return "connected"
 	}
 }
 
@@ -172,6 +201,15 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 	}
 	if c.deniedBy != nil {
 		attrs = append(attrs, attrRateLimitedBy.String(c.deniedBy.Name()))
+	}
+	if c.stream {
+		attrs = append(attrs, attrStream.Bool(true))
+	}
+	if c.firstEvent != 0 {
+		attrs = append(attrs, attrFirstEventMS.Int64(c.firstEvent.Milliseconds()))
+	}
+	if c.writeTimeout {
+		attrs = append(attrs, attrWriteTimeout.Bool(true))
 	}
 	return attrs
 }

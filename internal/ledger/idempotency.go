@@ -44,10 +44,13 @@ var (
 )
 
 // Response 是 QF 写回给客户端的上游 2xx：状态码、Content-Type 的值（上游没给时为 nil）和正文。
+// Streamed 表示这是一个结算了的流式回答：内容边读边写给了客户端，QF 没有留下，只记状态码当标记，
+// ContentType 和 Body 不用。正文为空的非流式 2xx 也是合法的快照，所以要显式标明，不靠正文为空来判断。
 type Response struct {
 	Status      int
 	ContentType []string
 	Body        []byte
+	Streamed    bool
 }
 
 // Replay 是要重放的快照和原来的调用号。
@@ -56,13 +59,15 @@ type Replay struct {
 	Response
 }
 
-// record 是查到的一条幂等记录。response 三列都是 NULL 表示没有写回 2xx；body 为 NULL、status 有值表示正文超过上限。
+// record 是查到的一条幂等记录。response 几列都是 NULL 表示没有写回 2xx；status 有值、body 为 NULL 时：bytes 有值是正文超过上限，
+// bytes 也是 NULL 是结算了的流（流式的标记，见 Response.Streamed）。
 type record struct {
 	fingerprint []byte
 	callID      string
 	expired     bool
 	callStatus  Status
 	status      sql.NullInt64
+	bytes       sql.NullInt64
 	contentType sql.Null[[]byte]
 	body        sql.Null[[]byte]
 }
@@ -89,10 +94,10 @@ func reserveWithKey(ctx context.Context, tx *sql.Tx, r Reservation) (*Replay, er
 func readRecord(ctx context.Context, tx *sql.Tx, accountID int64, key string) (*record, error) {
 	var rec record
 	err := tx.QueryRowContext(ctx, `SELECT k.fingerprint, k.call_id, k.`+expired+`, c.status,
-			k.response_status, k.response_content_type, k.response_body
+			k.response_status, k.response_bytes, k.response_content_type, k.response_body
 		FROM idempotency_keys k JOIN calls c ON c.id = k.call_id
 		WHERE k.account_id = ? AND k.idem_key = ?`, accountID, key).Scan(
-		&rec.fingerprint, &rec.callID, &rec.expired, &rec.callStatus, &rec.status, &rec.contentType, &rec.body)
+		&rec.fingerprint, &rec.callID, &rec.expired, &rec.callStatus, &rec.status, &rec.bytes, &rec.contentType, &rec.body)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, nil
@@ -114,6 +119,8 @@ func (rec *record) decide(fingerprint []byte) (*Replay, error) {
 	case rec.status.Valid && rec.body.Valid:
 		return &Replay{CallID: rec.callID, Response: Response{
 			Status: int(rec.status.Int64), ContentType: decodeContentType(rec.contentType), Body: rec.body.V}}, nil
+	case rec.status.Valid && !rec.bytes.Valid: // 结算了的流：已经计费，内容没有留下
+		return nil, ErrIdempotencyResponseUnavailable
 	case rec.status.Valid:
 		return nil, ErrIdempotencyResponseTooLarge
 	case rec.callStatus == Cancelled: // 确定上游没有生成结果
@@ -139,14 +146,16 @@ func pointRecord(ctx context.Context, tx *sql.Tx, r Reservation) error {
 	return nil
 }
 
-// saveResponse 把写回的 2xx 存成快照，是收尾事务的最后一条语句。WHERE 带上调用号：调用卡住期间记录过期、
+// saveResponse 把写回的 2xx 存成快照（结算了的流只记状态码，见 Response.Streamed），是收尾事务的最后一条语句。WHERE 带上调用号：调用卡住期间记录过期、
 // 被新请求改指向的话，旧调用的收尾影响 0 行，不会把快照写到新的记录上。
 func saveResponse(ctx context.Context, tx *sql.Tx, r Reservation, resp Response) error {
-	var contentType, body any // nil 存 NULL
+	var size, contentType, body any = len(resp.Body), nil, nil // nil 存 NULL
 	if resp.ContentType != nil {
 		contentType = strings.Join(resp.ContentType, "\n")
 	}
 	switch {
+	case resp.Streamed: // 只记状态码，其余三列 NULL
+		size, contentType = nil, nil
 	case len(resp.Body) > MaxSnapshotBody: // 只记状态码和长度
 	case resp.Body == nil:
 		body = "" // nil 的 []byte 会存成 NULL
@@ -156,7 +165,7 @@ func saveResponse(ctx context.Context, tx *sql.Tx, r Reservation, resp Response)
 	_, err := tx.ExecContext(ctx, `UPDATE idempotency_keys
 		SET response_status = ?, response_bytes = ?, response_content_type = ?, response_body = ?
 		WHERE account_id = ? AND idem_key = ? AND call_id = ?`,
-		resp.Status, len(resp.Body), contentType, body, r.AccountID, r.IdempotencyKey, r.CallID)
+		resp.Status, size, contentType, body, r.AccountID, r.IdempotencyKey, r.CallID)
 	if err != nil {
 		return fmt.Errorf("save idempotency snapshot: %w", err)
 	}

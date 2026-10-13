@@ -260,12 +260,18 @@ func newDBEnv(t *testing.T, limit int64, wrap func(Ledger) Ledger) *dbEnv {
 // newDBEnvLimited 同 newDBEnv，限流器用给定的。
 func newDBEnvLimited(t *testing.T, limit int64, wrap func(Ledger) Ledger, lim Limiter) *dbEnv {
 	t.Helper()
+	return newDBEnvWith(t, limit, wrap, func(l Ledger) *harness { return newHarnessLimited(t, l, lim) })
+}
+
+// newDBEnvWith 同 newDBEnv，QF 由 start 起。
+func newDBEnvWith(t *testing.T, limit int64, wrap func(Ledger) Ledger, start func(Ledger) *harness) *dbEnv {
+	t.Helper()
 	e := &dbEnv{store: dbtest.Store(t), admin: dbtest.Admin(t)}
 	var l Ledger = e.store
 	if wrap != nil {
 		l = wrap(l)
 	}
-	e.harness = newHarnessLimited(t, l, lim) // 先起 harness：allAliases 在这里生成
+	e.harness = start(l) // 先起 harness：allAliases 在这里生成
 	e.account = dbtest.Account(t, e.store, limit)
 	e.key = e.issue(t, allAliases)
 	e.limited = e.issue(t, []string{"shared"})

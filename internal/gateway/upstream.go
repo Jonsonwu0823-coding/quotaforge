@@ -47,17 +47,20 @@ func (g *gateway) upstreamRequest(c *call, body []byte) (*http.Request, *apiErro
 	req.Header.Set("Authorization", "Bearer "+up.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if c.stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	req.Header.Set("X-Client-Request-Id", c.id)
 	return req, nil
 }
 
-// forward 把请求发给上游，包一个客户端 span，记下等上游的时间（QF 自身耗时 = 总耗时 − 它）。
-// 只把 ctx 用于 span：发给上游的请求头在 upstreamRequest 里定好，不注入 traceparent。
-func (g *gateway) forward(ctx context.Context, c *call, req *http.Request) (*ledger.Response, *apiError) {
+// forward 把请求发给上游，包一个客户端 span，记下等上游的时间（QF 自身耗时 = 总耗时 − 它）。流式时 span 和这段时间
+// 包住整个流，含写给客户端的时间。只把 ctx 用于 span：发给上游的请求头在 upstreamRequest 里定好，不注入 traceparent。
+func (g *gateway) forward(ctx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
 	span := g.step(ctx, "upstream", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrUpstream.String(c.model.Upstream.Name), semconv.HTTPRequestMethodPost))
 	start := time.Now()
-	res, e := g.exchange(ctx, c, req)
+	res, e := g.exchange(ctx, w, c, req)
 	c.upstreamDuration = time.Since(start)
 	if c.upstreamStatus != 0 {
 		span.SetAttributes(semconv.HTTPResponseStatusCode(c.upstreamStatus))
@@ -68,8 +71,8 @@ func (g *gateway) forward(ctx context.Context, c *call, req *http.Request) (*led
 
 // exchange 把请求发给上游，不重试。超时从 ctx 派生，但不跟着客户端取消（有界结算）：请求一旦发出，
 // 就等到上游回答或超时，照常收尾，客户端断开了也一样。上游的请求号、模型名和用量记到 c 上。
-// 2xx 的应答原样交给客户端。
-func (g *gateway) exchange(ctx context.Context, c *call, req *http.Request) (*ledger.Response, *apiError) {
+// 2xx 的应答原样交给客户端：非流式整个读进来，由 deliver 在收尾之后写回；流式由 relay 边读边写给 w。
+func (g *gateway) exchange(ctx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
 	upCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.Timeout(c.purpose))
 	defer cancel()
 	c.upstreamCalled = true
@@ -82,6 +85,9 @@ func (g *gateway) exchange(ctx context.Context, c *call, req *http.Request) (*le
 	c.upstreamXRequestID = resp.Header.Get("x-request-id")
 	if e := fromUpstreamStatus(resp.StatusCode); e != nil {
 		return nil, e.withRetryAfter(resp.Header.Get("Retry-After"))
+	}
+	if c.stream {
+		return g.relay(ctx, upCtx, w, c, resp)
 	}
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))

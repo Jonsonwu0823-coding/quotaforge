@@ -37,7 +37,7 @@ flowchart LR
 | M4 限流和多实例 | Redis 共享令牌桶（Key、账户、上游三层的 RPM、TPM）；两个实例的跨进程检查和压测（[限流](docs/rate-limiting.md)、[两个实例和压测](docs/scaling.md)） |
 | M5 可观测 | OpenTelemetry 追踪（一次调用一棵 span 树，接收 W3C `traceparent`）、Prometheus 指标、SLO 和告警规则、日志按调用号和 `trace_id` 关联；Jaeger 加 Prometheus 的演示环境（[可观测](docs/observability.md)） |
 
-计划中：流式、多上游与熔断、Embedding 缓存、用量事件。
+进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。计划中：多上游与熔断、Embedding 缓存、用量事件。
 
 ## 快速开始
 

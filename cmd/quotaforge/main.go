@@ -32,10 +32,17 @@ func newHandler(api http.Handler) http.Handler {
 	return gateway.WithRequestID(mux)
 }
 
-// run 在 ln 上提供服务，直到 ctx 取消。取消后等进行中的请求处理完（最多 shutdownTimeout）才返回：
+// newServer 是 API 和指标两个服务共用的设置：读请求头、读整个请求（头和体）、keep-alive 空闲连接都有上限，
+// 只发一半请求体的客户端最多占住连接 ReadTimeout。不设 WriteTimeout：全局的写期限会掐断长流，
+// 流式的写期限设在每次写上。ReadTimeout 只管读请求：net/http 开始后台读时自己清读期限，由 TestServerReadTimeoutSparesLongCalls
+// 守着；以后升级 Go，这个测试会抓住变化。
+func newServer(h http.Handler) *http.Server {
+	return &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}
+}
+
+// run 用 srv 在 ln 上提供服务，直到 ctx 取消。取消后等进行中的请求处理完（最多 shutdownTimeout）才返回：
 // Shutdown 一调用 Serve 就会立刻返回，只有等 Shutdown 返回才算请求都结束了。
-func run(ctx context.Context, ln net.Listener, h http.Handler, shutdownTimeout time.Duration) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+func run(ctx context.Context, ln net.Listener, srv *http.Server, shutdownTimeout time.Duration) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
@@ -173,7 +180,7 @@ func main() {
 		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, logger, metrics)
 	}()
 	slog.Info("listening", "addr", ln.Addr().String())
-	err = run(ctx, ln, newHandler(gateway.New(cfg, store, limiter, logger, tel)), cfg.ShutdownTimeout())
+	err = run(ctx, ln, newServer(newHandler(gateway.New(cfg, store, limiter, logger, tel))), cfg.ShutdownTimeout())
 	stop()
 	<-done
 	if ferr := flushSpans(); ferr != nil {
@@ -189,7 +196,7 @@ func main() {
 func serveMetrics(ln net.Listener, m *telemetry.Metrics) (stop func()) {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", m.Handler())
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := newServer(mux)
 	go func() { _ = srv.Serve(ln) }()
 	return func() { _ = srv.Close() }
 }

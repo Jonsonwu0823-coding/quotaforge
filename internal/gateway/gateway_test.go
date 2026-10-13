@@ -46,6 +46,7 @@ const (
 // harness 起一个假上游（外面包一层，记下上游收到的请求和发出的响应）、一个脚本上游
 // （按模型名返回任意状态、超大正文、重定向）和 QF。
 type harness struct {
+	cfg      *config.Config
 	qf       *httptest.Server
 	up       *httptest.Server
 	fake     *fakeupstream.Server
@@ -91,22 +92,24 @@ func untraced(_ sdktrace.SpanProcessor, m *telemetry.Metrics) telemetry.Telemetr
 // newHarnessTelemetry 用给定的账本、限流器和 Telemetry 起 QF。
 func newHarnessTelemetry(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry) *harness {
 	t.Helper()
+	return newHarnessChat(t, l, lim, tel, chatTimeout)
+}
+
+// newHarnessChat 同 newHarnessTelemetry，chat 的上游超时用给定的（流式的测试要在一个流里来回几步）。
+func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry, chat time.Duration) *harness {
+	t.Helper()
 	h := &harness{fake: fakeupstream.New(), logs: &syncBuffer{}, spans: tracetest.NewSpanRecorder(),
 		metrics: telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} })}
 	h.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		rec := httptest.NewRecorder()
-		h.fake.ServeHTTP(rec, r)
-		h.mu.Lock()
-		h.upBody, h.upHeader, h.upResp = body, r.Header.Clone(), rec.Body.Bytes()
-		h.mu.Unlock()
-		for k, v := range rec.Header() {
-			w.Header()[k] = v
-		}
 		w.Header().Set("X-Upstream-Marker", "upstream-only")
-		w.WriteHeader(rec.Code)
-		_, _ = w.Write(rec.Body.Bytes())
+		tee := &flushTee{w: w, code: http.StatusOK}
+		h.fake.ServeHTTP(tee, r)
+		h.mu.Lock()
+		h.upBody, h.upHeader, h.upResp = body, r.Header.Clone(), tee.buf.Bytes()
+		h.mu.Unlock()
+		tee.Flush()
 	}))
 	t.Cleanup(h.up.Close)
 	scripted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -122,8 +125,8 @@ func newHarnessTelemetry(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.
 	deadURL := "http://" + dead.Addr().String() + "/v1"
 	dead.Close()
 
-	cfg := loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL)
-	h.qf = httptest.NewServer(WithRequestID(New(cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))))
+	h.cfg = loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL, chat)
+	h.qf = httptest.NewServer(WithRequestID(New(h.cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))))
 	t.Cleanup(h.qf.Close)
 	return h
 }
@@ -142,6 +145,8 @@ func scriptedResponse(w http.ResponseWriter, model, fakeURL string) {
 	case model == "no-completion":
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"x","usage":{"prompt_tokens":3,"total_tokens":3}}`))
+	case strings.HasPrefix(model, "sse-"):
+		scriptedSSE(w, model)
 	case model == "no-content-type":
 		w.Header()["Content-Type"] = nil // 不让 net/http 给这个响应嗅探出 Content-Type
 		_, _ = w.Write([]byte(`{"id":"no-ct"}`))
@@ -178,13 +183,89 @@ func scriptedResponse(w http.ResponseWriter, model, fakeURL string) {
 	}
 }
 
+// scriptedSSE 是脚本上游给流式请求的几种回答。
+func scriptedSSE(w http.ResponseWriter, model string) {
+	switch model {
+	case "sse-dense": // 事件一个接一个、一直发（最多 3 秒），直到 QF 关掉连接：到点时 QF 的读缓冲里总有已经读到的事件
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseEvery(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n", 0)
+	case "sse-late": // 先停 300 毫秒才回响应头，之后每 50 毫秒一个事件
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseEvery(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n", 50*time.Millisecond)
+	case "sse-usage-twice": // usage 先放在带内容的事件里，再一个 usage 为 null 的空 choices 事件，最后一个只带 usage 的（更大）
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseUsageTwice))
+	case "sse-crlf": // \r\n 的行尾、注释行、usage 分在两个 data 行里、带参数的 Content-Type
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		_, _ = w.Write([]byte(sseCRLF))
+	case "sse-not-json":
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"a\",\"choices\":[]}\n\ndata: not json RESP-MARKER-sse\n\ndata: [DONE]\n\n"))
+	case "sse-json-type": // 要的是流，上游却回了一个 JSON 正文
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	case "sse-no-type":
+		w.Header()["Content-Type"] = nil
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}
+}
+
+// sseEvery 每隔 every 写一个 ev 并刷新，最多 3 秒，对方关掉连接就停。
+func sseEvery(w http.ResponseWriter, ev string, every time.Duration) {
+	for start := time.Now(); time.Since(start) < 3*time.Second; time.Sleep(every) {
+		if _, err := w.Write([]byte(ev)); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+	}
+}
+
+// sseUsageTwice 是脚本上游的 sse-usage-twice 的四个事件。
+var sseUsageTwice = strings.Join([]string{
+	`data: {"id":"twice-1","model":"twice-model","choices":[{"index":0,"delta":{"content":"a"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n",
+	`data: {"choices":[],"usage":null}` + "\n\n",
+	`data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}` + "\n\n",
+	"data: [DONE]\n\n",
+}, "")
+
+// sseCRLF 是脚本上游的 sse-crlf：没要 usage 的客户端收到的是去掉第三个事件之后的字节。
+const sseCRLF = ": keep-alive\r\n\r\n" +
+	"data: {\"id\":\"crlf-1\",\"model\":\"crlf-model\",\"choices\":[{\"delta\":{\"content\":\"a\"},\"usage\":null}]}\r\n\r\n" +
+	"data: {\"choices\":[],\r\ndata: \"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\r\n\r\n" +
+	"data: [DONE]\r\n\r\n"
+
 // defaultMaxTokens 是测试配置里 chat 模型的 default_max_tokens。
 const defaultMaxTokens = 64
 
 // allAliases 是测试配置里的全部别名，clientKey 都能用。
 var allAliases []string
 
-func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string) *config.Config {
+// flushTee 记下假上游写的全部响应，并在它刷新时（流式的每个事件）才转发给 QF。不刷新的（非流式）等 handler 返回、
+// 记好了才一起发出，所以 QF 拿到响应时 upstreamSaw 已经能读到。
+type flushTee struct {
+	w          http.ResponseWriter
+	code       int
+	buf        bytes.Buffer
+	sent       int
+	headerSent bool
+}
+
+func (t *flushTee) Header() http.Header         { return t.w.Header() }
+func (t *flushTee) WriteHeader(code int)        { t.code = code }
+func (t *flushTee) Write(b []byte) (int, error) { return t.buf.Write(b) }
+
+func (t *flushTee) Flush() {
+	if !t.headerSent {
+		t.w.WriteHeader(t.code)
+		t.headerSent = true
+	}
+	_, _ = t.w.Write(t.buf.Bytes()[t.sent:])
+	t.sent = t.buf.Len()
+	t.w.(http.Flusher).Flush()
+}
+
+func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string, chat time.Duration) *config.Config {
 	t.Helper()
 	var models []map[string]any
 	var aliases []string
@@ -221,12 +302,13 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string) *config.Conf
 	}
 	add("over-limit", "embeddings", "scripted", "over-limit")
 	add("dead", "chat", "dead", "whatever")
+	addStreamModels(add)
 	if allAliases == nil { // 每次生成的都一样；只写一次，免得和进行中的请求竞争
 		allAliases = aliases
 	}
 
 	cfg := map[string]any{
-		"timeouts": map[string]any{"chat_ms": chatTimeout.Milliseconds(), "embeddings_ms": embeddingsTimeout.Milliseconds()},
+		"timeouts": map[string]any{"chat_ms": chat.Milliseconds(), "embeddings_ms": embeddingsTimeout.Milliseconds()},
 		"upstreams": []any{
 			map[string]any{"name": "fake", "base_url": fakeURL, "api_key_env": "UP_KEY"},
 			map[string]any{"name": "scripted", "base_url": scriptedURL, "api_key_env": "SCRIPTED_KEY"},
@@ -250,6 +332,18 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string) *config.Conf
 		t.Fatal(err)
 	}
 	return c
+}
+
+// addStreamModels 加上流式的别名：假上游的流式场景，和脚本上游的几种 SSE。
+func addStreamModels(add func(alias, purpose, upstream, upstreamModel string)) {
+	for _, s := range []string{"fake-stream-cut", "fake-stream-error", "fake-stream-huge", "fake-stream-no-done", "fake-stream-step", "fake-stream-big", "fake-stream-bytewise"} {
+		add(s, "chat", "fake", s)
+	}
+	add("stream-slow", "chat", "fake", "fake-stream-slow-100") // 14 个事件约 1.4 秒，比默认的 chat 超时长
+	add("stream-quick", "chat", "fake", "fake-stream-slow-20") // 14 个事件约 0.3 秒，在默认的 chat 超时之内
+	for _, s := range []string{"sse-crlf", "sse-not-json", "sse-json-type", "sse-no-type", "sse-dense", "sse-late", "sse-usage-twice"} {
+		add(s, "chat", "scripted", s)
+	}
 }
 
 type reply struct {
@@ -490,7 +584,9 @@ func TestErrorMapping(t *testing.T) {
 		{"trailing data", "/v1/chat/completions", clientKey, `{"model":"shared"} {}`, 400, "invalid_request"},
 		{"broken nested json", "/v1/chat/completions", clientKey, `{"model":"shared","tools":[{]}`, 400, "invalid_request"},
 		{"stream not bool", "/v1/chat/completions", clientKey, `{"model":"shared","stream":"yes"}`, 400, "invalid_request"},
-		{"stream", "/v1/chat/completions", clientKey, `{"model":"shared","stream":true}`, 400, "stream_not_supported"},
+		{"stream_options not an object", "/v1/chat/completions", clientKey, `{"model":"shared","stream":true,"stream_options":"x"}`, 400, "invalid_request"},
+		{"stream_options variant", "/v1/chat/completions", clientKey, `{"model":"shared","stream":true,"stream_options":null,"Stream_Options":{}}`, 400, "invalid_request"},
+		{"include_usage not boolean", "/v1/chat/completions", clientKey, `{"model":"shared","stream":true,"stream_options":{"include_usage":1}}`, 400, "invalid_request"},
 		{"unknown alias", "/v1/chat/completions", clientKey, `{"model":"gpt-x"}`, 404, "model_not_found"},
 		{"alias only for chat", "/v1/embeddings", clientKey, `{"model":"fake-tool-call","input":["a"]}`, 404, "model_not_found"},
 		{"alias only for embeddings", "/v1/chat/completions", clientKey, `{"model":"emb-hang"}`, 404, "model_not_found"},

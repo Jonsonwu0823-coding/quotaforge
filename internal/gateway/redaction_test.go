@@ -34,20 +34,26 @@ func TestTelemetryHasNoSecrets(t *testing.T) {
 	replay := e.send(t, "/v1/chat/completions", withModel(toolsBody, `"fake-tool-call"`), "Idempotency-Key", "IDEM-MARKER", tp, tps)
 	failed := e.send(t, "/v1/chat/completions", `{"model":"fake-500","messages":[{"content":"REQ-MARKER-3"}]}`, clientHeaders...)
 	exhausted := poor.send(t, "/v1/embeddings", `{"model":"shared","input":["REQ-MARKER-4"]}`, clientHeaders...)
+	// 流式：流里的事件（假上游的内容含 "fake reply"）也是正文；正常结束的、中途断开的、上游报错的各一个。
+	streamed := e.send(t, "/v1/chat/completions", streamOf("shared"), clientHeaders...)
+	cut := e.send(t, "/v1/chat/completions", streamOf("fake-stream-cut"), "Idempotency-Key", "IDEM-MARKER-S", tp, tps)
+	upErr := e.send(t, "/v1/chat/completions", streamOf("fake-stream-error"), clientHeaders...)
 	for _, r := range []struct {
 		r    reply
 		want int
-	}{{ok, 200}, {resp, 200}, {first, 200}, {replay, 200}, {failed, 502}, {exhausted, 429}} {
+	}{{ok, 200}, {resp, 200}, {first, 200}, {replay, 200}, {failed, 502}, {exhausted, 429}, {streamed, 200}, {cut, 200}, {upErr, 200}} {
 		if r.r.status != r.want {
 			t.Fatalf("status %d, want %d", r.r.status, r.want)
 		}
 	}
-	if replay.header.Get("Idempotent-Replayed") != "true" || !strings.Contains(string(resp.body), "RESP-MARKER") {
-		t.Fatal("the replay or the response marker did not happen")
+	if replay.header.Get("Idempotent-Replayed") != "true" || !strings.Contains(string(resp.body), "RESP-MARKER") ||
+		!strings.Contains(string(streamed.body), "fake reply") || !strings.Contains(string(upErr.body), "fake upstream stream error") {
+		t.Fatal("the replay, the response marker or the stream content did not happen")
 	}
-	waitFor(t, func() bool { return len(e.logs.lines(t)) == 5 && len(poor.logs.lines(t)) == 1 })
+	waitFor(t, func() bool { return len(e.logs.lines(t)) == 8 && len(poor.logs.lines(t)) == 1 })
 
-	secrets := []string{e.key, poor.key, "Bearer", upstreamKey, scriptedKey, "REQ-MARKER", "RESP-MARKER", "fake reply", "查询_lookup"}
+	secrets := []string{e.key, poor.key, "Bearer", upstreamKey, scriptedKey, "REQ-MARKER", "RESP-MARKER", "fake reply", "查询_lookup",
+		"fake upstream stream error", "fake_stream_error"}
 	clientStrings := []string{"IDEM-MARKER", "RUN-MARKER", "CRID-MARKER"}
 	for _, env := range []*dbEnv{e, poor} {
 		checkOutputs(t, env.harness, secrets, clientStrings)

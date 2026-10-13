@@ -16,12 +16,11 @@ type apiError struct {
 }
 
 var (
-	errInvalidAPIKey      = &apiError{status: 401, typ: "authentication_error", code: "invalid_api_key", message: "Invalid or missing API key."}
-	errRequestTooLarge    = &apiError{status: 413, typ: "invalid_request_error", code: "request_too_large", message: "Request body exceeds 2 MiB."}
-	errInvalidRequest     = &apiError{status: 400, typ: "invalid_request_error", code: "invalid_request", message: "Request body must be a JSON object with a string model field."}
-	errStreamNotSupported = &apiError{status: 400, typ: "invalid_request_error", code: "stream_not_supported", message: "Streaming is not supported."}
-	errModelNotFound      = &apiError{status: 404, typ: "invalid_request_error", code: "model_not_found", message: "The model does not exist for this endpoint."}
-	errModelNotAllowed    = &apiError{status: 403, typ: "permission_error", code: "model_not_allowed", message: "This API key is not allowed to use the model."}
+	errInvalidAPIKey   = &apiError{status: 401, typ: "authentication_error", code: "invalid_api_key", message: "Invalid or missing API key."}
+	errRequestTooLarge = &apiError{status: 413, typ: "invalid_request_error", code: "request_too_large", message: "Request body exceeds 2 MiB."}
+	errInvalidRequest  = &apiError{status: 400, typ: "invalid_request_error", code: "invalid_request", message: "Request body must be a JSON object with a string model field."}
+	errModelNotFound   = &apiError{status: 404, typ: "invalid_request_error", code: "model_not_found", message: "The model does not exist for this endpoint."}
+	errModelNotAllowed = &apiError{status: 403, typ: "permission_error", code: "model_not_allowed", message: "This API key is not allowed to use the model."}
 
 	// 额度不够：立即拒绝、不排队。Retry-After 由网关按配置填上（retryAfterSeconds），这里不写死。
 	errQuotaExhausted = &apiError{status: 429, typ: "insufficient_quota", code: "quota_exhausted", message: "The account's token quota is exhausted."}

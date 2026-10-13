@@ -107,7 +107,7 @@ func (g *gateway) markSent(ctx context.Context, c *call) (e *apiError) {
 }
 
 // finish 在账本里收尾。失败时不改已经拿到的上游结果：调用留在原来的状态，由回收接手，原因记进日志。
-// 写回了 2xx 时把响应交给账本：带幂等键的调用存成快照。
+// 非流式拿到 2xx 时把响应交给账本：带幂等键的调用存成快照。流式不存快照，结算了的只交一个标记。
 func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *apiError) {
 	result := ledger.Result{
 		Status:             c.outcome,
@@ -117,9 +117,17 @@ func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *
 		UpstreamResponseID: checked(c.upstreamResponseID),
 		ResponseModel:      checked(c.upstreamModel),
 	}
-	if e != nil {
+	switch {
+	case e != nil && c.streamed: // 响应头和 200 已经写给客户端；错误码是补给客户端的错误事件里的那个
+		result.HTTPStatus, result.ErrorCode = c.status, e.code
+	case e != nil:
 		result.HTTPStatus, result.ErrorCode = e.status, e.code
-	} else {
+	case c.stream: // 流式不存快照：内容边读边写，QF 没有留下。结算了的只记一个标记，同一个键再来是 409（docs/api.md 的幂等）
+		result.HTTPStatus = res.Status
+		if c.outcome == ledger.Settled {
+			result.Response = &ledger.Response{Status: res.Status, Streamed: true}
+		}
+	default:
 		result.HTTPStatus, result.Response = res.Status, res
 	}
 	span := g.step(ctx, "finish")

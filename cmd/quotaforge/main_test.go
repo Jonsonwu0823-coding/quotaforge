@@ -68,7 +68,7 @@ func TestRunWaitsForInFlightRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan error, 1)
-	go func() { runDone <- run(ctx, ln, h, 10*time.Second) }()
+	go func() { runDone <- run(ctx, ln, newServer(h), 10*time.Second) }()
 
 	type result struct {
 		code int
@@ -113,7 +113,9 @@ func TestRunReturnsServeError(t *testing.T) {
 	ln.Close()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- run(context.Background(), ln, newHandler(http.NotFoundHandler()), 10*time.Second) }()
+	go func() {
+		runDone <- run(context.Background(), ln, newServer(newHandler(http.NotFoundHandler())), 10*time.Second)
+	}()
 
 	select {
 	case err := <-runDone:
@@ -142,7 +144,7 @@ func TestRunReturnsShutdownTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan error, 1)
-	go func() { runDone <- run(ctx, ln, h, 50*time.Millisecond) }()
+	go func() { runDone <- run(ctx, ln, newServer(h), 50*time.Millisecond) }()
 	go func() {
 		if resp, err := http.Get("http://" + ln.Addr().String()); err == nil {
 			resp.Body.Close()

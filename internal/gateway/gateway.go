@@ -75,8 +75,9 @@ const (
 // endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、估算、校验幂等键（prepare）→ 准入（限流）→ 预留 → 落发送意图 → 转发
 // → 收尾 → 写回（deliver）→ 修正限流的 TPM 桶 → 记录（日志、指标、根 span）。
 // 鉴权之后才建根 span（见 startTrace），之后的每一步都挂在它下面。
-// 收尾在写回之前：客户端拿到响应时，账本已经记好了。带幂等键、可以重放时，预留这一步直接给出原来的响应。
-// 请求发出之后不再看客户端：断开了也等上游回答或超时，照常收尾（有界结算），只是不写回。
+// 收尾在写回之前：客户端拿到响应时，账本已经记好了。流式做不到（事件边读边写），改成流结束之后才收尾：
+// 客户端收到 [DONE] 时收尾还没做，读完上游的流才做，从不在流结束之前做。带幂等键、可以重放时，预留这一步直接给出原来的响应。
+// 请求发出之后不再看客户端：断开了也等上游回答或超时（流式是读完上游的流），照常收尾（有界结算），只是不写回。
 // 修正在 defer 里，覆盖准入之后的每个出口；它在 handler 返回之前执行，所以响应要等它做完才发完（通常约 1 毫秒，
 // 最多 config.RateLimitTimeout）。
 func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
@@ -121,13 +122,18 @@ func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 }
 
 // deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写回。客户端已经断开就不写回，状态码留 0。
+// 流式已经写了响应头的，在 send 里写完了，这里只记错误码。
 func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, body []byte) {
-	res, e, finish := g.send(ctx, c, body)
+	res, e, finish := g.send(ctx, w, c, body)
 	c.outcome, c.evidence = outcome(c, res, e)
 	if finish {
 		g.finish(ctx, c, res, e)
 	}
 	switch {
+	case c.streamed:
+		if e != nil {
+			c.errorCode = e.code
+		}
 	case ctx.Err() != nil:
 		c.clientDisconnected = true
 		if e != nil {
@@ -142,7 +148,7 @@ func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, b
 
 // send 是预留之后、收尾之前的步骤，返回上游的结果，以及要不要收尾。客户端已经断开就不发；先建好上游请求，
 // 再落发送意图，落成了才发。发送意图没落成的不收尾：调用要么还是 RESERVED，要么库里其实已经提交成了 IN_FLIGHT，都交给回收。
-func (g *gateway) send(ctx context.Context, c *call, body []byte) (*ledger.Response, *apiError, bool) {
+func (g *gateway) send(ctx context.Context, w http.ResponseWriter, c *call, body []byte) (*ledger.Response, *apiError, bool) {
 	if ctx.Err() != nil {
 		return nil, errClientCanceled, true
 	}
@@ -153,7 +159,7 @@ func (g *gateway) send(ctx context.Context, c *call, body []byte) (*ledger.Respo
 	if e := g.markSent(ctx, c); e != nil {
 		return nil, e, false
 	}
-	res, e := g.forward(ctx, c, req)
+	res, e := g.forward(ctx, w, c, req)
 	return res, e, true
 }
 
@@ -181,13 +187,18 @@ func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) ([]by
 		}
 		return nil, c.invalid(reasonUnreadableBody)
 	}
+	// 服务器的 ReadTimeout 只管读请求：请求体读完、net/http 开始后台读（用来发现客户端断开）时，它自己清掉读期限，
+	// 等上游久的调用和长的流不受它限制（TestServerReadTimeoutSparesLongCalls 守着；以后升级 Go，这个测试会抓住变化）。
 	req, reason := parseRequest(body)
 	if reason != "" {
 		return nil, c.invalid(reason)
 	}
 	c.alias = req.model
 	if c.purpose == config.Chat && req.stream {
-		return nil, errStreamNotSupported
+		if reason := req.checkStreamOptions(); reason != "" {
+			return nil, c.invalid(reason)
+		}
+		c.stream, c.wantsUsage = true, req.wantsUsage
 	}
 	if c.model = g.cfg.Model(c.purpose, req.model); c.model == nil {
 		return nil, errModelNotFound
@@ -205,7 +216,7 @@ func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) ([]by
 			return nil, c.invalid(reasonFingerprintFailed)
 		}
 	}
-	out := req.withModel(body, c.model.UpstreamModel)
+	out := req.upstreamBody(body, c.model.UpstreamModel)
 	c.planned = plan(c, out, req.maxTokens)
 	return out, nil
 }

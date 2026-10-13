@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$Check,
+    [switch]$Stream,
     [switch]$Stop,
     [string]$UpstreamBaseUrl,
     [string]$Reconcile
@@ -16,6 +17,12 @@ param(
 #                                        以及这把 Key 和账户的限流限额（每分钟的请求数和 token 数）。
 #                                        任何一次请求不是 2xx，或者重放的核对不成立（x-request-id、正文和第一次不同，或者已消费变了），
 #                                        就在额度那一行之后报错退出（throw）；QF 还开着，QUERYSHIELD_MODEL_API_KEY 仍然设着
+#   .\scripts\compose-real.ps1 -Stream   同上，再经 QF 发三次流式聊天（花费很少），只显示流的结构，不显示内容：
+#                                        1. 不带 stream_options：事件数、data 行数、最后一个是不是 [DONE]、choices 为空的事件数（QF 去掉了
+#                                           usage 事件，应为 0）、行尾是 \n 还是 \r\n；调用状态是 SETTLED、有用量；
+#                                        2. 带 include_usage: true：usage 事件在倒数第几个、它的 choices 是不是空数组；调用的用量等于它的数；
+#                                        3. 要一个长一点的回答，读 2 秒就断开：等一会儿查调用状态，应是 SETTLED（QF 读完了上游的流）。
+#                                        流的原文写进临时目录（-Stop 时删掉），不显示。可以和 -Check 一起用；任何一项不成立就报错退出
 #   .\scripts\compose-real.ps1 -Stop     停掉 QF，连数据库的数据一起删掉，删掉临时目录，清掉 QUERYSHIELD_MODEL_API_KEY
 #   .\scripts\compose-real.ps1 -Reconcile <QS 的 demo-summary.json>
 #                                        经 QS 跑完真实演示之后：把 QS 的摘要和正在运行的 QF 的账本逐个 run 对账
@@ -41,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue' # 5.1 的 Invoke-WebRequest 进度条写回窗口顶部几行时会弄乱中文（-Check 用到）；只在本脚本的作用域里生效
 $summaryPath = $null
 if ($PSBoundParameters.ContainsKey('Reconcile')) {
-    if ($Check -or $Stop) { throw '-Reconcile 不能和 -Check、-Stop 一起用。' }
+    if ($Check -or $Stream -or $Stop) { throw '-Reconcile 不能和 -Check、-Stream、-Stop 一起用。' }
     if (-not $Reconcile -or -not (Test-Path -LiteralPath $Reconcile -PathType Leaf)) { throw "找不到 QS 的摘要文件：$Reconcile" }
     # 下面会切到 QF 目录，所以先把相对路径变成完整路径。
     $summaryPath = (Resolve-Path -LiteralPath $Reconcile).ProviderPath
@@ -182,6 +189,71 @@ function Find-Python {
     throw '找不到 Python 3.10 或更新的版本（python、python3、py 都不能用）。请先安装 Python；核对脚本只用标准库，不需要装包。'
 }
 
+# 发一次流式聊天：curl.exe 边收边写进 $tempDir 下的文件（Invoke-WebRequest 会攒到最后），返回 x-request-id 和流的原文。
+function Invoke-QFStream {
+    param([string]$Key, [string]$Name, [string]$Body, [string[]]$Extra = @())
+    $bodyFile = Join-Path $tempDir "$Name.json"
+    $outFile = Join-Path $tempDir "$Name.sse"
+    $headerFile = Join-Path $tempDir "$Name.headers"
+    [IO.File]::WriteAllText($bodyFile, $Body)
+    # 只用 -s（不带 -S）：读 2 秒就断开那一次 curl 会以 28 退出，不往 stderr 写（5.1 下原生命令的 stderr 会变成 PowerShell 错误）。
+    & curl.exe -s -N -o $outFile -D $headerFile -H "Authorization: Bearer $Key" -H 'Content-Type: application/json' `
+        --data-binary "@$bodyFile" @Extra 'http://127.0.0.1:8080/v1/chat/completions'
+    $id = (Get-Content $headerFile | Where-Object { $_ -match '^x-request-id:' } | Select-Object -First 1) -replace '^x-request-id:\s*', ''
+    $raw = if (Test-Path $outFile) { [IO.File]::ReadAllText($outFile) } else { '' }
+    return @{ Id = $id.Trim(); Raw = $raw }
+}
+
+# 把流的原文切成事件里的 data（多个 data 行用 \n 连起来）。
+function Get-StreamData {
+    param([string]$Raw)
+    $events = [regex]::Split($Raw, "\r?\n\r?\n") | Where-Object { $_ -ne '' }
+    return @($events | ForEach-Object {
+            (($_ -split "\r?\n") | Where-Object { $_ -like 'data:*' } | ForEach-Object { $_.Substring(5).TrimStart(' ') }) -join "`n"
+        } | Where-Object { $_ -ne '' })
+}
+
+function Get-QFCall {
+    param([string]$Key, [string]$Id)
+    return Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/calls/$Id" -Headers @{ Authorization = "Bearer $Key" } -UseBasicParsing
+}
+
+# -Stream 的三次检查，见文件开头。返回是否全部成立。
+function Invoke-StreamCheck {
+    param([string]$Key)
+    $passed = $true
+    $plain = Invoke-QFStream -Key $Key -Name 'stream-plain' -Body '{"model":"qwen-plus","stream":true,"messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}'
+    $data = Get-StreamData $plain.Raw
+    $emptyChoices = @($data | Where-Object { $_ -ne '[DONE]' -and @(($_ | ConvertFrom-Json).choices).Count -eq 0 }).Count
+    $crlf = $plain.Raw.Contains("`r`n")
+    Start-Sleep -Seconds 1 # 收尾在流结束之后
+    $call = Get-QFCall -Key $Key -Id $plain.Id
+    Write-Host "  不带 stream_options：$($data.Count) 个 data，最后一个是 [DONE] $($data[-1] -eq '[DONE]')，choices 为空的 $emptyChoices 个，行尾 \r\n $crlf；调用 $($call.status)，用量 $($call.usage | ConvertTo-Json -Compress)"
+    $passed = $passed -and ($data[-1] -eq '[DONE]') -and ($emptyChoices -eq 0) -and ($call.status -eq 'SETTLED')
+
+    $wants = Invoke-QFStream -Key $Key -Name 'stream-usage' -Body '{"model":"qwen-plus","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}'
+    $data = Get-StreamData $wants.Raw
+    $index = -1
+    for ($i = 0; $i -lt $data.Count; $i++) { if ($data[$i] -ne '[DONE]' -and $null -ne ($data[$i] | ConvertFrom-Json).usage) { $index = $i } }
+    $usage = if ($index -ge 0) { ($data[$index] | ConvertFrom-Json) } else { $null }
+    Start-Sleep -Seconds 1
+    $call = Get-QFCall -Key $Key -Id $wants.Id
+    $fromEnd = if ($index -ge 0) { $data.Count - $index } else { 0 }
+    Write-Host "  带 include_usage：$($data.Count) 个 data，usage 在倒数第 $fromEnd 个，它的 choices 是空数组 $($null -ne $usage -and @($usage.choices).Count -eq 0)；调用 $($call.status)，用量和 usage 事件相同 $($null -ne $usage -and $call.usage.total_tokens -eq $usage.usage.total_tokens)"
+    $passed = $passed -and ($null -ne $usage) -and ($call.status -eq 'SETTLED') -and ($call.usage.total_tokens -eq $usage.usage.total_tokens)
+
+    $gone = Invoke-QFStream -Key $Key -Name 'stream-gone' -Extra @('--max-time', '2') -Body '{"model":"qwen-plus","stream":true,"messages":[{"role":"user","content":"Count from 1 to 300, one number per line."}],"max_tokens":1200}'
+    $data = Get-StreamData $gone.Raw
+    $status = ''
+    for ($i = 0; $i -lt 30 -and $status -ne 'SETTLED' -and $status -ne 'USAGE_UNKNOWN'; $i++) {
+        Start-Sleep -Seconds 1
+        $status = (Get-QFCall -Key $Key -Id $gone.Id).status
+    }
+    $call = Get-QFCall -Key $Key -Id $gone.Id
+    Write-Host "  读 2 秒就断开：断开前收到 $($data.Count) 个 data，最后一个是 [DONE] $($data.Count -gt 0 -and $data[-1] -eq '[DONE]')；调用 $($call.status)，用量 $($call.usage | ConvertTo-Json -Compress)"
+    return $passed -and ($call.status -eq 'SETTLED')
+}
+
 # 逐个 run 对账，再校验账本。返回退出码：1 表示对不上或校验失败，2 表示核对跑不了。
 function Invoke-Reconcile {
     param([string]$SummaryPath)
@@ -279,6 +351,12 @@ try {
         Write-Host "限流（每分钟）：这把 Key 最多 $($keyRow[4]) 个请求、$($keyRow[5]) tokens；账户最多 $($row[10]) 个请求、$($row[11]) tokens"
         if (-not $checkPassed) {
             throw '-Check 没有全部通过，见上面的输出。QF 还开着，看完日志再运行 -Stop。'
+        }
+    }
+    if ($Stream) {
+        Write-Host '经 QF 发三次流式聊天（只显示流的结构）：'
+        if (-not (Invoke-StreamCheck -Key $qfKey)) {
+            throw '-Stream 没有全部通过，见上面的输出。QF 还开着，看完日志再运行 -Stop。'
         }
     }
 }

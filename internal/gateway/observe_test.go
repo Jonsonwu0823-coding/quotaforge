@@ -404,9 +404,11 @@ func TestSpanAttributesAllowList(t *testing.T) {
 	allowed := []string{"http.request.method", "http.route", "http.response.status_code", "error.type", "qf.request_id",
 		"qf.endpoint", "qf.model_alias", "qf.upstream", "qf.call_status", "qf.outcome", "qf.replay_of", "qf.call_id",
 		"qf.reserved_tokens", "qf.usage.known", "qf.usage.prompt_tokens", "qf.usage.completion_tokens", "qf.usage.total_tokens",
-		"qf.client_disconnected", "qf.rate_limited_by"}
+		"qf.client_disconnected", "qf.rate_limited_by", "qf.stream", "qf.stream.first_event_ms", "qf.stream.write_timeout"}
 	h := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates}, &stubLimiter{})
 	h.chat(t, withModel(toolsBody, `"fake-tool-call"`), "X-Run-Id", "RUN-MARKER", "X-Client-Request-Id", "CRID-MARKER")
+	h.chat(t, streamOf("fake-stream-cut"), "X-Run-Id", "RUN-MARKER")
+	h.chat(t, streamOf("shared"), "Idempotency-Key", "IDEM-MARKER-2")
 	h.chat(t, `{"model":"fake-no-usage"}`, "Idempotency-Key", "IDEM-MARKER")
 	unknown := requestID(t, h.chat(t, `{"model":"ALIAS-MARKER"}`))
 	denied := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates},
