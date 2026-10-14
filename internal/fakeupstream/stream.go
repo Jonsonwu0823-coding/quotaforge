@@ -125,16 +125,17 @@ func (st *streamer) event(data string) bool {
 	}
 	b := []byte("data: " + data + "\n\n")
 	if st.model == "fake-stream-bytewise" {
-		for i := range b {
-			if _, err := st.w.Write(b[i : i+1]); err != nil {
+		for ; len(b) > 1; b = b[1:] { // 最后一个字节留到计数之后
+			if _, err := st.w.Write(b[:1]); err != nil {
 				return false
 			}
 			st.w.(http.Flusher).Flush()
 		}
-	} else if _, err := st.w.Write(b); err != nil {
+	}
+	if _, err := st.w.Write(b); err != nil {
 		return false
 	}
-	st.s.sent.Add(1) // 刷新之前就计数：客户端读到这个事件时，计数一定已经加上
+	st.s.sent.Add(1) // 最后一次刷新之前就计数：客户端读完这个事件时，计数一定已经加上
 	st.w.(http.Flusher).Flush()
 	if st.ctx.Err() != nil {
 		st.s.canceled.Add(1)

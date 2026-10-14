@@ -9,6 +9,8 @@ import (
 	"fmt"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 )
 
 //go:embed bucket.lua
@@ -55,11 +57,22 @@ func Open(url, prefix string) (*Limiter, error) {
 	if err != nil {
 		return nil, errors.New("redis: invalid URL")
 	}
+	return newLimiter(opt, prefix), nil
+}
+
+// newLimiter 把限流要求的设置加在 opt 上，再建连接池。
+func newLimiter(opt *redis.Options, prefix string) *Limiter {
 	// 没有这一项，Redis 接受连接却不回答时，调用要等 go-redis 自己的读超时，而不是 context 的期限。
 	opt.ContextTimeoutEnabled = true
 	// 准入不是幂等的：读超时之后重试可能扣两次。出错就直接按不可用处理。
 	opt.MaxRetries = -1
-	return &Limiter{rdb: redis.NewClient(opt), prefix: prefix}, nil
+	// 拨号也要跟着请求的期限走。请求的期限是 RateLimitTimeout，但 go-redis 在后台拨号，拨号的 ctx 不随请求取消：
+	// 默认每次 5 秒、最多 5 次，拨号活得比请求久。Redis 停着时，名字解析要好几秒才失败（Docker Desktop 上约 4 秒），
+	// 同一个名字的并发查询又会合并，Redis 回来之后的请求会等进这次过时的查询，头几秒仍是 503。
+	// 所以每次拨号最多 RateLimitTimeout，只试一次。
+	opt.DialTimeout = config.RateLimitTimeout
+	opt.DialerRetries = 1
+	return &Limiter{rdb: redis.NewClient(opt), prefix: prefix}
 }
 
 // Close 关闭连接池。

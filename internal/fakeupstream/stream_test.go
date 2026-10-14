@@ -165,3 +165,37 @@ func waitHeld(t *testing.T, s *Server, n int64) {
 	}
 	t.Fatalf("held %d, want %d", s.Stats().Held, n)
 }
+
+// fake-stream-bytewise 每写一个字节就刷新：客户端读完一个完整的事件时，计数一定已经加上。
+// 逐字节的场景不能一步一步放事件，服务端可以跑在客户端前面，所以断言“计数不少于已读的事件数”。
+// 最后一个字节刷新出去之后才计数的话，客户端读到事件的瞬间计数可能还差一。
+func TestStreamBytewiseCountsBeforeLastByte(t *testing.T) {
+	s := New()
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	var n int64
+	for i := range 5 {
+		resp := openStream(t, srv, context.Background(), "qf-CCCCCCCCCCCCCCCCCCCCCCCCCC", `{"model":"fake-stream-bytewise","stream":true,"stream_options":{"include_usage":true},"messages":[{"content":"ab"}]}`)
+		r := bufio.NewReader(resp.Body)
+		for done := false; !done; {
+			done = readEvent(t, r) == "[DONE]"
+			n++
+			if got := s.Stats().StreamEvents; got < n {
+				t.Fatalf("stream %d: read %d events, counted %d", i, n, got)
+			}
+		}
+	}
+}
+
+// readEvent 读一个完整的事件（一行 data 加一个空行），返回 data。
+func readEvent(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	line, err := r.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "data: ") {
+		t.Fatalf("event line %q: %v", line, err)
+	}
+	if blank, err := r.ReadString('\n'); err != nil || blank != "\n" {
+		t.Fatalf("after event: %q %v", blank, err)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(line, "data: "), "\n")
+}
