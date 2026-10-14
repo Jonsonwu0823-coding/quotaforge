@@ -1,0 +1,12 @@
+# QS 端到端联调（scripts/compose-qs-e2e.sh）里 QS 的最后一个覆盖文件，放在 QS 的四个文件之后：
+# - 三个服务的镜像换成联调专用、带 QS 提交号的标签，不碰本机开发环境用的 queryshield-app:local。镜像缺了才构建（QS 的文件里有 build）；
+# - app 把自己的 span 用 OTLP/HTTP 发到 QF 的 Jaeger（qf-jaeger 由 QF 的 compose.qs-e2e.yaml 接进 qs-qf），两边的 span 在同一条 trace 上。
+services:
+  setup:
+    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}
+  app:
+    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}
+    environment:
+      QUERYSHIELD_OTLP_TRACES_URL: http://qf-jaeger:4318/v1/traces
+  fake-upstream:
+    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}

@@ -1,9 +1,0 @@
-# QS 端到端联调（scripts/compose-qs-e2e.sh）的第五个覆盖文件：放在 QS 的四个文件之后，只把 QS 三个服务的镜像
-# 换成联调专用、带 QS 提交号的标签，不碰本机开发环境用的 queryshield-app:local。镜像缺了才构建（QS 的文件里有 build）。
-services:
-  setup:
-    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}
-  app:
-    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}
-  fake-upstream:
-    image: ${QF_E2E_QS_IMAGE:?QF_E2E_QS_IMAGE is not set - use scripts/compose-qs-e2e.sh}

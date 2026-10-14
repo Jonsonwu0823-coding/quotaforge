@@ -14,7 +14,7 @@ docker compose -f compose.yaml -f compose.two.yaml down -v
 
 - **共享什么**：两个实例是同一个镜像、同一份配置、同一个 `app_dsn`，共用 `qf-mysql`（额度、账本、幂等记录）和 `qf-redis`（限流的桶）。进程里没有会让两个实例结果不一致的状态：每个请求都查库鉴权，没有 Key 和额度的本地缓存；限流只在 Redis 的脚本里算，时间只取 Redis 的 `TIME`。
 - **写法**：`quotaforge-b` 用 `extends` 引用 `compose.yaml` 里的 `quotaforge`，安全设置、依赖（迁移成功、Redis 健康）、secret、`stop_grace_period` 只写一份；去掉 `build`（用同一个镜像）、换掉端口（`!override`，只发布 `127.0.0.1:8081`）。`extends` 要写明 `file: compose.yaml`：它只看那个文件，不看合并之后的项目。要 Compose v2.24 以上（`!reset`、`!override`）。
-- **不接 `qs-qf`**：QS 的两个覆盖文件只改 `quotaforge`，`quotaforge-b` 只在 Compose 的默认网络上。
+- **不接 `qs-qf`**：QS 的两个覆盖文件只改 `quotaforge`，`quotaforge-b` 只在 Compose 的默认网络上。叠上 `compose.qs-e2e.yaml`（只给端到端联调用，见[接 QueryShield](queryshield.md)）时才接进 `qs-qf`，带网络别名 `quotaforge`。
 - **没有负载均衡器**：测试和压测工具自己轮流发给两个实例。负载均衡器会多一层超时、断开和请求体上限的行为，这里要证明的是两个进程共享状态时的正确性。
 - **后台循环**：两个实例各自跑回收和清理，和生产一样（见[调用状态、回收和对账](ledger.md#调用状态回收和对账未知用量)）。
 - **压测工具** `qfbench`（`cmd/qfbench`，只用标准库）也在这个文件里，`profiles: [tools]`，`up` 不起它，只用 `docker compose run`。它在 Compose 网络里面发请求，不经宿主机的端口转发：

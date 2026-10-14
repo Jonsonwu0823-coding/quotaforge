@@ -134,8 +134,8 @@ func (st *streamer) event(data string) bool {
 	} else if _, err := st.w.Write(b); err != nil {
 		return false
 	}
+	st.s.sent.Add(1) // 刷新之前就计数：客户端读到这个事件时，计数一定已经加上
 	st.w.(http.Flusher).Flush()
-	st.s.sent.Add(1)
 	if st.ctx.Err() != nil {
 		st.s.canceled.Add(1)
 		return false

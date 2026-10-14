@@ -126,6 +126,7 @@ func TestStreamStepAndCancel(t *testing.T) {
 	srv := httptest.NewServer(s)
 	defer srv.Close()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // 后进先出，在 srv.Close 之前跑：中途 t.Fatalf 时 handler 照样能结束，不卡住整个包
 	resp := openStream(t, srv, ctx, "qf-BBBBBBBBBBBBBBBBBBBBBBBBBB", `{"model":"fake-stream-step","stream":true,"messages":[{"content":"ab"}]}`)
 	r := bufio.NewReader(resp.Body)
 	for n := int64(1); n <= 3; n++ {

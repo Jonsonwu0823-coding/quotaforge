@@ -19,6 +19,7 @@
 | `compose.bench.yaml` | 再叠加在 `compose.two.yaml` 上：两个实例都换成压测配置 `deploy/config.bench.json`，见[压测](scaling.md#压测) |
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
 | `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
+| `compose.qs-e2e.yaml` | 只给端到端联调（`scripts/compose-qs-e2e.sh`）用，叠在 `compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml` 之后：`qf-jaeger` 接进 `qs-qf`（QS 的 span 也发到这个 Jaeger），`quotaforge-b` 也接进 `qs-qf`、带网络别名 `quotaforge`，见[接 QueryShield](queryshield.md) |
 
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
 - **`qf-redis`**：`redis:8`，不持久化（`--save '' --appendonly no`），不发布端口，不接入 `qs-qf`，健康检查是 `redis-cli ping`。不叫 `redis`，理由和 `qf-mysql` 一样。`quotaforge` 经环境变量 `QF_REDIS_URL=redis://qf-redis:6379/0` 连它（三份 `deploy/` 配置的 `redis.url_env` 都指向这个变量）；它只在 Compose 的内部网络上，不设密码。两个覆盖文件不用改，会继承这些设置。
