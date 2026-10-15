@@ -550,3 +550,45 @@ tests:
         exp_samples:
           - labels: '{}'
             value: 0.0385
+
+  # 熔断一直开着（2）：5 分钟里没关上过，报。启动时是 0：开了不到 5 分钟（窗口里还有 0）时不报。
+  - interval: 1m
+    input_series:
+      - series: qf_upstream_circuit_state{instance="quotaforge:9464",job="quotaforge",upstream="fake-b"}
+        values: 0 2+0x10
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: QFUpstreamCircuitOpen
+      - eval_time: 5m
+        alertname: QFUpstreamCircuitOpen
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "quotaforge:9464", job: quotaforge, upstream: fake-b}
+            exp_annotations: {summary: "实例 quotaforge:9464 上，上游 fake-b 的熔断 5 分钟没有关上"}
+
+  # 开和半开交替（探测一直失败）：一直没关上，报。
+  - interval: 1m
+    input_series:
+      - series: qf_upstream_circuit_state{instance="quotaforge:9464",job="quotaforge",upstream="fake-b"}
+        values: 2 1 2 1 2 1 2 1 2 1 2
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QFUpstreamCircuitOpen
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "quotaforge:9464", job: quotaforge, upstream: fake-b}
+            exp_annotations: {summary: "实例 quotaforge:9464 上，上游 fake-b 的熔断 5 分钟没有关上"}
+
+  # 中间关上过一次（0）：5 分钟的窗口里有它就不报；窗口过了它、之后又一直开着，才报。另一个一直关着的上游不报。
+  - interval: 1m
+    input_series:
+      - series: qf_upstream_circuit_state{instance="quotaforge:9464",job="quotaforge",upstream="fake-b"}
+        values: 2 2 2 2 2 0 2 2 2 2 2 2
+      - series: qf_upstream_circuit_state{instance="quotaforge:9464",job="quotaforge",upstream="fake-a"}
+        values: 0+0x11
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: QFUpstreamCircuitOpen
+      - eval_time: 10m
+        alertname: QFUpstreamCircuitOpen
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "quotaforge:9464", job: quotaforge, upstream: fake-b}
+            exp_annotations: {summary: "实例 quotaforge:9464 上，上游 fake-b 的熔断 5 分钟没有关上"}

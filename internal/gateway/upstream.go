@@ -8,11 +8,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"time"
 
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
 
@@ -35,12 +37,12 @@ func newUpstreamClient() *http.Client {
 	}
 }
 
-// upstreamRequest 建好发给上游的请求：改写过 model 的请求体、上游的 Key，以及这次调用的 QF 调用号（X-Client-Request-Id，
-// 上游超时、拿不到它的请求号时凭这个对账单）。客户端发来的 X-Client-Request-Id、X-Run-Id 不转发。
-// 在落发送意图之前建：建不起来时调用还是 RESERVED，确定没发出。
-func (g *gateway) upstreamRequest(c *call, body []byte) (*http.Request, *apiError) {
-	up := c.model.Upstream
-	req, err := http.NewRequest(http.MethodPost, up.URL(c.purpose), bytes.NewReader(body))
+// upstreamRequest 建好发给目标 t 的请求：按 t 的上游模型名改写的请求体、上游的 Key，以及这次调用的 QF 调用号
+// （X-Client-Request-Id，上游超时、拿不到它的请求号时凭这个对账单；换过上游也是同一个号，只有一个上游可能收到它）。
+// 客户端发来的 X-Client-Request-Id、X-Run-Id 不转发。在落发送意图（换上游时是改道）之前建：建不起来时确定没发出。
+func (g *gateway) upstreamRequest(c *call, t *config.Target, rq request) (*http.Request, *apiError) {
+	up := t.Upstream
+	req, err := http.NewRequest(http.MethodPost, up.URL(c.purpose), bytes.NewReader(rq.bodyFor(t)))
 	if err != nil {
 		return nil, errUpstreamError
 	}
@@ -54,27 +56,35 @@ func (g *gateway) upstreamRequest(c *call, body []byte) (*http.Request, *apiErro
 	return req, nil
 }
 
-// forward 把请求发给上游，包一个客户端 span，记下等上游的时间（QF 自身耗时 = 总耗时 − 它）。流式时 span 和这段时间
-// 包住整个流，含写给客户端的时间。只把 ctx 用于 span：发给上游的请求头在 upstreamRequest 里定好，不注入 traceparent。
-func (g *gateway) forward(ctx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
+// forward 是对上游的一次尝试：包一个客户端 span，记这次尝试的指标，累计等上游的时间（QF 自身耗时 = 总耗时 − 它）。
+// 流式时 span 和这段时间包住整个流，含写给客户端的时间。只把 ctx 用于 span：发给上游的请求头在 upstreamRequest 里定好，
+// 不注入 traceparent。
+func (g *gateway) forward(ctx, upCtx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
+	up := c.target.Upstream.Name
 	span := g.step(ctx, "upstream", trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attrUpstream.String(c.model.Upstream.Name), semconv.HTTPRequestMethodPost))
+		trace.WithAttributes(attrUpstream.String(up), semconv.HTTPRequestMethodPost))
 	start := time.Now()
-	res, e := g.exchange(ctx, w, c, req)
-	c.upstreamDuration = time.Since(start)
+	res, e := g.exchange(ctx, upCtx, w, c, req)
+	d := time.Since(start)
+	c.upstreamDuration += d
 	if c.upstreamStatus != 0 {
 		span.SetAttributes(semconv.HTTPResponseStatusCode(c.upstreamStatus))
 	}
 	endStep(span, e)
+	result := "ok"
+	if e != nil {
+		result = e.code
+	}
+	endpoint := string(c.purpose)
+	g.tel.Metrics.UpstreamRequests.WithLabelValues(up, endpoint, result).Inc()
+	g.tel.Metrics.UpstreamDuration.WithLabelValues(up, endpoint).Observe(d.Seconds())
 	return res, e
 }
 
-// exchange 把请求发给上游，不重试。超时从 ctx 派生，但不跟着客户端取消（有界结算）：请求一旦发出，
+// exchange 把请求发给上游，不重试。upCtx 是这次调用所有尝试共用的期限，不跟着客户端取消（有界结算）：请求一旦发出，
 // 就等到上游回答或超时，照常收尾，客户端断开了也一样。上游的请求号、模型名和用量记到 c 上。
 // 2xx 的应答原样交给客户端：非流式整个读进来，由 deliver 在收尾之后写回；流式由 relay 边读边写给 w。
-func (g *gateway) exchange(ctx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
-	upCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.Timeout(c.purpose))
-	defer cancel()
+func (g *gateway) exchange(ctx, upCtx context.Context, w http.ResponseWriter, c *call, req *http.Request) (*ledger.Response, *apiError) {
 	c.upstreamCalled = true
 	resp, err := g.client.Do(req.WithContext(upCtx))
 	if err != nil {
@@ -98,6 +108,32 @@ func (g *gateway) exchange(ctx context.Context, w http.ResponseWriter, c *call, 
 		return nil, errUpstreamInvalidResponse
 	}
 	return &ledger.Response{Status: resp.StatusCode, ContentType: resp.Header.Values("Content-Type"), Body: respBody}, nil
+}
+
+// failover 在上一次尝试确定没发出（拨号失败）之后换到下一个目标：选目标 → 建请求 → 新上游准入（只准入上游层）
+// → 账本改道 → 换走的上游层的桶在收尾时全部加回。准入和改道受所有尝试共用的期限限制，期限已经到了就不换。
+// 任何一步不成就不换，返回 nil：调用照上一次尝试的结果收尾（确定没发出，释放），准入过的桶（新上游的也在里面）
+// 在收尾时按这个结局全部加回。
+func (g *gateway) failover(ctx, upCtx context.Context, c *call, rq request) *http.Request {
+	if upCtx.Err() != nil {
+		return nil
+	}
+	from := c.target.Upstream.Name
+	next, p := g.router.pick(c.model.Targets, append(slices.Clone(c.failoverFrom), from))
+	if next == nil {
+		return nil
+	}
+	c.permit = p
+	req, e := g.upstreamRequest(c, next, rq)
+	if e != nil || !g.admitUpstream(ctx, upCtx, c, next.Upstream) || !g.reroute(ctx, upCtx, c, next) {
+		g.router.release(c)
+		return nil
+	}
+	c.releaseUpstream(from)
+	c.failoverFrom = append(c.failoverFrom, from)
+	c.target = next
+	g.tel.Metrics.Failovers.WithLabelValues(string(c.purpose), from).Inc()
+	return req
 }
 
 // transportError 区分上游超时、连接没建立和其它传输错误。

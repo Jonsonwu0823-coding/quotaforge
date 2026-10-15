@@ -10,11 +10,11 @@
 | `GET /healthz` | 存活检查，不需要鉴权，不查数据库 |
 
 - 鉴权：`Authorization: Bearer <QF 发的 Key>`。Key 存在数据库里（只存哈希），每个请求都查库，吊销立即生效。
-- 转发时只把请求体顶层的 `model` 换成上游模型名，其余字节不改；上游的 2xx 响应体原样返回，`model` 是上游给的实际模型名。
+- 转发时只把请求体顶层的 `model` 换成上游模型名，其余字节不改；上游的 2xx 响应体原样返回，`model` 是上游给的实际模型名。别名有多个目标时，换到哪个目标就按它的上游模型名从原始请求体改写（见[多个上游](operations.md#多个上游)）。
 - 发给上游的请求头只有 `Authorization`（上游的 Key）、`Content-Type`、`Accept`（`application/json`，流式时是 `text/event-stream`）和 `X-Client-Request-Id`。最后这个的值是这次调用的 QF 调用号：上游超时、拿不到上游的请求号时，凭它向上游查这次调用、要按调用的账单（OpenAI 的 API 文档里这个头就是这个用途：调用方自己设、每个请求一个值、ASCII、不超过 512 个字符）。客户端发来的 `X-Client-Request-Id`、`X-Run-Id` 只记录，不转发。
 - QF 读请求体顶层的 `model`、`stream`、`max_tokens` 三个字段，流式时还有 `stream_options`（见[流式](#流式)）。它们重复出现，或者有大小写、Unicode 折叠变体（`MODEL`、`Max_Tokens`、`ſtream`），一律 400 `invalid_request`：有的上游解析键名不区分大小写，QF 和上游必须读到同一个值。`max_tokens` 必须是 0 到 2³¹−1 的整数（`1.5`、`1e3`、`"8"` 都是 400），`null` 当作没写。
 - 每个响应都带 `x-request-id`（QF 的调用号，也是账本里调用的编号）。错误体是 OpenAI 格式：`{"error":{"message":…,"type":…,"param":null,"code":…}}`。
-- 每次调用写一行 JSON 日志到标准输出：调用号、Key 编号（数据库里的数字 id）、账户、别名、上游、写回客户端的状态（`status`；客户端已断开、什么都没写回时没有）、上游的状态、耗时、错误码、`X-Client-Request-Id`、`X-Run-Id`、上游的请求号和模型名、用量（拿不到就是 `"unknown"`）、`call_status`（账本里实际记下的调用状态）、`outcome`（网关自己判定的结局，和账本写没写成功无关，见[上游结果怎么收尾](ledger.md#调用状态回收和对账未知用量)；只有预留成功的调用有）、`reserved_tokens`（预留量）、`ledger_error`（账本操作失败的原因）、`client_disconnected`（写回之前客户端已经断开；流式是流结束之前）、`stream`（流式的调用才有，值是 `true`）、`first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`write_timeout`（流式：客户端不读，写一个事件超过了期限，同时有 `client_disconnected`）、`idempotency_key`（请求带的幂等键，和客户端头同一条规则记）、`replay_of`（重放时是原来的调用号）、`rate_limited_by`（被限流时是哪个桶，例如 `key/rpm`）、`rate_limiter_error`（准入或修正时 Redis 的错误原文，不含 URL）、`invalid_reason`（400 `invalid_request` 的原因，取值固定，见[日志关联](observability.md#日志关联)）、`trace_id` 和 `span_id`（开着追踪、这次调用被采样时才有：所在的 trace 和根 span）、`parent_span_id`（同样的条件下，请求带了合法的 `traceparent` 时才有：其中的 parent-id，即客户端那一次请求的 span id）。不记 Key、密码、连接串和正文。
+- 每次调用写一行 JSON 日志到标准输出：调用号、Key 编号（数据库里的数字 id）、账户、别名、上游、写回客户端的状态（`status`；客户端已断开、什么都没写回时没有）、上游的状态、耗时、错误码、`X-Client-Request-Id`、`X-Run-Id`、上游的请求号和模型名、用量（拿不到就是 `"unknown"`）、`call_status`（账本里实际记下的调用状态）、`outcome`（网关自己判定的结局，和账本写没写成功无关，见[上游结果怎么收尾](ledger.md#调用状态回收和对账未知用量)；只有预留成功的调用有）、`reserved_tokens`（预留量）、`ledger_error`（账本操作失败的原因）、`failover_from`（换过上游时才有：之前试过、确定没收到请求的上游）、`circuit_open`（所有目标的上游都熔断着、快速失败时才有）、`client_disconnected`（写回之前客户端已经断开；流式是流结束之前）、`stream`（流式的调用才有，值是 `true`）、`first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`write_timeout`（流式：客户端不读，写一个事件超过了期限，同时有 `client_disconnected`）、`idempotency_key`（请求带的幂等键，和客户端头同一条规则记）、`replay_of`（重放时是原来的调用号）、`rate_limited_by`（被限流时是哪个桶，例如 `key/rpm`）、`rate_limiter_error`（准入或修正时 Redis 的错误原文，不含 URL）、`invalid_reason`（400 `invalid_request` 的原因，取值固定，见[日志关联](observability.md#日志关联)）、`trace_id` 和 `span_id`（开着追踪、这次调用被采样时才有：所在的 trace 和根 span）、`parent_span_id`（同样的条件下，请求带了合法的 `traceparent` 时才有：其中的 parent-id，即客户端那一次请求的 span id）。不记 Key、密码、连接串和正文。
 - 调用状态查询每次写一行 `msg: "lookup"`（调用号、Key 编号、账户、被查的调用号、状态码、错误码、耗时），不是 `msg: "call"`：不算一次模型调用，用量导出和对账都不读它。
 
 ### 额度和限流的错误
@@ -25,11 +25,13 @@
 | 429 | `rate_limited` | 被限流：Key、账户或上游的某个令牌桶不够（见[限流](rate-limiting.md)）。立即返回，不排队。`type` 是 `rate_limit_error`，带 `Retry-After` | 不调 |
 | 503 | `ledger_unavailable` | 账本数据库不可用或超时（查 Key、预留、发送意图，每次操作 2 秒），或者发送意图没落成（调用已被回收）。拒绝，不放行 | 不调 |
 | 503 | `rate_limiter_unavailable` | 限流用的 Redis 不可用或超时（每次操作 0.5 秒）。只影响要检查令牌桶的请求。拒绝，不放行；`type` 是 `server_error`，不带 `Retry-After` | 不调 |
+| 502 | `upstream_unavailable` | 这个别名所有目标的上游都熔断着（见[多个上游](operations.md#多个上游)）。立即返回，在准入和预留之前，账本里没有这次调用；`type` 是 `upstream_error`，不带 `Retry-After`。和“连不上上游”是同一个错误码，日志有 `circuit_open: true` | 不调 |
 
 - `quota_exhausted` 一定带 `Retry-After`，值是较大的上游超时（整秒，默认 25）：不经管理员改上限，额度回来的唯一途径是进行中的调用结算或释放，它们都在一个上游超时内结束。额度真的用完时，等多久都不会好，要 `qfctl account set-limit`。
 - `rate_limited` 的 `Retry-After` 是不够的桶里补够所需时间最长的那个，向上取整到秒，至少 1。
 - 429 只用于 QF 自己的额度和限流。上游的 429 仍是 503 `upstream_rate_limited`。
-- 预留之前就被拒的请求（401、403、404、400、429、503）只进调用日志，不进账本。
+- 预留之前就被拒的请求（401、403、404、400、429、503，以及全部熔断时的 502 `upstream_unavailable`）只进调用日志，不进账本。
+- 上游挂了时：只有一个目标的别名，连续几次连不上（或超时、5xx）之后熔断打开，之后的请求立即得到 502 `upstream_unavailable`，不再等上游超时（504）；有备用目标的别名直接去备用。
 
 ## 流式
 
@@ -131,7 +133,8 @@ curl.exe -sS -i http://127.0.0.1:8080/v1/embeddings -H "Authorization: Bearer $k
   | 之前的调用凭证据结算成了 `SETTLED`，没有快照（超时、断开之后凭账单或日志结算） | 不执行：上一次已经计费，响应没有保存 | 409 `idempotency_response_unavailable` |
 
   - 重放不预留、不调上游、不写账本，额度用完了也照样重放；鉴权、模型白名单照常检查。
-  - 预留之前就失败的请求（400、401、403、404、413、429 `quota_exhausted`、预留时的 503）不留记录，重试时重新判断：例如额度调高之后，同一个键可以正常执行。
+  - 预留之前就失败的请求（400、401、403、404、413、429 `quota_exhausted`、预留时的 503，以及全部熔断时的 502 `upstream_unavailable`）不留记录，重试时重新判断：例如额度调高之后，同一个键可以正常执行。这些检查在查记录之前，所以本来可以重放的键，这时也得到这些错误、不重放：和被限流时得到 429 `rate_limited`、不重放一样。
+  - 换过上游的调用照常记键：成功了就存快照，同一个键再来是重放；两个目标都连不上的是 `CANCELLED`，同一个键再来重新执行。
   - 几个 409 的 `type` 是 `conflict_error`，422 是 `invalid_request_error`；message 都是固定文字，不带键的值。
   - 客户端中途断开时，请求已经发出的照常收尾（有界结算），拿到 2xx 的存快照，同一个键重试得到重放。迟到的结果把未知结算掉、写回了 2xx 的，也存快照。
   - **流式**：照常记键和指纹，同一个键最多执行一次；但不存快照（内容边读边写给了客户端，QF 没有留下），所以**流式的调用不能重放**。结算了的流在记录里只记状态码，当作标记（快照的其余三列都是空的），`qfctl verify` 据此分得出它和漏存了快照的非流式调用。同一个键再来时按上表：流还没结束是 409 `idempotency_in_progress`；结算了是 409 `idempotency_response_unavailable`；用量未知（截断、没有 usage）的不记标记，是 409 `idempotency_outcome_unknown`，之后对账结清成 `SETTLED` 的也是 409 `idempotency_response_unavailable`；上游在流开始之前回了 4xx 的（`CANCELLED`）重新执行。同一个键先发非流式、再发流式，请求体不同，是 422。要能重放，就用非流式。

@@ -37,7 +37,7 @@ flowchart LR
 | M4 限流和多实例 | Redis 共享令牌桶（Key、账户、上游三层的 RPM、TPM）；两个实例的跨进程检查和压测（[限流](docs/rate-limiting.md)、[两个实例和压测](docs/scaling.md)） |
 | M5 可观测 | OpenTelemetry 追踪（一次调用一棵 span 树，接收 W3C `traceparent`）、Prometheus 指标、SLO 和告警规则、日志按调用号和 `trace_id` 关联；Jaeger 加 Prometheus 的演示环境（[可观测](docs/observability.md)） |
 
-进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。计划中：多上游与熔断、Embedding 缓存、用量事件。
+进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。多上游与熔断已经可用：一个别名多个目标、按权重分流（灰度、主备），连不上时换上游，按上游熔断（[多个上游](docs/operations.md#多个上游)）。计划中：Embedding 缓存、用量事件。
 
 ## 快速开始
 
@@ -68,7 +68,7 @@ docker compose down -v
 | [接口和幂等](docs/api.md) | 接口、错误码、用 curl 调用、`Idempotency-Key` |
 | [额度、账本和未知用量](docs/ledger.md) | 估算、预留、结算，锁的顺序，账本的不变量；调用状态、回收、对账、调用状态查询；数据库和迁移；用量导出 |
 | [限流](docs/rate-limiting.md) | 三层令牌桶、Lua 脚本、TPM 的修正、Redis 不可用时的行为 |
-| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
+| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、多个上游和熔断、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
 | [两个实例和压测](docs/scaling.md) | 两个实例怎么共享状态、跨实例的检查、压测方法和结果 |
 | [可观测](docs/observability.md) | span 树、日志关联、指标清单、SLO 和告警、Jaeger 加 Prometheus 的演示环境 |
 | [接 QueryShield](docs/queryshield.md) | 网络和配置、端到端联调、经 QS 的真实演示和对账 |

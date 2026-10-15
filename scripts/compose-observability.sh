@@ -187,7 +187,7 @@ check "prometheus: the background loop reports a recent success" \
   [ "$(promql 'time() - max(qf_background_last_success_timestamp_seconds) < 60')" != none ]
 rules=$(curl -sS "$PROM/api/v1/rules" | jq -c '[.data.groups[].rules[] | .type + ":" + .health] | group_by(.) | map(.[0] + "=" + (length | tostring))')
 say "rules: $rules"
-check "prometheus: 8 recording rules and 7 alerts are loaded and healthy" [ "$rules" = '["alerting:ok=7","recording:ok=8"]' ]
+check "prometheus: 8 recording rules and 8 alerts are loaded and healthy" [ "$rules" = '["alerting:ok=8","recording:ok=8"]' ]
 # 挂载用相对路径：由 docker 命令按自己的当前目录解析。Windows 的 Git Bash 里 $PWD 可能是 /tmp/...（%TEMP% 的映射），
 # Docker Desktop 会把它当成虚拟机里的路径，挂上空目录。
 # MSYS_NO_PATHCONV：Git Bash 会把容器里的路径 /etc/prometheus/... 改写成 Git 的安装目录。两者在 Linux 下都没有影响

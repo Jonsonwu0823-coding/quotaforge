@@ -27,6 +27,11 @@ type call struct {
 	key     *ledger.Key
 	alias   string
 	model   *config.Model
+	target  *config.Target // 这次发给的目标；换过上游时是最后那个
+	permit  *permit        // 熔断放行了 target 的上游、结果还没交回时才有
+
+	failoverFrom []string // 换上游之前试过、确定没收到请求（拨号失败）的上游，按顺序
+	circuitOpen  bool     // 所有目标的上游都熔断着，快速失败
 
 	planned     ledger.Reservation  // prepare 建好的预留（估算见 estimate）；准入的 TPM 花费和预留量都是它的 Amount
 	reservation *ledger.Reservation // 预留成功后才有，指向 planned
@@ -36,6 +41,7 @@ type call struct {
 	ledgerError string              // 账本操作失败的原因（驱动的错误文字，不含连接串）
 
 	admitted         []ratelimit.Bucket // 准入放行时扣过的桶；没有桶、被拒、出错时为空
+	released         []ratelimit.Bucket // 换上游时换走的上游层的桶：那个上游确定没收到请求，收尾时 TPM 全部加回
 	deniedBy         *ratelimit.Bucket  // 被限流时是哪个桶
 	rateLimiterError string             // 准入或修正时 Redis 的错误文字（不含 URL）
 
@@ -153,9 +159,7 @@ func (g *gateway) logCall(c *call, d time.Duration) {
 		attrs = append(attrs, slog.Int64("key_id", c.key.ID), slog.String("account", c.key.Account))
 	}
 	attrs = appendChecked(attrs, "model_alias", c.alias)
-	if c.model != nil {
-		attrs = append(attrs, slog.String("upstream", c.model.Upstream.Name))
-	}
+	attrs = routeLogAttrs(attrs, c)
 	if c.upstreamStatus != 0 {
 		attrs = append(attrs, slog.Int("upstream_status", c.upstreamStatus))
 	}
@@ -195,6 +199,21 @@ func (g *gateway) logCall(c *call, d time.Duration) {
 		attrs = append(attrs, slog.String("rate_limiter_error", c.rateLimiterError))
 	}
 	g.log.LogAttrs(context.Background(), slog.LevelInfo, "call", attrs...)
+}
+
+// routeLogAttrs 是调用行里上游的字段：upstream（最后发给的上游）、failover_from（换过上游时才有）、
+// circuit_open（所有目标的上游都熔断着、快速失败时才有）。
+func routeLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
+	if c.target != nil {
+		attrs = append(attrs, slog.String("upstream", c.target.Upstream.Name))
+	}
+	if len(c.failoverFrom) > 0 {
+		attrs = append(attrs, slog.Any("failover_from", c.failoverFrom))
+	}
+	if c.circuitOpen {
+		attrs = append(attrs, slog.Bool("circuit_open", true))
+	}
+	return attrs
 }
 
 // streamLogAttrs 是流式的调用行多的字段：stream、first_event_ms（收到了事件才有）、write_timeout（写超时才有）。

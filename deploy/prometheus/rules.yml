@@ -84,3 +84,12 @@ groups:
           severity: critical
         annotations:
           summary: "{{ $labels.dependency }} 持续出错超过 5 分钟"
+      # 一个上游的熔断 5 分钟里一直没关上过：一直开着，或者开和半开交替（探测一直失败）。熔断每个实例各记各的，按实例和上游报。
+      # 用 min_over_time 而不是 for：半开（1）的探测会让状态短暂离开“开”（2），for 会被它打断重新计时。
+      # 没有请求时熔断不会去探测，上游恢复了告警也会一直在；发一个请求就会触发探测（docs/observability.md）。
+      - alert: QFUpstreamCircuitOpen
+        expr: min_over_time(qf_upstream_circuit_state[5m]) >= 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "实例 {{ $labels.instance }} 上，上游 {{ $labels.upstream }} 的熔断 5 分钟没有关上"

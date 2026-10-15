@@ -9,8 +9,8 @@
     }
   ],
   "models": [
-    {"alias": "qs-fake-upstream-v1", "purpose": "chat", "upstream": "qs-fake", "upstream_model": "qs-fake-upstream-v1", "default_max_tokens": 1024},
-    {"alias": "qs-fake-upstream-v1", "purpose": "embeddings", "upstream": "qs-fake", "upstream_model": "qs-fake-upstream-v1"}
+    {"alias": "qs-fake-upstream-v1", "purpose": "chat", "targets": [{"upstream": "qs-fake", "upstream_model": "qs-fake-upstream-v1", "weight": 1}], "default_max_tokens": 1024},
+    {"alias": "qs-fake-upstream-v1", "purpose": "embeddings", "targets": [{"upstream": "qs-fake", "upstream_model": "qs-fake-upstream-v1", "weight": 1}]}
   ],
   "database": {"dsn_file": "/run/secrets/app_dsn"},
   "redis": {"url_env": "QF_REDIS_URL"}

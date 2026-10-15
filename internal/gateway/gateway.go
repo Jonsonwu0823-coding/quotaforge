@@ -34,12 +34,13 @@ func WithRequestID(h http.Handler) http.Handler {
 
 // Ledger 是网关用到的账本操作：生产里是 *ledger.Store。不存在或已吊销的 Key，KeyByHash 返回 nil, nil；
 // 额度不够时 Reserve 返回 ledger.ErrQuotaExhausted，带幂等键时还可能返回要重放的快照或幂等的几种拒绝。
-// MarkSent 落发送意图；Call 给调用状态查询用，不存在或不属于这个账户时返回 nil, nil。
-// 其它错误都当成账本不可用。
+// MarkSent 落发送意图；Reroute 是换上游时的改道（调用不再是 IN_FLIGHT 时返回 ledger.ErrNotInFlight）；
+// Call 给调用状态查询用，不存在或不属于这个账户时返回 nil, nil。其它错误都当成账本不可用。
 type Ledger interface {
 	KeyByHash(ctx context.Context, hash string) (*ledger.Key, error)
 	Reserve(ctx context.Context, r ledger.Reservation) (*ledger.Replay, error)
 	MarkSent(ctx context.Context, r ledger.Reservation) error
+	Reroute(ctx context.Context, r ledger.Reservation, upstream, upstreamModel string) error
 	Finish(ctx context.Context, r ledger.Reservation, res ledger.Result) error
 	Call(ctx context.Context, accountID int64, id string) (*ledger.CallInfo, error)
 }
@@ -49,6 +50,7 @@ type gateway struct {
 	ledger         Ledger
 	limiter        Limiter
 	client         *http.Client
+	router         *router
 	log            *slog.Logger
 	tel            telemetry.Telemetry
 	quotaExhausted *apiError // 带上按配置算好的 Retry-After
@@ -56,8 +58,16 @@ type gateway struct {
 
 // New 返回两个转发接口和调用状态查询的路由。外面要套 WithRequestID。
 func New(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger, tel telemetry.Telemetry) http.Handler {
-	g := &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), log: log, tel: tel,
-		quotaExhausted: errQuotaExhausted.withRetryAfter(retryAfterSeconds(cfg))}
+	return newGateway(cfg, l, lim, log, tel).routes()
+}
+
+// newGateway 建好网关；测试在 routes 之前换掉熔断的时钟、选目标的随机源或上游的 Transport。
+func newGateway(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger, tel telemetry.Telemetry) *gateway {
+	return &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), router: newRouter(cfg, tel.Metrics),
+		log: log, tel: tel, quotaExhausted: errQuotaExhausted.withRetryAfter(retryAfterSeconds(cfg))}
+}
+
+func (g *gateway) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST "+chatRoute, g.endpoint(config.Chat, chatRoute))
 	mux.Handle("POST "+embeddingsRoute, g.endpoint(config.Embeddings, embeddingsRoute))
@@ -72,8 +82,8 @@ const (
 	lookupRoute     = "/v1/calls/{id}"
 )
 
-// endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、估算、校验幂等键（prepare）→ 准入（限流）→ 预留 → 落发送意图 → 转发
-// → 收尾 → 写回（deliver）→ 修正限流的 TPM 桶 → 记录（日志、指标、根 span）。
+// endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、校验幂等键、选目标、估算（prepare）→ 准入（限流）→ 预留 → 落发送意图
+// → 转发（拨号失败时换上游）→ 收尾 → 写回（deliver）→ 修正限流的 TPM 桶 → 记录（日志、指标、根 span）。
 // 鉴权之后才建根 span（见 startTrace），之后的每一步都挂在它下面。
 // 收尾在写回之前：客户端拿到响应时，账本已经记好了。流式做不到（事件边读边写），改成流结束之后才收尾：
 // 客户端收到 [DONE] 时收尾还没做，读完上游的流才做，从不在流结束之前做。带幂等键、可以重放时，预留这一步直接给出原来的响应。
@@ -94,10 +104,11 @@ func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 		e := g.authenticate(r, c)
 		ctx := g.startTrace(r, c, route, e)
 		defer g.adjust(ctx, c) // 先于 record 执行：日志里要有修正的错误，根 span 要包住修正
+		defer g.router.release(c)
 
-		var body []byte
+		var rq request
 		if e == nil {
-			body, e = g.prepare(w, r, c)
+			rq, e = g.prepare(w, r, c)
 		}
 		if e == nil {
 			e = g.admit(ctx, c)
@@ -117,14 +128,14 @@ func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 			writeResponse(w, c, &replay.Response)
 			return
 		}
-		g.deliver(ctx, w, c, body)
+		g.deliver(ctx, w, c, rq)
 	}
 }
 
 // deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写回。客户端已经断开就不写回，状态码留 0。
 // 流式已经写了响应头的，在 send 里写完了，这里只记错误码。
-func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, body []byte) {
-	res, e, finish := g.send(ctx, w, c, body)
+func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, rq request) {
+	res, e, finish := g.send(ctx, w, c, rq)
 	c.outcome, c.evidence = outcome(c, res, e)
 	if finish {
 		g.finish(ctx, c, res, e)
@@ -148,19 +159,31 @@ func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, b
 
 // send 是预留之后、收尾之前的步骤，返回上游的结果，以及要不要收尾。客户端已经断开就不发；先建好上游请求，
 // 再落发送意图，落成了才发。发送意图没落成的不收尾：调用要么还是 RESERVED，要么库里其实已经提交成了 IN_FLIGHT，都交给回收。
-func (g *gateway) send(ctx context.Context, w http.ResponseWriter, c *call, body []byte) (*ledger.Response, *apiError, bool) {
+// 发出之后，只有确定没发出（notSent）才换上游（failover）；所有尝试共用一个期限，从第一次尝试开始算，
+// 不跟着客户端取消（有界结算）。发送意图只落一次。
+func (g *gateway) send(ctx context.Context, w http.ResponseWriter, c *call, rq request) (*ledger.Response, *apiError, bool) {
 	if ctx.Err() != nil {
 		return nil, errClientCanceled, true
 	}
-	req, e := g.upstreamRequest(c, body)
+	req, e := g.upstreamRequest(c, c.target, rq)
 	if e != nil {
 		return nil, e, true
 	}
 	if e := g.markSent(ctx, c); e != nil {
 		return nil, e, false
 	}
-	res, e := g.forward(ctx, w, c, req)
-	return res, e, true
+	upCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.Timeout(c.purpose))
+	defer cancel()
+	for {
+		res, e := g.forward(ctx, upCtx, w, c, req)
+		g.router.report(c, verdictOf(e))
+		if !notSent(e) {
+			return res, e, true
+		}
+		if req = g.failover(ctx, upCtx, c, rq); req == nil {
+			return res, e, true
+		}
+	}
 }
 
 // writeResponse 写回上游的 2xx 或它的快照：状态码、Content-Type 和正文，不转发上游的其它响应头。
@@ -172,53 +195,70 @@ func writeResponse(w http.ResponseWriter, c *call, resp *ledger.Response) {
 	_, _ = w.Write(resp.Body)
 }
 
-// prepare 读请求体、解析、检查模型、估算，带幂等键时校验键、算指纹，返回改写过 model 的请求体。
-func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) ([]byte, *apiError) {
+// request 是客户端的原始请求体和它的解析结果。发给哪个目标，就按那个目标的上游模型名从原始请求体改写一次（upstreamBody）：
+// 换上游时也一样，不在改写过的请求体上再改。
+type request struct {
+	parsed parsedRequest
+	body   []byte
+}
+
+func (rq request) bodyFor(t *config.Target) []byte {
+	return rq.parsed.upstreamBody(rq.body, t.UpstreamModel)
+}
+
+// prepare 读请求体、解析、检查模型，带幂等键时校验键、算指纹，选目标、估算。所有目标的上游都熔断着时快速失败
+// （502 upstream_unavailable），在准入和预留之前：不进账本、不调上游。
+func (g *gateway) prepare(w http.ResponseWriter, r *http.Request, c *call) (request, *apiError) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		switch {
 		case errors.As(err, &tooLarge):
-			return nil, errRequestTooLarge
+			return request{}, errRequestTooLarge
 		case r.Context().Err() != nil:
 			// 请求体没发完客户端就断开了：连接读出错时 net/http 会取消请求的 context。和写回之前断开一样，不写回。
 			// 连接还在、只是分块编码坏了的，context 没有取消，仍是 400。
-			return nil, errClientCanceled
+			return request{}, errClientCanceled
 		}
-		return nil, c.invalid(reasonUnreadableBody)
+		return request{}, c.invalid(reasonUnreadableBody)
 	}
 	// 服务器的 ReadTimeout 只管读请求：请求体读完、net/http 开始后台读（用来发现客户端断开）时，它自己清掉读期限，
 	// 等上游久的调用和长的流不受它限制（TestServerReadTimeoutSparesLongCalls 守着；以后升级 Go，这个测试会抓住变化）。
 	req, reason := parseRequest(body)
 	if reason != "" {
-		return nil, c.invalid(reason)
+		return request{}, c.invalid(reason)
 	}
 	c.alias = req.model
 	if c.purpose == config.Chat && req.stream {
 		if reason := req.checkStreamOptions(); reason != "" {
-			return nil, c.invalid(reason)
+			return request{}, c.invalid(reason)
 		}
 		c.stream, c.wantsUsage = true, req.wantsUsage
 	}
 	if c.model = g.cfg.Model(c.purpose, req.model); c.model == nil {
-		return nil, errModelNotFound
+		return request{}, errModelNotFound
 	}
 	if !c.key.Allows(req.model) {
-		return nil, errModelNotAllowed
+		return request{}, errModelNotAllowed
 	}
 	key, e := idempotencyKey(r.Header)
 	if e != nil {
-		return nil, e
+		return request{}, e
 	}
 	if key != "" {
 		// 指纹用客户端发来的原始请求体（改写 model 之前的）。
 		if c.fingerprint, err = fingerprint(c.purpose, body); err != nil {
-			return nil, c.invalid(reasonFingerprintFailed)
+			return request{}, c.invalid(reasonFingerprintFailed)
 		}
 	}
-	out := req.upstreamBody(body, c.model.UpstreamModel)
-	c.planned = plan(c, out, req.maxTokens)
-	return out, nil
+	if c.target, c.permit = g.router.pick(c.model.Targets, nil); c.target == nil {
+		c.circuitOpen = true
+		return request{}, errUpstreamUnavailable
+	}
+	rq := request{parsed: req, body: body}
+	// 估算按第一次选中的目标改写后的请求体算；换上游时预留量不变（差的只是上游模型名的几个字节）。
+	c.planned = plan(c, rq.bodyFor(c.target), req.maxTokens)
+	return rq, nil
 }
 
 // authenticate 按 Bearer 后面的 Key 的哈希查库。每个请求都查，吊销立即生效。

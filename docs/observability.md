@@ -25,7 +25,8 @@ POST /v1/chat/completions      SERVER  整个请求，起点是请求进来的�
 ├── admit                      INTERNAL  Redis 准入（有限流桶时）
 ├── reserve                    INTERNAL  账本预留（带幂等键时可能直接给出重放）
 ├── mark_sent                  INTERNAL  落发送意图
-├── upstream                   CLIENT    发请求到读完正文（流式：整个流，含写给客户端的时间）
+├── upstream                   CLIENT    发请求到读完正文（流式：整个流，含写给客户端的时间）；每次尝试一个
+├── (admit, reroute, upstream) 换上游时：新上游的准入、账本改道、发给新上游（见下面的“多个上游和熔断”）
 ├── finish                     INTERNAL  账本收尾
 └── adjust                     INTERNAL  修正 TPM 桶（有 TPM 桶时）
 
@@ -38,7 +39,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | span | 属性 |
 |---|---|
-| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型之后才有）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有） |
+| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游，字符串数组）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有） |
 | `upstream` | `qf.upstream`、`http.request.method`、`http.response.status_code`（上游的） |
 | 出错的子 span | `error.type` |
 
@@ -71,6 +72,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 - 从 trace 找日志：根 span 的 `qf.request_id` 就是日志的 `request_id`；或者按 `trace_id` 搜日志。
 - 400 `invalid_request` 的调用行有 `invalid_reason`，取值固定：`unreadable_body`、`not_object`、`malformed_json`、`trailing_data`、`ambiguous_field`、`model_not_string`、`model_missing`、`stream_not_boolean`、`max_tokens_invalid`、`fingerprint_failed`、`stream_options_invalid`（流式请求的 `stream_options` 不是对象或 null，或者 `include_usage` 不是布尔值或 null）。不写 `encoding/json` 的错误原文：它会带上请求体里的字符。
 - 请求体没发完客户端就断开时，和写回之前断开一样：日志没有 `status`，有 `client_disconnected: true`，错误码 `client_canceled`。请求体超过读整个请求的上限（30 秒，见[运行](operations.md#配置文件)）还没发完的，连接已被服务器断开，也这样记。
+- 调用行的 `upstream` 是这次调用最后发给的上游。换过上游的有 `failover_from`：之前试过、拨号失败（确定没收到请求）的上游，按顺序的数组。所有目标的上游都熔断着、快速失败的有 `circuit_open: true`（这种请求没有预留，没有 `upstream`、`reserved_tokens`、`outcome`）。
 - 流式的调用行有 `stream: true`、`first_event_ms`。流开始之后中途断开的，`status` 是已经写出的 200，加上 `client_disconnected: true`；客户端不读、写超过期限的另有 `write_timeout: true`。流截断时 `error_code` 是补给客户端的错误事件里的那个（`upstream_timeout`、`upstream_error`、`upstream_invalid_response`），流里的内容一律不记。
 
 ## 指标
@@ -82,8 +84,11 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_requests_total` | counter | `endpoint`（chat、embeddings、calls）、`status`、`code` | 每个请求一次，401 也算。`status` 是写回的 HTTP 状态，客户端已断开、没写回时是 `0`；`code` 是错误码，成功时为空 |
 | `qf_request_duration_seconds` | histogram | `endpoint` | 总耗时 |
 | `qf_overhead_seconds` | histogram | `endpoint` | QF 自身耗时 = 总耗时 − 等上游的时间（没调上游的就是总耗时）。0.25 秒是一个桶边界，延迟 SLO 按它算 |
-| `qf_upstream_requests_total` | counter | `upstream`、`endpoint`、`result` | 调过上游的调用；`result` 是 `ok` 或上游这一步的错误码（`upstream_*`） |
-| `qf_upstream_duration_seconds` | histogram | `upstream`、`endpoint` | 发请求到读完正文（流式：整个流） |
+| `qf_upstream_requests_total` | counter | `upstream`、`endpoint`、`result` | 对上游的每次尝试（换过上游的调用计两次以上）；`result` 是 `ok` 或这次尝试的错误码（`upstream_*`，连不上是 `upstream_unavailable`） |
+| `qf_upstream_duration_seconds` | histogram | `upstream`、`endpoint` | 每次尝试从发请求到读完正文（流式：整个流） |
+| `qf_upstream_circuit_state` | gauge | `upstream` | 这个实例里上游的熔断状态：0 关、1 半开（探测在飞）、2 开。启动时每个配置的上游都是 0 |
+| `qf_upstream_failovers_total` | counter | `endpoint`、`upstream` | 换上游的次数；`upstream` 是换走的那个（拨号失败、确定没收到请求） |
+| `qf_upstream_circuit_rejections_total` | counter | `endpoint` | 所有目标的上游都熔断着、快速失败的请求（502 `upstream_unavailable`） |
 | `qf_calls_total` | counter | `endpoint`、`outcome` | 预留过的调用按网关的判定：`settled`、`cancelled`、`usage_unknown` |
 | `qf_usage_tokens_total` | counter | `endpoint`、`upstream`、`type`（prompt、completion、total） | 只计结算的调用；用量未知的不计成 0，数在 `qf_calls_total{outcome="usage_unknown"}` 里 |
 | `qf_streams_total` | counter | `result`（`ok`、`upstream_error`、`upstream_timeout`、`upstream_invalid_response`）、`client`（`connected`、`disconnected`、`write_timeout`） | 上游回了 2xx 的流式调用，按流怎么结束、客户端有没有读完 |
@@ -142,12 +147,25 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `QFBackgroundStalled` | 某个实例的后台循环约 10 轮没有成功：`time() − 最近一次成功 > 10 × 间隔`（默认约 90 秒） | 1 分钟 | warning |
 | `QFUnknownUsageUnreconciled` | 有未知用量的调用超过一天没对账（对账要人按上游的账单做：`qfctl unknown`、`qfctl reconcile`） | 10 分钟 | warning |
 | `QFDependencyUnavailable` | 账本或 Redis 持续出错（没有请求时不会出错，也就不告警：没有用户受影响） | 5 分钟 | critical |
+| `QFUpstreamCircuitOpen` | 某个实例里某个上游的熔断 5 分钟里一直没关上：`min_over_time(qf_upstream_circuit_state[5m]) >= 1`（一直开着，或者开和半开交替、探测一直失败） | — | warning |
+
+- `QFUpstreamCircuitOpen` 用 `min_over_time` 而不是 `for`：半开的探测会让状态短暂离开“开”，`for` 会被它打断、重新计时。**没有请求时熔断不会去探测**：上游已经恢复、却没有流量的话，熔断一直开着、告警也一直在；发一个请求就会触发探测，探测成功就关上，5 分钟后告警解除。
 
 每条告警都有触发和不触发的测试情形，数值贴着阈值的两边。跑法（在项目根目录下运行）。两处是给 Windows 的 Git Bash 的，Linux 下没有影响：挂载用相对路径 `./deploy/prometheus`，由 docker 命令按自己的当前目录解析，不用 `$PWD`（Git Bash 里它可能是 `/tmp/...` 这种映射出来的路径，Docker Desktop 会挂上一个空目录）；`MSYS_NO_PATHCONV=1` 不让 Git Bash 把容器里的路径 `/etc/prometheus/...` 改写成 Git 的安装目录。
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v ./deploy/prometheus:/etc/prometheus:ro --entrypoint promtool prom/prometheus:v3.15.0 test rules /etc/prometheus/rules_test.yml
 ```
+
+## 多个上游和熔断
+
+别名有多个目标、拨号失败时换上游、按上游熔断（见[多个上游](operations.md#多个上游)）时：
+
+- **span**：每次尝试一个 `upstream` span，带这次的 `qf.upstream`；连不上的那次标成 Error、`error.type` 是 `upstream_unavailable`。换上游时两次尝试之间还有新上游的 `admit`（新上游有限流桶时）和账本改道的 `reroute`。根 span 的 `qf.upstream` 是最后那个，`qf.failover_from` 是换走的。正常路径（没换）仍是一个 `upstream`。快速失败（全部熔断）的调用没有 `reserve` 和 `upstream`。
+- **日志**：`upstream` 是最后那个；`failover_from`、`circuit_open` 见上面的[日志关联](#日志关联)。
+- **指标**：`qf_upstream_requests_total` 每次尝试计一次；`qf_upstream_circuit_state` 按实例和上游看熔断；`qf_upstream_failovers_total`、`qf_upstream_circuit_rejections_total`。标签只取配置里的上游名和两个接口名，配置定了就不会再多。
+- **SLO**：快速失败的错误码是 `upstream_unavailable`，和连不上上游一样，不进 QF 的可用性。
+- 熔断每个实例各记各的，两个实例的 `qf_upstream_circuit_state` 可以短时间不同（见[两个实例](scaling.md#两个实例)）。
 
 ## 演示环境
 

@@ -99,9 +99,9 @@ func gatewayConfig(t *testing.T) (string, *config.Config, string, *fakeupstream.
 	t.Cleanup(up.Close)
 	path := filepath.Join(t.TempDir(), "config.json")
 	data := fmt.Sprintf(`{"timeouts":{"chat_ms":10000},"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
-		"models":[{"alias":"step","purpose":"chat","upstream":"fake","upstream_model":"fake-stream-step","default_max_tokens":16},
-			{"alias":"slow","purpose":"chat","upstream":"fake","upstream_model":"fake-slow-600","default_max_tokens":16},
-			{"alias":"flow","purpose":"chat","upstream":"fake","upstream_model":"fake-stream-slow-100","default_max_tokens":16}],
+		"models":[{"alias":"step","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-stream-step","weight":1}],"default_max_tokens":16},
+			{"alias":"slow","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-slow-600","weight":1}],"default_max_tokens":16},
+			{"alias":"flow","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-stream-slow-100","weight":1}],"default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)

@@ -39,6 +39,7 @@ var (
 	attrTotalTokens    = attribute.Key("qf.usage.total_tokens")
 	attrDisconnected   = attribute.Key("qf.client_disconnected")
 	attrRateLimitedBy  = attribute.Key("qf.rate_limited_by")
+	attrFailoverFrom   = attribute.Key("qf.failover_from")
 	attrStream         = attribute.Key("qf.stream")
 	attrFirstEventMS   = attribute.Key("qf.stream.first_event_ms")
 	attrWriteTimeout   = attribute.Key("qf.stream.write_timeout")
@@ -110,14 +111,8 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 	if c.deniedBy != nil {
 		m.RateLimited.WithLabelValues(c.deniedBy.Layer, c.deniedBy.Metric).Inc()
 	}
-	if c.upstreamCalled {
-		up := c.model.Upstream.Name
-		result := c.errorCode // 调过上游之后，错误码只会来自上游这一步
-		if result == "" {
-			result = "ok"
-		}
-		m.UpstreamRequests.WithLabelValues(up, endpoint, result).Inc()
-		m.UpstreamDuration.WithLabelValues(up, endpoint).Observe(c.upstreamDuration.Seconds())
+	if c.circuitOpen {
+		m.CircuitRejections.WithLabelValues(endpoint).Inc()
 	}
 	if c.reservation != nil {
 		m.Calls.WithLabelValues(endpoint, strings.ToLower(string(c.outcome))).Inc()
@@ -129,7 +124,7 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 		m.StreamFirstEvent.WithLabelValues(endpoint).Observe(c.firstEvent.Seconds())
 	}
 	if c.outcome == ledger.Settled { // 结算的一定有用量；未知用量的不计成 0，数在 qf_calls_total 里
-		up := c.model.Upstream.Name
+		up := c.target.Upstream.Name
 		m.UsageTokens.WithLabelValues(endpoint, up, "prompt").Add(float64(c.usage.Prompt))
 		if c.usage.HasCompletion {
 			m.UsageTokens.WithLabelValues(endpoint, up, "completion").Add(float64(c.usage.Completion))
@@ -181,7 +176,13 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(c.errorCode))
 	}
 	if c.model != nil {
-		attrs = append(attrs, attrModelAlias.String(c.model.Alias), attrUpstream.String(c.model.Upstream.Name))
+		attrs = append(attrs, attrModelAlias.String(c.model.Alias))
+	}
+	if c.target != nil {
+		attrs = append(attrs, attrUpstream.String(c.target.Upstream.Name))
+	}
+	if len(c.failoverFrom) > 0 {
+		attrs = append(attrs, attrFailoverFrom.StringSlice(c.failoverFrom))
 	}
 	if c.reservation != nil {
 		attrs = append(attrs, attrCallStatus.String(string(c.callStatus)), attrOutcome.String(string(c.outcome)),

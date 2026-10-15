@@ -47,8 +47,8 @@ func plan(c *call, body []byte, maxTokens *int64) ledger.Reservation {
 		KeyID:           c.key.ID,
 		Purpose:         string(c.purpose),
 		Alias:           c.alias,
-		Upstream:        c.model.Upstream.Name,
-		UpstreamModel:   c.model.UpstreamModel,
+		Upstream:        c.target.Upstream.Name,
+		UpstreamModel:   c.target.UpstreamModel,
 		EstInput:        input,
 		EstOutput:       output,
 		ClientRequestID: checked(c.clientRequestID),
@@ -106,6 +106,22 @@ func (g *gateway) markSent(ctx context.Context, c *call) (e *apiError) {
 	return nil
 }
 
+// reroute 换上游时在账本里改道（条件更新，见 ledger.Store.Reroute），改成了才能发给新的上游。账本操作的上限从所有尝试共用的
+// 期限派生。没改成（被回收了、账本出错）返回 false：不发，调用照上一次尝试的结果收尾。
+func (g *gateway) reroute(ctx, upCtx context.Context, c *call, t *config.Target) bool {
+	span := g.step(ctx, "reroute")
+	lctx, cancel := context.WithTimeout(upCtx, config.LedgerTimeout)
+	defer cancel()
+	if err := g.ledger.Reroute(lctx, c.planned, t.Upstream.Name, t.UpstreamModel); err != nil {
+		g.ledgerFailed(c, "reroute", err)
+		endStep(span, errLedgerUnavailable)
+		return false
+	}
+	endStep(span, nil)
+	c.planned.Upstream, c.planned.UpstreamModel = t.Upstream.Name, t.UpstreamModel
+	return true
+}
+
 // finish 在账本里收尾。失败时不改已经拿到的上游结果：调用留在原来的状态，由回收接手，原因记进日志。
 // 非流式拿到 2xx 时把响应交给账本：带幂等键的调用存成快照。流式不存快照，结算了的只交一个标记。
 func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *apiError) {
@@ -142,6 +158,10 @@ func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *
 	c.callStatus = result.Status
 }
 
+// notSent 报告上游的这次尝试确定没收到请求：连接没建立（拨号失败，见 transportError）。outcome 判“确定没发出”、
+// send 判能不能换上游，都用这一条：换走了，前一个上游就一定算没收到；一个调用号最多到达一个可能计费的上游。
+func notSent(e *apiError) bool { return e == errUpstreamUnavailable }
+
 // outcome 是网关自己对一次调用结局的判定，和账本写没写成功无关；docs/ledger.md 的“上游结果怎么收尾”就是这张表。
 //   - 确定没发出（发出前失败、发送意图没落成、连接没建立）：释放，凭 NotSent；
 //   - 上游明确拒绝（4xx）：释放，凭上游的回答；
@@ -150,7 +170,7 @@ func (g *gateway) finish(ctx context.Context, c *call, res *ledger.Response, e *
 //     3xx 不保证请求没执行（例如 303 就是“处理完了，去别处取结果”），所以不当成拒绝。
 func outcome(c *call, res *ledger.Response, e *apiError) (ledger.Status, ledger.Evidence) {
 	switch {
-	case !c.upstreamCalled || e == errUpstreamUnavailable:
+	case !c.upstreamCalled || notSent(e):
 		return ledger.Cancelled, ledger.NotSent
 	case c.upstreamStatus >= 400 && c.upstreamStatus < 500:
 		return ledger.Cancelled, ledger.Answered

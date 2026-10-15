@@ -109,6 +109,9 @@ jobs:
       # 流式：逐个到达、usage 事件、中途断开照常结算、上游断开和超时记未知、带键不重放
       - name: Streaming
         run: scripts/compose-stream.sh
+      # 多个上游：按权重分流、拨号失败时换上游、按上游熔断和恢复、可能已经发出的不换（两个假上游）
+      - name: Multiple upstreams
+        run: scripts/compose-failover.sh
       # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
       # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
       - name: Check out QueryShield at the pinned commit
@@ -132,5 +135,6 @@ jobs:
             evidence/compose-two-instances-summary.txt
             evidence/compose-observability-summary.txt
             evidence/compose-stream-summary.txt
+            evidence/compose-failover-summary.txt
             evidence/compose-qs-e2e-summary.txt
           if-no-files-found: warn

@@ -30,7 +30,8 @@ const (
 )
 
 // transitions 是允许的状态转换：谁、从哪个状态、到哪些状态。其余一律不允许，SETTLED、CANCELLED 是终态。
-// RESERVED → IN_FLIGHT（发送意图）只有 MarkSent 一条路，不经过这里。
+// RESERVED → IN_FLIGHT（发送意图）只有 MarkSent 一条路，不经过这里。网关换上游时的改道（Reroute）只在 IN_FLIGHT 上
+// 改上游两列、状态不变，也不经过这里；Verify 不读这两列。
 var transitions = map[Actor]map[Status][]Status{
 	Gateway:   {Reserved: {Cancelled}, InFlight: {Settled, Cancelled, UsageUnknown}, UsageUnknown: {Settled, Cancelled}},
 	Reclaim:   {Reserved: {Cancelled}, InFlight: {UsageUnknown}},

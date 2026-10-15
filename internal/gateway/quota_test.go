@@ -24,11 +24,13 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
 
-// allowAll 是只放行的账本替身：认 clientKey 和 limitedKey，预留和收尾一律成功，记下收到的预留。
-// 它不判断额度、不记余额，额度的规则只在 MySQL 里有一份，由下面用真库的测试检查。
+// allowAll 是只放行的账本替身：认 clientKey 和 limitedKey，预留、发送意图、改道和收尾一律成功，记下收到的预留、
+// 发送意图的次数和改道。它不判断额度、不记余额，额度的规则只在 MySQL 里有一份，由下面用真库的测试检查。
 type allowAll struct {
 	mu       sync.Mutex
 	reserved []ledger.Reservation
+	sent     int
+	reroutes []string // 每次改道一项：“旧上游/旧模型 -> 新上游/新模型”
 }
 
 func newAllowAll() *allowAll { return &allowAll{} }
@@ -50,7 +52,19 @@ func (a *allowAll) Reserve(_ context.Context, r ledger.Reservation) (*ledger.Rep
 	return nil, nil
 }
 
-func (a *allowAll) MarkSent(context.Context, ledger.Reservation) error { return nil }
+func (a *allowAll) MarkSent(context.Context, ledger.Reservation) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sent++
+	return nil
+}
+
+func (a *allowAll) Reroute(_ context.Context, r ledger.Reservation, upstream, upstreamModel string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reroutes = append(a.reroutes, r.Upstream+"/"+r.UpstreamModel+" -> "+upstream+"/"+upstreamModel)
+	return nil
+}
 
 func (a *allowAll) Finish(context.Context, ledger.Reservation, ledger.Result) error { return nil }
 
@@ -927,7 +941,7 @@ func testConfig(t *testing.T, chatMS, embeddingsMS int64) *config.Config {
 	t.Helper()
 	data := fmt.Sprintf(`{"timeouts":{"chat_ms":%d,"embeddings_ms":%d},
 		"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
-		"models":[{"alias":"m","purpose":"embeddings","upstream":"u","upstream_model":"m"}],
+		"models":[{"alias":"m","purpose":"embeddings","targets":[{"upstream":"u","upstream_model":"m","weight":1}]}],
 		"database":{"dsn_env":"K"},"redis":{"url_env":"K"}}`, chatMS, embeddingsMS)
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {

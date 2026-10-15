@@ -92,7 +92,7 @@ func TestKillWhileUpstreamHasTheRequest(t *testing.T) {
 	t.Cleanup(up.Close)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	cfgJSON := fmt.Sprintf(`{"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
-		"models":[{"alias":"billed","purpose":"chat","upstream":"fake","upstream_model":"fake-billed-hang","default_max_tokens":16}],
+		"models":[{"alias":"billed","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-billed-hang","weight":1}],"default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
 		t.Fatal(err)

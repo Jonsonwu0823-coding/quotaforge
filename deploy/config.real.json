@@ -9,8 +9,8 @@
     }
   ],
   "models": [
-    {"alias": "qwen-plus", "purpose": "chat", "upstream": "bailian", "upstream_model": "qwen-plus", "default_max_tokens": 32768},
-    {"alias": "text-embedding-v4", "purpose": "embeddings", "upstream": "bailian", "upstream_model": "text-embedding-v4"}
+    {"alias": "qwen-plus", "purpose": "chat", "targets": [{"upstream": "bailian", "upstream_model": "qwen-plus", "weight": 1}], "default_max_tokens": 32768},
+    {"alias": "text-embedding-v4", "purpose": "embeddings", "targets": [{"upstream": "bailian", "upstream_model": "text-embedding-v4", "weight": 1}]}
   ],
   "database": {"dsn_file": "/run/secrets/app_dsn"},
   "redis": {"url_env": "QF_REDIS_URL"}

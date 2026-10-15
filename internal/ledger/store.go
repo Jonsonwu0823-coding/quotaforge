@@ -5,7 +5,7 @@
 //
 // 锁的顺序：每个改动额度的事务都先锁这个账户的额度行（budgets），再按主键动 calls 和 ledger。
 // 顺序统一，并发的预留、收尾、回收和对账就不会互相等成死锁；同一账户的事务在额度行上排队。
-// 发送意图（MarkSent）是唯一不锁额度行的写：它只锁调用这一行，持锁时不等别的锁，构不成等待环。
+// 发送意图（MarkSent）和改道（Reroute）是不锁额度行的两个写：它们只锁调用这一行，持锁时不等别的锁，构不成等待环。
 package ledger
 
 import (
@@ -249,6 +249,31 @@ func (s *Store) MarkSent(ctx context.Context, r Reservation) error {
 	}
 	if n == 0 {
 		return ErrNotReserved
+	}
+	return nil
+}
+
+// ErrNotInFlight 是改道没改成：调用已经不是 IN_FLIGHT（超过上界，被回收标成了未知），或者上游已经不是 r 里的那个。
+// 这时不能把请求发给新的上游。
+var ErrNotInFlight = errors.New("call is no longer IN_FLIGHT on the expected upstream: it was not rerouted")
+
+// Reroute 是网关换上游时的改道：调用还是 IN_FLIGHT、上游和上游模型名还是 r 里的时，改成新的。状态不变，额度和账本行不动。
+// 只在前一个上游确定没收到请求（拨号失败）之后、发给新上游之前调用；提交之后才发。和 MarkSent 一样是一条自动提交的
+// 条件更新，只锁这一行；回收先把调用标成未知的话影响 0 行，返回 ErrNotInFlight。
+// 改道之后、发出之前进程死了：回收把它标成未知，上游是新的那个（偏保守：新上游其实没收到）。
+func (s *Store) Reroute(ctx context.Context, r Reservation, upstream, upstreamModel string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE calls SET upstream = ?, upstream_model = ?
+		WHERE id = ? AND status = 'IN_FLIGHT' AND upstream = ? AND upstream_model = ?`,
+		upstream, upstreamModel, r.CallID, r.Upstream, r.UpstreamModel)
+	if err != nil {
+		return fmt.Errorf("reroute: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reroute: %w", err)
+	}
+	if n == 0 {
+		return ErrNotInFlight
 	}
 	return nil
 }

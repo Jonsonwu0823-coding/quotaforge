@@ -748,3 +748,118 @@ func explainKey(t *testing.T, db *sql.DB, query string) string {
 	}
 	return key
 }
+
+// upstreamOf 是调用在库里的上游和上游模型名。
+func (f *fixture) upstreamOf(t *testing.T, id string) [2]string {
+	t.Helper()
+	var u [2]string
+	if err := f.admin.QueryRow("SELECT upstream, upstream_model FROM calls WHERE id = ?", id).Scan(&u[0], &u[1]); err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// 改道只在 IN_FLIGHT、上游还是预留里那个时改上游两列；状态、额度、账本行都不动。别的状态、上游对不上，都是 ErrNotInFlight，什么都不改。
+func TestReroute(t *testing.T) {
+	f := newFixture(t, 1000)
+	r := f.reserve(t, 10)
+	if err := f.s.Reroute(ctx, r, "u2", "um2"); !errors.Is(err, ledger.ErrNotInFlight) { // 还没落发送意图
+		t.Fatalf("reroute on RESERVED = %v", err)
+	}
+	f.sent(t, r)
+	before := f.state(t, r.CallID)
+	_, reserved, _ := f.budget(t)
+	stale := r
+	stale.Upstream = "other"
+	if err := f.s.Reroute(ctx, stale, "u2", "um2"); !errors.Is(err, ledger.ErrNotInFlight) {
+		t.Fatalf("reroute from a different upstream = %v", err)
+	}
+	stale = r
+	stale.UpstreamModel = "other"
+	if err := f.s.Reroute(ctx, stale, "u2", "um2"); !errors.Is(err, ledger.ErrNotInFlight) {
+		t.Fatalf("reroute from a different upstream model = %v", err)
+	}
+	if got := f.upstreamOf(t, r.CallID); got != [2]string{"u", "um"} {
+		t.Fatalf("upstream after refused reroutes = %v", got)
+	}
+	if err := f.s.Reroute(ctx, r, "u2", "um2"); err != nil {
+		t.Fatal(err)
+	}
+	after := f.state(t, r.CallID)
+	if got := f.upstreamOf(t, r.CallID); got != [2]string{"u2", "um2"} {
+		t.Fatalf("upstream = %v", got)
+	}
+	if _, res, _ := f.budget(t); res != reserved || !slices.Equal(after.kinds, before.kinds) || after.status != "IN_FLIGHT" || !after.sent {
+		t.Fatalf("reroute changed more than the upstream: %+v → %+v, reserved %d → %d", before, after, reserved, res)
+	}
+	// 改过一次之后，旧的上游已经对不上
+	if err := f.s.Reroute(ctx, r, "u3", "um3"); !errors.Is(err, ledger.ErrNotInFlight) {
+		t.Fatalf("reroute from the old upstream again = %v", err)
+	}
+
+	// 结清的、未知的都不能改道
+	for _, status := range []ledger.Status{ledger.Settled, ledger.Cancelled, ledger.UsageUnknown} {
+		r := f.reserve(t, 10)
+		f.sent(t, r)
+		res := ledger.Result{Status: status, Evidence: ledger.Answered, HTTPStatus: 200}
+		if status == ledger.Settled {
+			res.Usage = &ledger.Usage{Prompt: 1, Completion: 1, HasCompletion: true, Total: 2}
+		}
+		if status == ledger.UsageUnknown {
+			res.Evidence = ""
+		}
+		if err := f.s.Finish(ctx, r, res); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.s.Reroute(ctx, r, "u2", "um2"); !errors.Is(err, ledger.ErrNotInFlight) {
+			t.Fatalf("reroute on %s = %v", status, err)
+		}
+		if got := f.upstreamOf(t, r.CallID); got != [2]string{"u", "um"} {
+			t.Fatalf("%s: upstream = %v", status, got)
+		}
+	}
+	dbtest.Verify(t, f.s)
+}
+
+// 改道和回收同时碰到同一个超过上界的 IN_FLIGHT：谁先拿到调用行都只有一个结果。
+// 改道先提交 ⇔ 回收把它标成未知、上游是新的；回收先 ⇔ 改道 ErrNotInFlight、上游还是旧的（网关不发）。
+func TestRerouteAndReclaim(t *testing.T) {
+	for round := range 3 {
+		f := newFixture(t, 1000)
+		r := f.reserve(t, 10)
+		f.sent(t, r)
+		f.age(t, r, reclaimAfter+time.Second)
+		holder, err := f.admin.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := holder.Exec("SELECT 1 FROM calls WHERE id = ? FOR UPDATE", r.CallID); err != nil {
+			t.Fatal(err)
+		}
+		reclaimErr, rerouteErr := make(chan error, 1), make(chan error, 1)
+		go func() {
+			_, err := f.s.Reclaim(ctx, reclaimAfter, 10*time.Second)
+			reclaimErr <- err
+		}()
+		go func() { rerouteErr <- f.s.Reroute(ctx, r, "u2", "um2") }()
+		waitBlocked(t, "SELECT status, purpose, reserved_tokens%FOR UPDATE", 1)
+		waitBlocked(t, "UPDATE calls SET upstream = %", 1)
+		_ = holder.Rollback()
+		if err := <-reclaimErr; err != nil {
+			t.Fatal(err)
+		}
+		err = <-rerouteErr
+		c, up := f.state(t, r.CallID), f.upstreamOf(t, r.CallID)
+		if c.status != "USAGE_UNKNOWN" || c.errorCode != "reclaimed_in_flight" || len(c.kinds) != 1 {
+			t.Fatalf("round %d: call %+v", round, c)
+		}
+		switch {
+		case err == nil && up == [2]string{"u2", "um2"}:
+		case errors.Is(err, ledger.ErrNotInFlight) && up == [2]string{"u", "um"}:
+		default:
+			t.Fatalf("round %d: Reroute %v, upstream %v", round, err, up)
+		}
+		t.Logf("round %d: Reroute %v → upstream %v", round, err, up)
+		dbtest.Verify(t, f.s)
+	}
+}

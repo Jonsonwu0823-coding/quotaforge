@@ -32,6 +32,10 @@ type Metrics struct {
 	Streams          *prometheus.CounterVec   // result, client
 	StreamFirstEvent *prometheus.HistogramVec // endpoint
 
+	CircuitState      *prometheus.GaugeVec   // upstream
+	Failovers         *prometheus.CounterVec // endpoint, upstream
+	CircuitRejections *prometheus.CounterVec // endpoint
+
 	Reclaimed             *prometheus.CounterVec // result
 	Purged                prometheus.Counter
 	BackgroundErrors      *prometheus.CounterVec // task
@@ -52,28 +56,13 @@ var overheadBuckets = []float64{.001, .0025, .005, .01, .025, .05, .1, OverheadS
 // NewMetrics 建好全部指标。dbStats 是账本连接池的统计（ledger.Store.Stats），每次抓取时读。
 func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 	m := &Metrics{reg: prometheus.NewRegistry()}
-	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
-		v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
-		m.reg.MustRegister(v)
-		return v
-	}
-	histogram := func(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
-		v := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
-		m.reg.MustRegister(v)
-		return v
-	}
-	gauge := func(name, help string) prometheus.Gauge {
-		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
-		m.reg.MustRegister(g)
-		return g
-	}
-
+	counter, histogram, gauge := m.counter, m.histogram, m.gauge
 	m.Requests = counter("qf_requests_total", "Requests by endpoint, HTTP status written (0: the client was gone) and error code.",
 		"endpoint", "status", "code")
 	m.RequestDuration = histogram("qf_request_duration_seconds", "Total time of a request.", slowBuckets, "endpoint")
 	m.Overhead = histogram("qf_overhead_seconds", "Time of a request spent in QF itself: the total minus the wait for the upstream.",
 		overheadBuckets, "endpoint")
-	m.UpstreamRequests = counter("qf_upstream_requests_total", "Upstream calls by result: ok or the upstream error code.",
+	m.UpstreamRequests = counter("qf_upstream_requests_total", "Upstream attempts by result: ok or the upstream error code; a call that moved to another upstream counts once per attempt.",
 		"upstream", "endpoint", "result")
 	m.UpstreamDuration = histogram("qf_upstream_duration_seconds", "Time from sending an upstream request to reading its whole body.",
 		slowBuckets, "upstream", "endpoint")
@@ -89,6 +78,13 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 	m.StreamFirstEvent = histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
 		slowBuckets, "endpoint")
 
+	m.CircuitState = m.gaugeVec("qf_upstream_circuit_state", "Circuit breaker state of an upstream in this instance: 0 closed, 1 half-open (a probe is in flight), 2 open.",
+		"upstream")
+	m.Failovers = counter("qf_upstream_failovers_total", "Calls moved to another target after the upstream could not be connected (the request was not sent to it).",
+		"endpoint", "upstream")
+	m.CircuitRejections = counter("qf_upstream_circuit_rejections_total", "Requests failed fast because the circuits of all their targets were open.",
+		"endpoint")
+
 	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
 	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()
 	m.BackgroundErrors = counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge or unknown_scan.", "task")
@@ -102,6 +98,31 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 	m.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m.registerDBStats(dbStats)
 	return m
+}
+
+// counter、histogram、gaugeVec、gauge 建一个指标并注册。
+func (m *Metrics) counter(name, help string, labels ...string) *prometheus.CounterVec {
+	v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
+	m.reg.MustRegister(v)
+	return v
+}
+
+func (m *Metrics) histogram(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
+	v := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
+	m.reg.MustRegister(v)
+	return v
+}
+
+func (m *Metrics) gaugeVec(name, help string, labels ...string) *prometheus.GaugeVec {
+	v := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
+	m.reg.MustRegister(v)
+	return v
+}
+
+func (m *Metrics) gauge(name, help string) prometheus.Gauge {
+	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
+	m.reg.MustRegister(g)
+	return g
 }
 
 // registerDBStats 导出账本连接池的统计。ledger.Store 不暴露 *sql.DB，所以不用 collectors.NewDBStatsCollector，

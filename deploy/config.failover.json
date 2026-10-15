@@ -1,0 +1,31 @@
+{
+  "timeouts": {
+    "chat_ms": 10000
+  },
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "cooldown_ms": 5000
+  },
+  "upstreams": [
+    {
+      "name": "fake-a",
+      "base_url": "http://qf-fake-upstream:8081/v1",
+      "api_key_env": "QF_FAKE_UPSTREAM_KEY",
+      "rpm": 6000,
+      "tpm": 100000000
+    },
+    {
+      "name": "fake-b",
+      "base_url": "http://qf-fake-upstream-b:8081/v1",
+      "api_key_env": "QF_FAKE_UPSTREAM_KEY",
+      "rpm": 6000,
+      "tpm": 100000000
+    }
+  ],
+  "models": [
+    {"alias": "split", "purpose": "chat", "targets": [{"upstream": "fake-a", "upstream_model": "fake-chat", "weight": 9}, {"upstream": "fake-b", "upstream_model": "fake-chat", "weight": 1}], "default_max_tokens": 64},
+    {"alias": "primary-b", "purpose": "chat", "targets": [{"upstream": "fake-b", "upstream_model": "fake-chat", "weight": 1}, {"upstream": "fake-a", "upstream_model": "fake-chat", "weight": 0}], "default_max_tokens": 64}
+  ],
+  "database": {"dsn_file": "/run/secrets/app_dsn"},
+  "redis": {"url_env": "QF_REDIS_URL"}
+}

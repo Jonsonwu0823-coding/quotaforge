@@ -295,8 +295,8 @@ func processConfig(t *testing.T) (cfgPath, key string, upstream *fakeupstream.Se
 	t.Cleanup(up.Close)
 	cfgPath = filepath.Join(t.TempDir(), "config.json")
 	cfgJSON := fmt.Sprintf(`{"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
-		"models":[{"alias":"m","purpose":"chat","upstream":"fake","upstream_model":"fake-chat","default_max_tokens":16},
-			{"alias":"hold","purpose":"chat","upstream":"fake","upstream_model":"fake-hold","default_max_tokens":16}],
+		"models":[{"alias":"m","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-chat","weight":1}],"default_max_tokens":16},
+			{"alias":"hold","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-hold","weight":1}],"default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
 		t.Fatal(err)

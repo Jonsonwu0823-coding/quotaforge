@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -39,6 +40,11 @@ const (
 	reclaimMargin = 5 * time.Second
 	// 名字会写进账本的 VARCHAR(255) 列。
 	maxNameLen = 255
+	// 熔断的默认值：连续失败几次打开，打开后多久放一个探测请求。
+	defaultBreakerFailures = 5
+	defaultBreakerCooldown = 30 * time.Second
+	// MaxWeight 是目标权重的上限：几个目标的权重加起来也远在 int 之内。
+	MaxWeight = 1000
 )
 
 type Upstream struct {
@@ -52,20 +58,36 @@ type Upstream struct {
 // URL 是这个上游在某个用途下的完整地址，例如 …/v1/chat/completions。
 func (u *Upstream) URL(p Purpose) string { return u.urls[p] }
 
-type Model struct {
-	Alias         string
-	Purpose       Purpose
+// Target 是别名的一个目标：发给哪个上游、换成哪个上游模型名、按多大的权重分流。
+// Weight 为 0 的是备用：平时不选，权重大于 0 的目标都用不了时才用。
+type Target struct {
 	Upstream      *Upstream
 	UpstreamModel string
+	Weight        int
+}
+
+type Model struct {
+	Alias   string
+	Purpose Purpose
+	// Targets 至少一个，至少一个权重大于 0；同一个别名里（上游，上游模型名）不重复。顺序就是配置里的顺序。
+	Targets []Target
 	// DefaultMaxTokens 是请求没写 max_tokens 时估算输出用的上限；只有 chat 模型有，embeddings 为 0。
 	DefaultMaxTokens int64
 }
 
+// Breaker 是熔断的参数，所有上游共用一份：连续 Failures 次失败就打开，打开 Cooldown 之后放一个探测请求。
+type Breaker struct {
+	Failures int
+	Cooldown time.Duration
+}
+
 type Config struct {
-	timeouts map[Purpose]time.Duration
-	models   map[modelKey]*Model
-	dsn      string
-	redisURL string
+	timeouts  map[Purpose]time.Duration
+	upstreams []*Upstream
+	models    map[modelKey]*Model
+	breaker   Breaker
+	dsn       string
+	redisURL  string
 }
 
 type modelKey struct {
@@ -75,6 +97,12 @@ type modelKey struct {
 
 // Model 按端点用途和别名查模型，没有就返回 nil。
 func (c *Config) Model(p Purpose, alias string) *Model { return c.models[modelKey{p, alias}] }
+
+// Upstreams 是配置里的全部上游，按配置的顺序。
+func (c *Config) Upstreams() []*Upstream { return c.upstreams }
+
+// Breaker 是熔断的参数。
+func (c *Config) Breaker() Breaker { return c.breaker }
 
 // DatabaseDSN 是账本数据库的连接串（go-sql-driver 的格式）。里面有密码，不能写进日志和报错。
 func (c *Config) DatabaseDSN() string { return c.dsn }
@@ -101,9 +129,13 @@ type fileConfig struct {
 		ChatMS       int64 `json:"chat_ms"`
 		EmbeddingsMS int64 `json:"embeddings_ms"`
 	} `json:"timeouts"`
-	Upstreams []fileUpstream `json:"upstreams"`
-	Models    []fileModel    `json:"models"`
-	Database  struct {
+	Upstreams      []fileUpstream `json:"upstreams"`
+	Models         []fileModel    `json:"models"`
+	CircuitBreaker struct {
+		FailureThreshold int64 `json:"failure_threshold"`
+		CooldownMS       int64 `json:"cooldown_ms"`
+	} `json:"circuit_breaker"`
+	Database struct {
 		DSNEnv  string `json:"dsn_env"`
 		DSNFile string `json:"dsn_file"`
 	} `json:"database"`
@@ -124,11 +156,16 @@ type fileUpstream struct {
 }
 
 type fileModel struct {
-	Alias            string  `json:"alias"`
-	Purpose          Purpose `json:"purpose"`
-	Upstream         string  `json:"upstream"`
-	UpstreamModel    string  `json:"upstream_model"`
-	DefaultMaxTokens int64   `json:"default_max_tokens"`
+	Alias            string       `json:"alias"`
+	Purpose          Purpose      `json:"purpose"`
+	Targets          []fileTarget `json:"targets"`
+	DefaultMaxTokens int64        `json:"default_max_tokens"`
+}
+
+type fileTarget struct {
+	Upstream      string `json:"upstream"`
+	UpstreamModel string `json:"upstream_model"`
+	Weight        int64  `json:"weight"`
 }
 
 // Load 读取 path 处的配置。上游的 Key、数据库连接串、Redis 地址和用 base_url_env 指定的地址从 getenv 或文件取。
@@ -157,11 +194,13 @@ func parse(data []byte, getenv func(string) string) (*Config, error) {
 	if c.timeouts, err = timeouts(f.Timeouts.ChatMS, f.Timeouts.EmbeddingsMS); err != nil {
 		return nil, err
 	}
-	upstreams, err := parseUpstreams(f.Upstreams, getenv)
-	if err != nil {
+	if c.upstreams, err = parseUpstreams(f.Upstreams, getenv); err != nil {
 		return nil, err
 	}
-	if c.models, err = parseModels(f.Models, upstreams); err != nil {
+	if c.models, err = parseModels(f.Models, c.upstreams); err != nil {
+		return nil, err
+	}
+	if c.breaker, err = breaker(f.CircuitBreaker.FailureThreshold, f.CircuitBreaker.CooldownMS); err != nil {
 		return nil, err
 	}
 	if c.dsn, err = Secret("dsn_env", "dsn_file", f.Database.DSNEnv, f.Database.DSNFile, getenv); err != nil {
@@ -173,17 +212,17 @@ func parse(data []byte, getenv func(string) string) (*Config, error) {
 	return c, nil
 }
 
-func parseUpstreams(list []fileUpstream, getenv func(string) string) (map[string]*Upstream, error) {
+func parseUpstreams(list []fileUpstream, getenv func(string) string) ([]*Upstream, error) {
 	if len(list) == 0 {
 		return nil, errors.New("upstreams: at least one is required")
 	}
-	upstreams := map[string]*Upstream{}
+	var upstreams []*Upstream
 	for i, u := range list {
 		if u.Name == "" || len(u.Name) > maxNameLen {
 			return nil, fmt.Errorf("upstreams[%d]: name is required, at most %d bytes", i, maxNameLen)
 		}
 		where := fmt.Sprintf("upstream %q", u.Name)
-		if upstreams[u.Name] != nil {
+		if slices.ContainsFunc(upstreams, func(o *Upstream) bool { return o.Name == u.Name }) {
 			return nil, fmt.Errorf("%s: duplicate name", where)
 		}
 		base, err := baseURL(u.BaseURL, u.BaseURLEnv, getenv)
@@ -197,17 +236,21 @@ func parseUpstreams(list []fileUpstream, getenv func(string) string) (map[string
 		if !ValidRate(u.RPM) || !ValidRate(u.TPM) {
 			return nil, fmt.Errorf("%s: rpm and tpm must be integers from 0 (no limit) to %d", where, int64(MaxRate))
 		}
-		upstreams[u.Name] = &Upstream{Name: u.Name, APIKey: key, RPM: u.RPM, TPM: u.TPM, urls: map[Purpose]string{
+		upstreams = append(upstreams, &Upstream{Name: u.Name, APIKey: key, RPM: u.RPM, TPM: u.TPM, urls: map[Purpose]string{
 			Chat:       base + "/chat/completions",
 			Embeddings: base + "/embeddings",
-		}}
+		}})
 	}
 	return upstreams, nil
 }
 
-func parseModels(list []fileModel, upstreams map[string]*Upstream) (map[modelKey]*Model, error) {
+func parseModels(list []fileModel, upstreams []*Upstream) (map[modelKey]*Model, error) {
 	if len(list) == 0 {
 		return nil, errors.New("models: at least one is required")
+	}
+	byName := map[string]*Upstream{}
+	for _, u := range upstreams {
+		byName[u.Name] = u
 	}
 	models := map[modelKey]*Model{}
 	for i, m := range list {
@@ -217,10 +260,6 @@ func parseModels(list []fileModel, upstreams map[string]*Upstream) (map[modelKey
 			return nil, fmt.Errorf("%s: alias is required, at most %d bytes", where, maxNameLen)
 		case m.Purpose != Chat && m.Purpose != Embeddings:
 			return nil, fmt.Errorf("%s: purpose must be %q or %q", where, Chat, Embeddings)
-		case upstreams[m.Upstream] == nil:
-			return nil, fmt.Errorf("%s: upstream %q is not defined", where, m.Upstream)
-		case m.UpstreamModel == "" || len(m.UpstreamModel) > maxNameLen:
-			return nil, fmt.Errorf("%s: upstream_model is required, at most %d bytes", where, maxNameLen)
 		case m.Purpose == Chat && m.DefaultMaxTokens <= 0:
 			return nil, fmt.Errorf("%s: default_max_tokens must be a positive integer for chat models", where)
 		case m.Purpose == Embeddings && m.DefaultMaxTokens != 0:
@@ -230,10 +269,57 @@ func parseModels(list []fileModel, upstreams map[string]*Upstream) (map[modelKey
 		if models[k] != nil {
 			return nil, fmt.Errorf("%s: alias %q is already defined for %s", where, m.Alias, m.Purpose)
 		}
-		models[k] = &Model{Alias: m.Alias, Purpose: m.Purpose, Upstream: upstreams[m.Upstream],
-			UpstreamModel: m.UpstreamModel, DefaultMaxTokens: m.DefaultMaxTokens}
+		targets, err := parseTargets(m.Targets, byName)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", where, err)
+		}
+		models[k] = &Model{Alias: m.Alias, Purpose: m.Purpose, Targets: targets, DefaultMaxTokens: m.DefaultMaxTokens}
 	}
 	return models, nil
+}
+
+// parseTargets 校验一个别名的目标：至少一个；上游必须存在；上游模型名必填；权重 0 到 MaxWeight、至少一个大于 0；
+// （上游，上游模型名）不重复。
+func parseTargets(list []fileTarget, upstreams map[string]*Upstream) ([]Target, error) {
+	if len(list) == 0 {
+		return nil, errors.New("targets: at least one is required")
+	}
+	var targets []Target
+	weighted := false
+	for i, t := range list {
+		where := fmt.Sprintf("targets[%d]", i)
+		switch {
+		case upstreams[t.Upstream] == nil:
+			return nil, fmt.Errorf("%s: upstream %q is not defined", where, t.Upstream)
+		case t.UpstreamModel == "" || len(t.UpstreamModel) > maxNameLen:
+			return nil, fmt.Errorf("%s: upstream_model is required, at most %d bytes", where, maxNameLen)
+		case t.Weight < 0 || t.Weight > MaxWeight:
+			return nil, fmt.Errorf("%s: weight must be an integer from 0 (standby) to %d", where, MaxWeight)
+		case slices.ContainsFunc(targets, func(o Target) bool { return o.Upstream.Name == t.Upstream && o.UpstreamModel == t.UpstreamModel }):
+			return nil, fmt.Errorf("%s: upstream %q with upstream_model %q is already a target", where, t.Upstream, t.UpstreamModel)
+		}
+		targets = append(targets, Target{Upstream: upstreams[t.Upstream], UpstreamModel: t.UpstreamModel, Weight: int(t.Weight)})
+		weighted = weighted || t.Weight > 0
+	}
+	if !weighted {
+		return nil, errors.New("targets: at least one weight must be greater than 0")
+	}
+	return targets, nil
+}
+
+// breaker 取熔断的参数：0（不写）取默认值，负数报错。
+func breaker(failures, cooldownMS int64) (Breaker, error) {
+	b := Breaker{Failures: defaultBreakerFailures, Cooldown: defaultBreakerCooldown}
+	switch {
+	case failures < 0 || cooldownMS < 0:
+		return Breaker{}, errors.New("circuit_breaker.failure_threshold and cooldown_ms must not be negative")
+	case failures > 0:
+		b.Failures = int(failures)
+	}
+	if cooldownMS > 0 {
+		b.Cooldown = time.Duration(cooldownMS) * time.Millisecond
+	}
+	return b, nil
 }
 
 func timeouts(chatMS, embeddingsMS int64) (map[Purpose]time.Duration, error) {

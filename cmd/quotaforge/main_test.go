@@ -208,7 +208,7 @@ func ledgerConfig(t *testing.T, dsn string) *config.Config {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")
 	data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
-		"models":[{"alias":"m","purpose":"chat","upstream":"u","upstream_model":"m","default_max_tokens":1}],
+		"models":[{"alias":"m","purpose":"chat","targets":[{"upstream":"u","upstream_model":"m","weight":1}],"default_max_tokens":1}],
 		"database":{"dsn_env":"DSN"},"redis":{"url_env":"K"}}`
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)

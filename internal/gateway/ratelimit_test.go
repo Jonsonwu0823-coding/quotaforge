@@ -127,7 +127,7 @@ var bothRates = ledger.Rate{RPM: 100, TPM: 1_000_000}
 func TestBuckets(t *testing.T) {
 	c := &call{
 		key:     &ledger.Key{ID: 7, AccountID: 3, Rate: ledger.Rate{RPM: 10}, AccountRate: ledger.Rate{RPM: 20, TPM: 2000}},
-		model:   &config.Model{Upstream: &config.Upstream{Name: "up:a", TPM: 9000}},
+		target:  &config.Target{Upstream: &config.Upstream{Name: "up:a", TPM: 9000}},
 		planned: ledger.Reservation{EstInput: 40, EstOutput: 60},
 	}
 	want := []ratelimit.Bucket{
@@ -139,7 +139,7 @@ func TestBuckets(t *testing.T) {
 	if got := buckets(c); !slices.Equal(got, want) {
 		t.Fatalf("buckets = %+v\nwant %+v", got, want)
 	}
-	c.key.Rate, c.key.AccountRate, c.model.Upstream.TPM = ledger.Rate{}, ledger.Rate{}, 0
+	c.key.Rate, c.key.AccountRate, c.target.Upstream.TPM = ledger.Rate{}, ledger.Rate{}, 0
 	if got := buckets(c); got != nil {
 		t.Fatalf("no limits: buckets = %+v", got)
 	}

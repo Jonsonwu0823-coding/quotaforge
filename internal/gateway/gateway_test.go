@@ -44,12 +44,15 @@ const (
 )
 
 // harness 起一个假上游（外面包一层，记下上游收到的请求和发出的响应）、一个脚本上游
-// （按模型名返回任意状态、超大正文、重定向）和 QF。
+// （按模型名返回任意状态、超大正文、重定向）、第二个假上游 fake-b（换上游的测试用）和 QF。
 type harness struct {
 	cfg      *config.Config
+	g        *gateway
 	qf       *httptest.Server
 	up       *httptest.Server
 	fake     *fakeupstream.Server
+	fakeB    *fakeupstream.Server
+	upBBody  []byte // fake-b 最后收到的请求体
 	logs     *syncBuffer
 	spans    *tracetest.SpanRecorder
 	metrics  *telemetry.Metrics
@@ -98,7 +101,7 @@ func newHarnessTelemetry(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.
 // newHarnessChat 同 newHarnessTelemetry，chat 的上游超时用给定的（流式的测试要在一个流里来回几步）。
 func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry, chat time.Duration) *harness {
 	t.Helper()
-	h := &harness{fake: fakeupstream.New(), logs: &syncBuffer{}, spans: tracetest.NewSpanRecorder(),
+	h := &harness{fake: fakeupstream.New(), fakeB: fakeupstream.New(), logs: &syncBuffer{}, spans: tracetest.NewSpanRecorder(),
 		metrics: telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} })}
 	h.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -112,6 +115,15 @@ func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanP
 		tee.Flush()
 	}))
 	t.Cleanup(h.up.Close)
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		h.mu.Lock()
+		h.upBBody = body
+		h.mu.Unlock()
+		h.fakeB.ServeHTTP(w, r)
+	}))
+	t.Cleanup(upB.Close)
 	scripted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Model string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -125,8 +137,9 @@ func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanP
 	deadURL := "http://" + dead.Addr().String() + "/v1"
 	dead.Close()
 
-	h.cfg = loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL, chat)
-	h.qf = httptest.NewServer(WithRequestID(New(h.cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))))
+	h.cfg = loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL, upB.URL+"/v1", chat)
+	h.g = newGateway(h.cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))
+	h.qf = httptest.NewServer(WithRequestID(h.g.routes()))
 	t.Cleanup(h.qf.Close)
 	return h
 }
@@ -139,6 +152,10 @@ func scriptedResponse(w http.ResponseWriter, model, fakeURL string) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTemporaryRedirect)
 		_, _ = w.Write([]byte(`{"redirect":true}`)) // 正文是 JSON 对象，确认 3xx 不会被当成成功透传
+	case model == "hangup": // 收下请求、不回答就关掉连接：请求已经发出，之后断开
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			conn.Close()
+		}
 	case model == "missing-fields":
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"chat.completion","marker":"RESP-MARKER-缺字段"}`))
@@ -265,12 +282,17 @@ func (t *flushTee) Flush() {
 	t.w.(http.Flusher).Flush()
 }
 
-func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string, chat time.Duration) *config.Config {
+func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL, fakeBURL string, chat time.Duration) *config.Config {
 	t.Helper()
 	var models []map[string]any
 	var aliases []string
-	add := func(alias, purpose, upstream, upstreamModel string) {
-		m := map[string]any{"alias": alias, "purpose": purpose, "upstream": upstream, "upstream_model": upstreamModel}
+	// addTargets 加一个别名，目标按（上游，上游模型名，权重）三个一组。
+	addTargets := func(alias, purpose string, spec ...any) {
+		var targets []any
+		for i := 0; i < len(spec); i += 3 {
+			targets = append(targets, map[string]any{"upstream": spec[i], "upstream_model": spec[i+1], "weight": spec[i+2]})
+		}
+		m := map[string]any{"alias": alias, "purpose": purpose, "targets": targets}
 		if purpose == "chat" {
 			m["default_max_tokens"] = defaultMaxTokens
 		}
@@ -278,6 +300,9 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string, chat time.Du
 		if !slices.Contains(aliases, alias) {
 			aliases = append(aliases, alias)
 		}
+	}
+	add := func(alias, purpose, upstream, upstreamModel string) {
+		addTargets(alias, purpose, upstream, upstreamModel, 1)
 	}
 	// 同一个别名分别配给 chat 和 embeddings
 	add("shared", "chat", "fake", "fake-chat")
@@ -303,6 +328,7 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string, chat time.Du
 	add("over-limit", "embeddings", "scripted", "over-limit")
 	add("dead", "chat", "dead", "whatever")
 	addStreamModels(add)
+	addFailoverModels(addTargets)
 	if allAliases == nil { // 每次生成的都一样；只写一次，免得和进行中的请求竞争
 		allAliases = aliases
 	}
@@ -313,10 +339,14 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL string, chat time.Du
 			map[string]any{"name": "fake", "base_url": fakeURL, "api_key_env": "UP_KEY"},
 			map[string]any{"name": "scripted", "base_url": scriptedURL, "api_key_env": "SCRIPTED_KEY"},
 			map[string]any{"name": "dead", "base_url": deadURL, "api_key_env": "UP_KEY"},
+			map[string]any{"name": "fake-b", "base_url": fakeBURL, "api_key_env": "UP_KEY"},
 		},
-		"models":   models,
-		"database": map[string]any{"dsn_env": "TEST_DSN"}, // 网关只经 Ledger 用库，这个值不会被连接
-		"redis":    map[string]any{"url_env": "TEST_DSN"}, // 网关只经 Limiter 用 Redis，这个值也不会被连接
+		"models": models,
+		// 不少测试在同一个 harness 里接连打失败的别名（fake-500、fake-hang、redirect……），默认阈值会让熔断打开、
+		// 后面的请求变成快速失败。熔断的测试自己配小阈值。
+		"circuit_breaker": map[string]any{"failure_threshold": 1000000},
+		"database":        map[string]any{"dsn_env": "TEST_DSN"}, // 网关只经 Ledger 用库，这个值不会被连接
+		"redis":           map[string]any{"url_env": "TEST_DSN"}, // 网关只经 Limiter 用 Redis，这个值也不会被连接
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {

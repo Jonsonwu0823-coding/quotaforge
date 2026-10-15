@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"slices"
 	"strconv"
 
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
@@ -21,35 +22,52 @@ func limiterContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), config.RateLimitTimeout)
 }
 
-// buckets 是这次请求要检查的桶：Key、账户、上游三层里限额不为 0 的那些。RPM 桶花 1，TPM 桶花预留量（估算）。
+// buckets 是这次请求要检查的桶：Key、账户和选中的目标的上游三层里限额不为 0 的那些。RPM 桶花 1，TPM 桶花预留量（估算）。
 func buckets(c *call) []ratelimit.Bucket {
+	out := layerBuckets("key", strconv.FormatInt(c.key.ID, 10), c.key.Rate.RPM, c.key.Rate.TPM, c.planned.Amount())
+	out = append(out, layerBuckets("account", strconv.FormatInt(c.key.AccountID, 10), c.key.AccountRate.RPM, c.key.AccountRate.TPM, c.planned.Amount())...)
+	return append(out, upstreamBuckets(c.target.Upstream, c.planned.Amount())...)
+}
+
+// upstreamBuckets 是一个上游的那一层桶。
+func upstreamBuckets(up *config.Upstream, amount int64) []ratelimit.Bucket {
+	return layerBuckets("upstream", up.Name, up.RPM, up.TPM, amount)
+}
+
+func layerBuckets(layer, id string, rpm, tpm, amount int64) []ratelimit.Bucket {
 	var out []ratelimit.Bucket
-	add := func(layer, id string, rpm, tpm int64) {
-		if rpm > 0 {
-			out = append(out, ratelimit.Bucket{Layer: layer, ID: id, Metric: "rpm", Limit: rpm, Cost: 1})
-		}
-		if tpm > 0 {
-			out = append(out, ratelimit.Bucket{Layer: layer, ID: id, Metric: "tpm", Limit: tpm, Cost: c.planned.Amount()})
-		}
+	if rpm > 0 {
+		out = append(out, ratelimit.Bucket{Layer: layer, ID: id, Metric: "rpm", Limit: rpm, Cost: 1})
 	}
-	add("key", strconv.FormatInt(c.key.ID, 10), c.key.Rate.RPM, c.key.Rate.TPM)
-	add("account", strconv.FormatInt(c.key.AccountID, 10), c.key.AccountRate.RPM, c.key.AccountRate.TPM)
-	up := c.model.Upstream
-	add("upstream", up.Name, up.RPM, up.TPM)
+	if tpm > 0 {
+		out = append(out, ratelimit.Bucket{Layer: layer, ID: id, Metric: "tpm", Limit: tpm, Cost: amount})
+	}
 	return out
 }
 
 // admit 是准入，在预留之前：被限流的请求不碰账本。一个桶都没有就不碰 Redis。
 // 被拒是 429（带 Retry-After），Redis 出错或超时是 503：不放行。
-func (g *gateway) admit(ctx context.Context, c *call) (e *apiError) {
-	bs := buckets(c)
+func (g *gateway) admit(ctx context.Context, c *call) *apiError {
+	lctx, cancel := limiterContext(ctx)
+	defer cancel()
+	return g.admitBuckets(ctx, lctx, c, buckets(c))
+}
+
+// admitUpstream 是换上游时新上游的准入：只准入上游层（Key、账户两层只在调用开始时准入一次）。lctx 从所有尝试共用的期限
+// 派生。不放行（被限、Redis 出错）就不换；被拒的桶、Redis 的错误照常记进日志和指标，返回给客户端的仍是上一次尝试的错误。
+func (g *gateway) admitUpstream(ctx, upCtx context.Context, c *call, up *config.Upstream) bool {
+	lctx, cancel := context.WithTimeout(upCtx, config.RateLimitTimeout)
+	defer cancel()
+	return g.admitBuckets(ctx, lctx, c, upstreamBuckets(up, c.planned.Amount())) == nil
+}
+
+// admitBuckets 用 lctx 检查一组桶，放行时把它们记进 c.admitted。
+func (g *gateway) admitBuckets(ctx, lctx context.Context, c *call, bs []ratelimit.Bucket) (e *apiError) {
 	if len(bs) == 0 {
 		return nil
 	}
 	span := g.step(ctx, "admit")
 	defer func() { endStep(span, e) }()
-	lctx, cancel := limiterContext(ctx)
-	defer cancel()
 	denial, err := g.limiter.Admit(lctx, bs)
 	switch {
 	case err != nil:
@@ -59,8 +77,20 @@ func (g *gateway) admit(ctx context.Context, c *call) (e *apiError) {
 		c.deniedBy = &denial.Bucket
 		return errRateLimited.withRetryAfter(strconv.Itoa(denial.RetryAfter))
 	}
-	c.admitted = bs
+	c.admitted = append(c.admitted, bs...)
 	return nil
+}
+
+// releaseUpstream 把准入时给上游 name 扣过的桶从 c.admitted 挪到 c.released：这个上游确定没收到请求，
+// 收尾时它的 TPM 全部加回，不按结局修正。
+func (c *call) releaseUpstream(name string) {
+	c.admitted = slices.DeleteFunc(c.admitted, func(b ratelimit.Bucket) bool {
+		mine := b.Layer == "upstream" && b.ID == name
+		if mine {
+			c.released = append(c.released, b)
+		}
+		return mine
+	})
 }
 
 // refund 是调用结束后要加回每个 TPM 桶的令牌数，按网关自己判定的结局，和账本写没写成功无关：
@@ -81,19 +111,20 @@ func refund(c *call) int64 {
 // adjust 按结局修正准入时扣过的 TPM 桶，RPM 不退。在 endpoint 的 defer 里、写日志之前执行。
 // 实际比估算多时再扣，但一个桶一次最多再扣它的容量 L：上游报的用量离谱时，桶最多被压到 −L、一分钟补回，
 // 而不是被压成很大的负数、挡住这一层（上游那层就是所有账户）几个小时。账本不受影响，照旧按实际结算。
+// 换上游时换走的上游（c.released）确定没收到请求，它的 TPM 不论结局都全部加回。
 // 失败只记日志，不影响已经得到的结果，也不重试：桶里多扣着估算，偏保守。
 func (g *gateway) adjust(ctx context.Context, c *call) {
-	n := refund(c)
-	if n == 0 {
-		return
-	}
 	var tpm []ratelimit.Bucket
-	for _, b := range c.admitted {
-		if b.Metric == "tpm" {
-			b.Cost = min(-n, b.Limit)
-			tpm = append(tpm, b)
+	add := func(bs []ratelimit.Bucket, n int64) {
+		for _, b := range bs {
+			if b.Metric == "tpm" && n != 0 {
+				b.Cost = min(-n, b.Limit)
+				tpm = append(tpm, b)
+			}
 		}
 	}
+	add(c.admitted, refund(c))
+	add(c.released, c.planned.Amount())
 	if len(tpm) == 0 {
 		return
 	}

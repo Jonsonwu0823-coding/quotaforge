@@ -1,0 +1,16 @@
+# 换上游和熔断的演示环境，叠加在 compose.yaml 之上（见 docs/operations.md 的“多个上游”）：
+#   docker compose -f compose.yaml -f compose.failover.yaml up -d --build --wait
+# 第二个假上游 qf-fake-upstream-b 和 qf-fake-upstream 是同一个镜像；QF 换成 deploy/config.failover.json（两个上游、
+# 两个别名：按 9:1 分流的 split，主备的 primary-b）。QF 的指标在 9464 上，只在 Compose 的网络里，不发布到宿主机。
+services:
+  quotaforge:
+    environment:
+      QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9464
+    volumes: !override
+      - ./deploy/config.failover.json:/etc/quotaforge/config.json:ro
+
+  qf-fake-upstream-b:
+    extends:
+      file: compose.yaml
+      service: qf-fake-upstream
+    build: !reset null # 用 qf-fake-upstream 构建的同一个镜像

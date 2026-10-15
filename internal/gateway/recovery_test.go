@@ -364,6 +364,33 @@ func TestKillPointsSimulated(t *testing.T) {
 		}
 		e.expect(t, r.CallID, "USAGE_UNKNOWN", []string{"reserve"}, audit{sent: true})
 	})
+	// 换上游：改道已经提交、还没发给新上游时被杀。回收把它标成未知，上游是新的那个（偏保守：新上游其实没收到）；
+	// 用量未知的清单上是新上游，运维向它要账单；它的账单里没有这次调用，对账没有证据，保持未知。
+	t.Run("after the reroute, before sending", func(t *testing.T) {
+		r := reservation()
+		if _, err := e.store.Reserve(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.MarkSent(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.Reroute(ctx, r, "fake-b", "fake-chat"); err != nil {
+			t.Fatal(err)
+		}
+		e.reclaim(t, r.CallID)
+		e.expect(t, r.CallID, "USAGE_UNKNOWN", []string{"reserve"}, audit{sent: true})
+		unknown, err := e.store.UnknownCalls(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		i := slices.IndexFunc(unknown, func(u ledger.UnknownCall) bool { return u.ID == r.CallID })
+		if i < 0 || unknown[i].Upstream != "fake-b" || unknown[i].UpstreamModel != "fake-chat" {
+			t.Fatalf("unknown calls = %+v", unknown)
+		}
+		if billRow(e.bill(t), r.CallID) != nil || strings.Contains(string(e.fakeB.Bill()), r.CallID) {
+			t.Fatal("no upstream received the call")
+		}
+	})
 	t.Run("after the response, before finishing", func(t *testing.T) {
 		killed := newDBEnv(t, 1_000_000, func(l Ledger) Ledger { return &faulty{Ledger: l, finishErr: errors.New("killed")} })
 		r := killed.send(t, "/v1/chat/completions", `{"model":"shared","messages":[{"role":"user","content":"abc"}]}`)

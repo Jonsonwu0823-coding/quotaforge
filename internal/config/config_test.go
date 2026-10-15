@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +26,8 @@ func base() map[string]any {
 			map[string]any{"name": "up", "base_url": "http://127.0.0.1:8081/v1/", "api_key_env": "UP_KEY"},
 		},
 		"models": []any{
-			map[string]any{"alias": "same", "purpose": "chat", "upstream": "up", "upstream_model": "chat-model", "default_max_tokens": 512},
-			map[string]any{"alias": "same", "purpose": "embeddings", "upstream": "up", "upstream_model": "embed-model"},
+			map[string]any{"alias": "same", "purpose": "chat", "targets": targets("up", "chat-model", 1), "default_max_tokens": 512},
+			map[string]any{"alias": "same", "purpose": "embeddings", "targets": targets("up", "embed-model", 1)},
 		},
 		"database": map[string]any{"dsn_env": "DB_DSN"},
 		"redis":    map[string]any{"url_env": "REDIS_URL"},
@@ -34,6 +35,29 @@ func base() map[string]any {
 }
 
 func item(m map[string]any, list string) map[string]any { return m[list].([]any)[0].(map[string]any) }
+
+// targets 按（上游，上游模型名，权重）三个一组写出 targets 列表。
+func targets(spec ...any) []any {
+	var out []any
+	for i := 0; i < len(spec); i += 3 {
+		out = append(out, map[string]any{"upstream": spec[i], "upstream_model": spec[i+1], "weight": spec[i+2]})
+	}
+	return out
+}
+
+// target 是第一个模型的第一个目标。
+func target(m map[string]any) map[string]any {
+	return item(m, "models")["targets"].([]any)[0].(map[string]any)
+}
+
+// only 是只有一个目标的模型的那个目标。
+func only(t *testing.T, m *Model) Target {
+	t.Helper()
+	if m == nil || len(m.Targets) != 1 {
+		t.Fatalf("model = %+v, want one target", m)
+	}
+	return m.Targets[0]
+}
 
 func parseMap(t *testing.T, m map[string]any) (*Config, error) {
 	t.Helper()
@@ -57,9 +81,13 @@ func TestParseValid(t *testing.T) {
 		t.Fatalf("ReclaimAfter = %v, ShutdownTimeout = %v, want 36s", c.ReclaimAfter(), c.ShutdownTimeout())
 	}
 	// 同一个别名分别配给两种用途，各按自己的配置。
-	chat, emb := c.Model(Chat, "same"), c.Model(Embeddings, "same")
-	if chat == nil || emb == nil || chat.UpstreamModel != "chat-model" || emb.UpstreamModel != "embed-model" {
-		t.Fatalf("models = %+v, %+v", chat, emb)
+	chatModel, embModel := c.Model(Chat, "same"), c.Model(Embeddings, "same")
+	chat, emb := only(t, chatModel), only(t, embModel)
+	if chat.UpstreamModel != "chat-model" || emb.UpstreamModel != "embed-model" || chat.Weight != 1 {
+		t.Fatalf("targets = %+v, %+v", chat, emb)
+	}
+	if chat.Upstream != emb.Upstream || len(c.Upstreams()) != 1 || c.Upstreams()[0] != chat.Upstream {
+		t.Fatal("both targets must point to the one configured upstream")
 	}
 	if got := chat.Upstream.URL(Chat); got != "http://127.0.0.1:8081/v1/chat/completions" {
 		t.Fatalf("chat URL = %q", got)
@@ -70,8 +98,11 @@ func TestParseValid(t *testing.T) {
 	if chat.Upstream.APIKey != "upstream-secret" {
 		t.Fatal("upstream key not read from the environment")
 	}
-	if chat.DefaultMaxTokens != 512 || emb.DefaultMaxTokens != 0 {
-		t.Fatalf("default_max_tokens = %d, %d", chat.DefaultMaxTokens, emb.DefaultMaxTokens)
+	if chatModel.DefaultMaxTokens != 512 || embModel.DefaultMaxTokens != 0 {
+		t.Fatalf("default_max_tokens = %d, %d", chatModel.DefaultMaxTokens, embModel.DefaultMaxTokens)
+	}
+	if b := c.Breaker(); b != (Breaker{Failures: 5, Cooldown: 30 * time.Second}) {
+		t.Fatalf("default circuit breaker = %+v, want 5 failures, 30s", b)
 	}
 	if c.DatabaseDSN() != testDSN {
 		t.Fatal("database DSN not read from the environment")
@@ -105,7 +136,7 @@ func TestParseUpstreamRate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("rpm = tpm = %d: %v", n, err)
 		}
-		if up := c.Model(Chat, "same").Upstream; up.RPM != n || up.TPM != n {
+		if up := only(t, c.Model(Chat, "same")).Upstream; up.RPM != n || up.TPM != n {
 			t.Fatalf("limits = %d, %d; want %d", up.RPM, up.TPM, n)
 		}
 	}
@@ -116,6 +147,58 @@ func TestParseUpstreamRate(t *testing.T) {
 			if _, err := parseMap(t, m); err == nil {
 				t.Errorf("%s = %v was accepted", field, bad)
 			}
+		}
+	}
+}
+
+// 一个别名可以有多个目标：按配置的顺序保留；权重 0 是备用；同一个上游可以配不同的上游模型名，两个别名可以共用上游。
+func TestParseTargets(t *testing.T) {
+	m := base()
+	m["upstreams"] = append(m["upstreams"].([]any), map[string]any{"name": "up-b", "base_url": "http://127.0.0.1:8082/v1", "api_key_env": "UP_KEY"})
+	item(m, "models")["targets"] = targets("up-b", "b-model", 9, "up", "chat-model", 1, "up", "other-model", 0)
+	c, err := parseMap(t, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.Model(Chat, "same").Targets
+	ups := c.Upstreams()
+	if len(ups) != 2 || ups[0].Name != "up" || ups[1].Name != "up-b" {
+		t.Fatalf("upstreams = %+v", ups)
+	}
+	want := []Target{{ups[1], "b-model", 9}, {ups[0], "chat-model", 1}, {ups[0], "other-model", 0}}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("targets[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if only(t, c.Model(Embeddings, "same")).Upstream != ups[0] {
+		t.Fatal("the embeddings alias shares the upstream object")
+	}
+}
+
+func TestParseCircuitBreaker(t *testing.T) {
+	cases := []struct {
+		cb   map[string]any
+		want Breaker
+	}{
+		{map[string]any{}, Breaker{5, 30 * time.Second}},
+		{map[string]any{"failure_threshold": 0, "cooldown_ms": 0}, Breaker{5, 30 * time.Second}},
+		{map[string]any{"failure_threshold": 3}, Breaker{3, 30 * time.Second}},
+		{map[string]any{"cooldown_ms": 5000}, Breaker{5, 5 * time.Second}},
+		{map[string]any{"failure_threshold": 1000000, "cooldown_ms": 1}, Breaker{1000000, time.Millisecond}},
+	}
+	for _, tc := range cases {
+		m := base()
+		m["circuit_breaker"] = tc.cb
+		c, err := parseMap(t, m)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.cb, err)
+		}
+		if c.Breaker() != tc.want {
+			t.Fatalf("%v: breaker = %+v, want %+v", tc.cb, c.Breaker(), tc.want)
 		}
 	}
 }
@@ -182,7 +265,7 @@ func TestParseBaseURLFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := c.Model(Chat, "same").Upstream.URL(Chat); got != "https://example.test/v1/chat/completions" {
+	if got := only(t, c.Model(Chat, "same")).Upstream.URL(Chat); got != "https://example.test/v1/chat/completions" {
 		t.Fatalf("chat URL = %q", got)
 	}
 }
@@ -216,8 +299,27 @@ func TestParseErrors(t *testing.T) {
 		{"no models", func(m map[string]any) { m["models"] = []any{} }, "models"},
 		{"model without alias", func(m map[string]any) { delete(item(m, "models"), "alias") }, "alias is required"},
 		{"bad purpose", func(m map[string]any) { item(m, "models")["purpose"] = "rerank" }, "purpose"},
-		{"unknown upstream", func(m map[string]any) { item(m, "models")["upstream"] = "nope" }, `upstream "nope" is not defined`},
-		{"no upstream model", func(m map[string]any) { delete(item(m, "models"), "upstream_model") }, "upstream_model"},
+		{"unknown upstream", func(m map[string]any) { target(m)["upstream"] = "nope" }, `models[0]: targets[0]: upstream "nope" is not defined`},
+		{"no upstream model", func(m map[string]any) { delete(target(m), "upstream_model") }, "targets[0]: upstream_model is required"},
+		{"upstream model too long", func(m map[string]any) { target(m)["upstream_model"] = strings.Repeat("m", 256) }, "at most 255"},
+		{"no targets", func(m map[string]any) { delete(item(m, "models"), "targets") }, "models[0]: targets: at least one is required"},
+		{"empty targets", func(m map[string]any) { item(m, "models")["targets"] = []any{} }, "targets: at least one is required"},
+		// 旧的写法（模型上直接写上游）不再认：严格解码直接报错，不会悄悄换了意思。
+		{"old upstream field", func(m map[string]any) { item(m, "models")["upstream"] = "up" }, `unknown field "upstream"`},
+		{"old upstream_model field", func(m map[string]any) { item(m, "models")["upstream_model"] = "x" }, `unknown field "upstream_model"`},
+		{"negative weight", func(m map[string]any) { target(m)["weight"] = -1 }, "weight must be an integer from 0 (standby) to 1000"},
+		{"weight too large", func(m map[string]any) { target(m)["weight"] = 1001 }, "weight must be an integer from 0"},
+		{"fractional weight", func(m map[string]any) { target(m)["weight"] = 1.5 }, "weight"},
+		{"only standby targets", func(m map[string]any) {
+			item(m, "models")["targets"] = targets("up", "a", 0, "up", "b", 0)
+		}, "at least one weight must be greater than 0"},
+		{"no weight", func(m map[string]any) { delete(target(m), "weight") }, "at least one weight must be greater than 0"},
+		{"duplicate target", func(m map[string]any) {
+			item(m, "models")["targets"] = targets("up", "chat-model", 1, "up", "chat-model", 0)
+		}, `targets[1]: upstream "up" with upstream_model "chat-model" is already a target`},
+		{"negative failure threshold", func(m map[string]any) { m["circuit_breaker"] = map[string]any{"failure_threshold": -1} }, "circuit_breaker"},
+		{"negative cooldown", func(m map[string]any) { m["circuit_breaker"] = map[string]any{"cooldown_ms": -1} }, "circuit_breaker"},
+		{"unknown circuit breaker field", func(m map[string]any) { m["circuit_breaker"] = map[string]any{"failures": 3} }, "unknown field"},
 		{"duplicate alias in purpose", func(m map[string]any) {
 			m["models"] = append(m["models"].([]any), item(m, "models"))
 		}, `alias "same" is already defined for chat`},
@@ -294,7 +396,7 @@ func TestParseAPIKeyFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: %v", content, err)
 		}
-		if got := c.Model(Chat, "same").Upstream.APIKey; got != "file-secret" {
+		if got := only(t, c.Model(Chat, "same")).Upstream.APIKey; got != "file-secret" {
 			t.Fatalf("%q: key = %q, want file-secret", content, got)
 		}
 	}
@@ -321,7 +423,7 @@ func TestParseAPIKeyFileErrors(t *testing.T) {
 // 文件里有 Key 或连接串、但配置别处有错时，错误信息里也不能有它们。
 func TestAPIKeyFileErrorHidesKey(t *testing.T) {
 	m := fileKeyConfig(writeFile(t, "file-secret-XYZ\n"))
-	item(m, "models")["upstream"] = "nope"
+	target(m)["upstream"] = "nope"
 	_, err := parseMap(t, m)
 	if err == nil || strings.Contains(err.Error(), "file-secret-XYZ") {
 		t.Fatalf("err = %v", err)
@@ -397,9 +499,10 @@ func TestDeployConfigs(t *testing.T) {
 		if want == "" {
 			want = tc.chat
 		}
-		chat, emb := c.Model(Chat, tc.chat), c.Model(Embeddings, tc.embeddings)
-		if chat == nil || emb == nil || chat.UpstreamModel != want {
-			t.Fatalf("%s: models = %+v, %+v", tc.file, chat, emb)
+		// 自带的配置都是一个上游、每个别名一个目标
+		chat, emb := only(t, c.Model(Chat, tc.chat)), only(t, c.Model(Embeddings, tc.embeddings))
+		if chat.UpstreamModel != want || len(c.Upstreams()) != 1 || emb.Upstream != chat.Upstream {
+			t.Fatalf("%s: targets = %+v, %+v", tc.file, chat, emb)
 		}
 		if chat.Upstream.URL(Chat) != tc.baseURL+"/chat/completions" || chat.Upstream.APIKey != tc.apiKey || c.DatabaseDSN() != testDSN {
 			t.Fatalf("%s: chat URL = %q, or the upstream key or DSN is not from its source", tc.file, chat.Upstream.URL(Chat))
@@ -466,5 +569,36 @@ func TestLoadTelemetry(t *testing.T) {
 				t.Errorf("%v: err = %v, shows the value", tc.env, err)
 			}
 		}
+	}
+}
+
+// 换上游的演示配置：两个上游；split 按 9:1 分流，primary-b 是主备（fake-a 是权重 0 的备用）；熔断 5 次、冷却 5 秒。
+func TestFailoverDemoConfig(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "config.failover.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.ReplaceAll(string(data), "/run/secrets/app_dsn", filepath.ToSlash(writeFile(t, testDSN+"\n")))
+	c, err := parse([]byte(s), env(map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ups := c.Upstreams()
+	if len(ups) != 2 || ups[0].URL(Chat) != "http://qf-fake-upstream:8081/v1/chat/completions" ||
+		ups[1].URL(Chat) != "http://qf-fake-upstream-b:8081/v1/chat/completions" {
+		t.Fatalf("upstreams = %+v", ups)
+	}
+	want := map[string][]Target{
+		"split":     {{ups[0], "fake-chat", 9}, {ups[1], "fake-chat", 1}},
+		"primary-b": {{ups[1], "fake-chat", 1}, {ups[0], "fake-chat", 0}},
+	}
+	for alias, w := range want {
+		if got := c.Model(Chat, alias).Targets; !slices.Equal(got, w) {
+			t.Fatalf("%s: targets = %+v", alias, got)
+		}
+	}
+	// 拨号失败在 Docker Desktop 上要等名字查不到（约 4 秒），chat 的超时要留出换上游之后的时间；回收的上界不变
+	if c.Breaker() != (Breaker{5, 5 * time.Second}) || c.Timeout(Chat) != 10*time.Second || c.ReclaimAfter() != 36*time.Second {
+		t.Fatalf("breaker %+v, chat timeout %v, reclaim after %v", c.Breaker(), c.Timeout(Chat), c.ReclaimAfter())
 	}
 }

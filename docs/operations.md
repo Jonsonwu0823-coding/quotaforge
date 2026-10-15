@@ -19,6 +19,7 @@
 | `compose.bench.yaml` | 再叠加在 `compose.two.yaml` 上：两个实例都换成压测配置 `deploy/config.bench.json`，见[压测](scaling.md#压测) |
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
 | `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
+| `compose.failover.yaml` | 叠加在主文件上：第二个假上游 `qf-fake-upstream-b`（同一个镜像），`quotaforge` 换成两个上游的配置 `deploy/config.failover.json`、打开指标（只在 Compose 的网络里），见[多个上游](#多个上游) |
 | `compose.qs-e2e.yaml` | 只给端到端联调（`scripts/compose-qs-e2e.sh`）用，叠在 `compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml` 之后：`qf-jaeger` 接进 `qs-qf`（QS 的 span 也发到这个 Jaeger），`quotaforge-b` 也接进 `qs-qf`、带网络别名 `quotaforge`，见[接 QueryShield](queryshield.md) |
 
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
@@ -110,15 +111,28 @@ QF 调上游用 Go 默认的 HTTP 客户端，会读 `HTTP_PROXY`、`HTTPS_PROXY
 | `upstreams[].rpm`、`upstreams[].tpm` | 这个上游每分钟的请求数、token 数限额（见[限流](rate-limiting.md)），0 到 10¹² 的整数。不写或 0 表示不限 |
 | `models[].alias` | 客户端请求里的 `model`，最长 255 字节 |
 | `models[].purpose` | `chat` 或 `embeddings`。同一个别名可以分别配给两种用途；同一用途里别名不能重复 |
-| `models[].upstream` | 上游名 |
-| `models[].upstream_model` | 转发时写进请求体的上游模型名，最长 255 字节 |
+| `models[].targets` | 这个别名的目标，至少一个，见[多个上游](#多个上游)。同一个别名里（上游，上游模型名）不能重复 |
+| `models[].targets[].upstream` | 上游名，必须是 `upstreams[]` 里的 |
+| `models[].targets[].upstream_model` | 转发时写进请求体的上游模型名，最长 255 字节 |
+| `models[].targets[].weight` | 分流的权重，0 到 1000 的整数，至少一个目标大于 0。0 是备用：权重大于 0 的目标都用不了时才用 |
 | `models[].default_max_tokens` | 请求没写 `max_tokens` 时估算输出用的上限。chat 模型必填（正整数），embeddings 模型不许写 |
+| `circuit_breaker.failure_threshold` | 熔断：一个上游连续失败几次就打开。所有上游共用。不写或 0 用默认 5 |
+| `circuit_breaker.cooldown_ms` | 熔断打开后多久放一个探测请求，毫秒。不写或 0 用默认 30000 |
 | `database.dsn_env` | 账本数据库连接串（go-sql-driver 格式，`user:password@tcp(host:port)/db`）所在的环境变量名。用只能增删改查的账号 |
 | `database.dsn_file` | 从这个文件读连接串（容器里是 secret `/run/secrets/app_dsn`）。和 `dsn_env` 正好写一个 |
 | `redis.url_env` | 限流用的 Redis 地址（`redis://[:密码@]主机:端口/库号`）所在的环境变量名。必填：没有任何限流限额时请求不会用到 Redis，但这一节不能缺 |
 | `redis.url_file` | 从这个文件读 Redis 地址。和 `url_env` 正好写一个。地址可能带密码，按机密处理：不进日志和报错 |
 
 base URL 只接受 http 和 https，必须有主机名，不能带账号密码、查询串和片段。
+
+一个别名只有一个上游时写一个目标，权重写 1：
+
+```json
+{"alias": "qwen-plus", "purpose": "chat", "default_max_tokens": 32768,
+ "targets": [{"upstream": "bailian", "upstream_model": "qwen-plus", "weight": 1}]}
+```
+
+模型上不能再直接写 `upstream`、`upstream_model`：不认识的字段启动就报错，旧写法的配置不会被悄悄换了意思。
 
 服务器的超时（API 和指标两个监听地址一样，不可配置）：
 
@@ -130,6 +144,49 @@ base URL 只接受 http 和 https，必须有主机名，不能带账号密码�
 | 写响应 | 不设全局的 | 全局的写期限会掐断长流。流式的写期限设在每次写上：5 秒，不越过 chat 的上游超时加 1 秒（多的 1 秒让到点时已经读到的事件和补的错误事件写得出去，见[流式](api.md#流式)）|
 
 优雅退出（SIGINT、SIGTERM）最多等回收的上界 `max(chat 超时, embeddings 超时) + 3 × 2 秒 + 5 秒`，默认 36 秒；流式的调用也等得完（整个流受 chat 的上游超时管，见[回收](ledger.md#调用状态回收和对账未知用量)）；开着追踪时，之后再用最多 2 秒把还没导出的 span 发完（到点没发完的丢掉，账本在这之前已经收完尾）。容器的停止宽限期要比两者之和长。**调大上游超时时，`stop_grace_period` 也要跟着改**，否则 `docker compose stop` 会在 QF 收尾之前把它杀掉（调用由回收接手，但会多出未知用量）。
+
+## 多个上游
+
+一个别名可以有多个目标（上游、上游模型名、权重），例如灰度（9:1）或主备（1:0）：
+
+```json
+"models": [
+  {"alias": "split", "purpose": "chat", "default_max_tokens": 64,
+   "targets": [{"upstream": "fake-a", "upstream_model": "fake-chat", "weight": 9},
+               {"upstream": "fake-b", "upstream_model": "fake-chat", "weight": 1}]},
+  {"alias": "primary-b", "purpose": "chat", "default_max_tokens": 64,
+   "targets": [{"upstream": "fake-b", "upstream_model": "fake-chat", "weight": 1},
+               {"upstream": "fake-a", "upstream_model": "fake-chat", "weight": 0}]}
+],
+"circuit_breaker": {"failure_threshold": 5, "cooldown_ms": 30000}
+```
+
+- **选目标**：每个请求在估算、准入、预留之前选一个目标。跳过熔断开着的上游，在剩下的权重大于 0 的目标里按权重随机选；一个都没有时，按配置顺序用第一个权重 0 的目标（备用）。估算按选中的目标改写后的请求体算（见[额度和账本](ledger.md#额度和账本)）。
+- **全部熔断**：所有目标的上游都熔断着时，请求立即得到 502 `upstream_unavailable`（日志有 `circuit_open: true`），在准入和预留之前：账本里没有这次调用，上游没收到请求（见[接口](api.md#额度和限流的错误)）。
+- **换上游**：只在“确定没发出”时换：连不上上游（拨号失败：连接被拒、名字查不到）。超时、5xx、发出后断开、3xx、4xx、429、流已经开始，一律不换，照常收尾：这些请求可能已经被上游执行、计费，再发给另一个上游就可能计费两次。
+  - 一次调用每个上游最多试一次；所有尝试共用一个期限，从第一次尝试算起，不超过用途的超时。
+  - 换之前，新上游先过上游层的限流（见[限流](rate-limiting.md#多个上游)），账本再把这次调用改到新上游（见[账本](ledger.md#换上游)）；任何一步不成就不换，返回上一次的错误。
+  - 请求体按新目标的上游模型名从客户端的原始请求体重新改写。发给上游的 `X-Client-Request-Id` 还是这次调用的调用号：只有一个上游可能收到它，按调用对账单不会重复。
+- **熔断**：按上游，两个别名用同一个上游时共用它的熔断；每个实例各记各的（见[两个实例](scaling.md#两个实例)）。
+  - 关着：每个请求都放行；连续失败 `failure_threshold` 次就打开，中间一次成功就清零。并发时，打开之前已经放行的请求照常发出，所以多试的次数可以超过 `failure_threshold`；上游超时的话，第一个超时回来之前到达的请求都要等满超时。这些请求的结果在打开之后才回来，不再计数。
+  - 开着：不发给这个上游；过了 `cooldown_ms`，下一个请求成为探测（半开），探测在飞时别的请求仍当它开着。探测成功就关上，失败就重新打开、重新计时。
+  - 失败：连不上、超时、5xx、发出后断开、流中途失败、3xx 和不能用的正文。成功：2xx，以及 401、403 和其它 4xx（上游活着，只是拒绝了这个请求）。上游的 429 不算失败也不算成功（它在限流，是背压，不是故障）。
+  - 只有一个目标的别名也受熔断：上游挂了时，熔断打开之后到达的请求快速失败，不再一个个等超时。请求一个接一个来时，就是第 `failure_threshold + 1` 个请求起；并发时见上面“关着”。
+  - 没有请求时熔断不会去探测：上游恢复之后，要有一个请求来才会关上。
+- 指标、日志和告警见[可观测](observability.md#多个上游和熔断)。
+
+演示（bash，Linux 和 CI 用；两个假上游，约 2 分钟）：
+
+```bash
+# 在项目根目录下运行
+scripts/compose-failover.sh   # Compose 项目名 qf-failover，叠加 compose.failover.yaml
+```
+
+- 权重：`split` 发 200 个，两个假上游收到的请求数合计 200，`fake-b` 在 5 到 40 之间；账本里按上游数的一致。
+- 换上游：`docker compose stop` 掉 `fake-b`（名字查不到）。`primary-b` 的 8 个请求都是 200：前 5 个先试 `fake-b`、连不上、换到 `fake-a`（日志的 `failover_from`），之后 `fake-b` 的熔断开着，直接去备用；账本里都是 `fake-a`。
+- 恢复：起回 `fake-b`，冷却过后的一个请求是探测，去 `fake-b`，熔断关上。
+- 不换：`docker compose pause` 掉 `fake-b`（它照样完成 TCP 握手、收下请求）。5 个并发请求都在 10 秒后 504 `upstream_timeout`、用量未知、账本的上游是 `fake-b`，不换到 `fake-a`；5 次超时打开熔断，之后的请求直接去 `fake-a`。取消暂停、冷却过后探测成功，又回到按权重分流。
+- 演示配置的 chat 超时是 10 秒、冷却 5 秒。Docker Desktop 上停着的容器名约 4 秒才查不到，换上游的请求也就慢这么多；脚本只看结局，不看用时。8080 被占（例如别的 QF 项目在跑）就不跑。
 
 ## qfctl
 
