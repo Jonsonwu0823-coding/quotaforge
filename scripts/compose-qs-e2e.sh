@@ -27,7 +27,7 @@ native() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
 QS_DIR=$(native "$(cd "${1:-${QS_DIR:?用法：$0 <QS 公开仓库的本地目录>}}" && pwd)")
 cd "$(dirname "$0")/.."
 
-readonly QS_COMMIT=0918d49fcea7f8ae1141ef3847092ca33c736b72
+readonly QS_COMMIT=dc1627fa90bb88154fd8f83f45b0e18c59218fc1
 readonly QF_PROJECT=qf-e2e-qf QS_PROJECT=qf-e2e-qs
 # 额度 100 万 tokens：整套演示实测消费约 11.1 万（33 次聊天、15 次嵌入），留足余量；且远大于一次预留（请求字节数加 default_max_tokens 1024）。
 readonly LIMIT=1000000

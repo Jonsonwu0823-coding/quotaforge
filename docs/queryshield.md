@@ -23,16 +23,16 @@ QF_KEY=$(docker compose run --rm -T --no-deps qfctl key issue -account queryshie
 
 QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个场景：正常、跨服务 trace、额度耗尽、上游超时、两个实例。每个场景都用 QF 的账本、调用日志和 Jaeger 核对。不调用任何付费模型。
 
-- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `0918d49fcea7f8ae1141ef3847092ca33c736b72`，目录任意；Docker、Python 3。
-  `git clone https://github.com/Jonsonwu0823-coding/queryshield.git ../queryshield && git -C ../queryshield checkout 0918d49fcea7f8ae1141ef3847092ca33c736b72`
+- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `dc1627fa90bb88154fd8f83f45b0e18c59218fc1`，目录任意；Docker、Python 3。
+  `git clone https://github.com/Jonsonwu0823-coding/queryshield.git ../queryshield && git -C ../queryshield checkout dc1627fa90bb88154fd8f83f45b0e18c59218fc1`
 - **命令**：`scripts/compose-qs-e2e.sh ../queryshield`（也可以用环境变量 `QS_DIR`）。
   - 用时：约 3 分钟，其中上游超时的场景要等 QF 的 chat 超时 25 秒，接手的场景要等回收约 40 秒；QS 镜像要首次构建的话，再多几分钟。
   - 结果：摘要在 `evidence/compose-qs-e2e-summary.txt`，每个场景一段，段尾报这个场景的项数、失败数和用时，最后一行是总的失败数，全部 `ok` 才以 0 退出。
   - 一个场景的检查失败只计数，后面的场景照跑；跑不下去的错误（取不到摘要、容器操作失败）直接停下。两种情况都会清理干净。
 - **不碰本机已有的东西**：
-  - QF、QS 各用联调专用的项目名（`qf-e2e-qf`、`qf-e2e-qs`）和镜像标签（`queryshield-app:qf-e2e-0918d49`）。结束时的 `down -v` 只删自己的容器、网络和卷，不会动 `queryshield_*` 的开发数据卷；`qs-qf` 是脚本建的才删。
+  - QF、QS 各用联调专用的项目名（`qf-e2e-qf`、`qf-e2e-qs`）和镜像标签（`queryshield-app:qf-e2e-dc1627f`）。结束时的 `down -v` 只删自己的容器、网络和卷，不会动 `queryshield_*` 的开发数据卷；`qs-qf` 是脚本建的才删。
   - QS 发布到本机的端口默认 18731，避开常用的 8000。
-  - 联调镜像 `queryshield-app:qf-e2e-0918d49` 跑完会留着（下次直接用），不要了用 `docker rmi` 删。QS 的镜像缺了才构建；出口代理会替换证书的环境里，预先自己构建好这个标签即可。
+  - 联调镜像 `queryshield-app:qf-e2e-dc1627f` 跑完会留着（下次直接用），不要了用 `docker rmi` 删。QS 的镜像缺了才构建；出口代理会替换证书的环境里，预先自己构建好这个标签即可。
   - 开始前报错退出的几种情况：`qs-qf` 上已有容器；同名项目在运行；端口被占（QF 两个实例的 8080、8081，QS 的 18731，Jaeger 界面的 16686；QS 的端口可以用 `QUERYSHIELD_HTTP_PORT` 换）；QS 目录不在固定提交或有改动。
 - **QS 的四个 Compose 文件顺序不能换**：脚本按 `compose.yaml`、`compose.fake-upstream.yaml`、`compose.model-gateway.yaml`、`compose.fake-upstream-gateway.yaml` 的顺序，最后再加 QF 的 `deploy/compose.qs-e2e-qs.yaml`，它换镜像名，并设 QS 的 span 导出地址。顺序反了，`app` 会直连假上游、绕过 QF，而且不报错；脚本的核对（QF 账本里的聊天调用数对不上）会失败。
 - **两边的 span 在同一个 Jaeger 里**：
@@ -46,7 +46,7 @@ QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个�
 | 场景 | 怎么造出来 | QS 那边 | QF 这边查什么 | 项数、用时（参考） |
 |---|---|---|---|---|
 | 1 正常（账户 `e2e`） | 跑 QS 的整套演示（14 题，12 个 run，48 次调用） | 摘要 `pass`，13 题 pass、1 题 not_applicable | 逐个 run 对账；调用日志和账本一一对应；trace 的三项；幂等键；`qfctl verify`；没有被限流的请求 | 35 项，约 10 秒 |
-| 2 跨服务 trace | 场景 1 的 12 个 run | 自己的 span 导出到 QF 的 Jaeger | 两个服务都在；每个 run 的 trace 里两边该有的 span 都在；QF 的每个根 span 挂在 QS 那次尝试的 span 下；QS 的 ERROR span 只有允许的几种 | 4 项 |
+| 2 跨服务 trace | 场景 1 的 12 个 run | 自己的 span 导出到 QF 的 Jaeger | 两个服务都在；每个 run 的 trace 里两边该有的 span 都在；QF 的每个根 span 挂在 QS 那次尝试的 span 下；QS 的 ERROR span 只能是失败的 run 自己的错误码 | 4 项 |
 | 3 额度耗尽（`e2e-quota`） | 先提一个问题（run A，正常结束），再把账户的额度设成已消费的量（剩余 0），再提一个（run B） | run B：`FAILED`、`model_quota_exhausted`，HTTP 503，聊天 1 次（QS 发请求前就计数），`usage_total` 是 `unknown` | QF 回 429 `quota_exhausted`；run B 在账本里 0 次聊天：被拒的请求不进账本、不调上游（Jaeger 里只有失败的 `reserve`，没有 `upstream`）；已消费 + 预留 ≤ 额度，预留 0 | 25 项，约 15 秒 |
 | 4 上游超时（`e2e-timeout`） | 先提一个问题（run C），再暂停 QS 的 `fake-upstream`（`docker pause`）、提一个（run D），之后恢复 | run D：`FAILED`、`upstream_http_error`（QS 把网关回的 504 记成这个码，事件里另记 504 和 `upstream_timeout`），HTTP 502，`usage_total` 是 `unknown` | QF 在 25 到 30 秒之间回 504 `upstream_timeout`，赶在 QS 自己的 30 秒之前；这次调用记 `USAGE_UNKNOWN`、占着预留；超时之后的对账见下面 | 27 项，约 40 秒 |
 | 5 两个实例（`e2e-two`） | 起 `quotaforge-b`，和 `quotaforge` 共用网络别名 `quotaforge`；跑整套演示；再做一次“杀掉一个实例、另一个接手” | 演示同场景 1；run E：`FAILED`、`upstream_request_error`（连接被断开，QS 不重试）；run F 正常 | 整套演示照场景 1 逐个 run 对账，两个实例的日志合起来和账本一一对应；E 的调用由 `quotaforge-b` 回收成 `USAGE_UNKNOWN`（`reclaimed_in_flight`）；F 的 span 都来自 `quotaforge-b` | 43 项，约 65 秒 |
@@ -110,11 +110,11 @@ QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个�
   - 一，`quotaforge`、`queryshield` 两个服务都在。
   - 二，每个 run 的 trace 里上面这些 span 都在，QS 和 QF 的 span 都有。日志里一行都没有的 run（场景 5 的 E）不要求 QF 的 span。
   - 三，QF 的每个根 span（kind 是 SERVER）的父，都是同一条 trace 里 QS 的 `queryshield.http_attempt`（CLIENT）：两边父子相接。被杀的实例可能只导出了几个子 span、没导出根 span，这些孤儿子 span 不算根。
-  - 四，QS 的 ERROR span 的 `queryshield.error_code`，只能是这个场景里 QS 报 `FAILED` 的 run 自己的错误码，或者下面这两个暂停的码；没有错误码的 ERROR 也算失败。每个 `FAILED` 的 run 的 trace 里，至少要有一个带它错误码的 ERROR span。
-    - 固定提交里的 QS 把因审批、追问而暂停的那次工具调用标成 ERROR（`approval_required`、`clarification_required`），run 本身是正常暂停。给了演示摘要时，要求至少有一个这样的 span（Q07 的审批）。QS 之后的版本不再这样标，换固定提交时这条改成“没有 ERROR span”。
+  - 四，QS 的 ERROR span 的 `queryshield.error_code`，只能是这个场景里 QS 报 `FAILED` 的 run 自己的错误码；没有错误码的 ERROR 也算失败。每个 `FAILED` 的 run 的 trace 里，至少要有一个带它错误码的 ERROR span。
+    - run 真的暂停时（等审批 `approval_required`、等用户回答 `clarification_required`），那次工具调用的 span 不标 ERROR：状态不设，`queryshield.status` 是 `waiting_approval` 或 `waiting_user`，`queryshield.error_code` 照旧。同样遇到审批或追问、但 run 没有暂停而是以 `DENIED` 或 `FAILED` 结束的，那次工具调用的 span 仍标 ERROR。所以联调里正常的 run 没有 ERROR span，带这两个码的 ERROR span 会让这一项失败：QS 以后要是把暂停标成 ERROR，联调会报出来。
   - 有 QF 拒绝的请求时（场景 3），这次请求的 QF trace 里有失败的 `reserve`、没有 `upstream`。有 QF 等上游超时的调用时（场景 4），QF 的根 span 和 `upstream` 都以 `upstream_timeout` 失败，它挂在 QS 的一次尝试下，那次尝试记着 504 和 `upstream_timeout`。
   - `--served-by <run_id>=<实例>`（场景 5 的 run F）：这个 run 的 QF 根 span 都来自这个实例（`service.instance.id`）。
-  - 场景 1 的预期：12 个 run 的 trace 里 QS 192 个、QF 352 个 span，44 个根 span 都挂在 QS 的尝试下，QS 的 ERROR span 只有 1 个 `approval_required`。
+  - 场景 1 的预期：12 个 run 的 trace 里 QS 192 个、QF 352 个 span，44 个根 span 都挂在 QS 的尝试下，QS 没有 ERROR span。
 - **单元测试**：`python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'`（不需要 Docker）。
 - **数据从哪读**：
   - QF 的账本（`calls`、`budgets` 表）：`check_qs_runs.py` 按 Compose 的标签找到项目的 `qf-mysql` 容器，在里面用容器内的 secret 文件做只读查询，密码不出容器；

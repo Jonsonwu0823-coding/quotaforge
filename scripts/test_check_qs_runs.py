@@ -813,7 +813,7 @@ def otlp(groups):
 
 def jaeger_world():
     """trace_world() 在 Jaeger 里的样子：每个 run 的 trace 有 QS 的 run span 和每次尝试的 http_attempt，QF 的 SERVER span 挂在尝试下面，
-    带 reserve、upstream 两个子 span；第一个 run 有一个审批暂停的 ERROR tool span。返回 (摘要, 日志行, 服务, {trace_id: 摊平的 span})。"""
+    带 reserve、upstream 两个子 span；第一个 run 有一个审批暂停的 tool span（QS 不把暂停标成 ERROR）。返回 (摘要, 日志行, 服务, {trace_id: 摊平的 span})。"""
     summary, rows = trace_world()
     traces = {}
     for n, record in enumerate(r for r in summary["records"] if r.get("run_id")):
@@ -821,7 +821,7 @@ def jaeger_world():
         qs = [span(run_span, None, "queryshield.run", queryshield__status="SUCCEEDED")]
         qf = []
         if n == 0:
-            qs.append(span(f"{0xb000:016x}", run_span, "queryshield.tool", error=True, queryshield__error_code="approval_required"))
+            qs.append(span(f"{0xb000:016x}", run_span, "queryshield.tool", queryshield__status="waiting_approval", queryshield__error_code="approval_required"))
         for row in (r for r in rows if r["run_id"] == record["run_id"]):
             qs.append(span(row["parent_span_id"], run_span, "queryshield.http_attempt", kind=3, queryshield__status="succeeded"))
             qf.append(span(row["span_id"], row["parent_span_id"], "POST /v1/chat/completions", kind=2))
@@ -836,8 +836,8 @@ def drop(traces, trace_id, keep):
 
 
 class JaegerChecks(unittest.TestCase):
-    def results(self, summary, rows, services, traces, demo=True, served_by=None):
-        return cq.jaeger_checks(summary["records"], rows, services, traces, demo, served_by)
+    def results(self, summary, rows, services, traces, served_by=None):
+        return cq.jaeger_checks(summary["records"], rows, services, traces, served_by)
 
     def fails(self, *args, **kwargs):
         return [t for level, t in self.results(*args, **kwargs) if level == "FAIL"]
@@ -851,6 +851,8 @@ class JaegerChecks(unittest.TestCase):
         self.assertEqual([level for level, _ in results], ["ok"] * 4 + ["info"], results)
         self.assertIn("12 run traces have all their spans, 47 from queryshield and 102 from quotaforge (0 incomplete)", results[1][1])
         self.assertIn("34 quotaforge SERVER spans each hang under", results[2][1])
+        self.assertEqual(results[3], ("ok", "jaeger: queryshield ERROR spans {} are all the failed runs' own codes (0 are not);"
+                                            " 0 failed runs each have one with their code (0 do not)"))
         self.assertEqual(results[4], ("info", "jaeger: quotaforge SERVER spans by instance {'quotaforge': 34}"))
         for _, text in results:
             text.encode("ascii")
@@ -936,11 +938,15 @@ class JaegerChecks(unittest.TestCase):
         traces[trace] += self.error_span("upstream_http_error", trace)
         self.assertEqual(self.fails(summary, rows, services, traces), [])
 
-    def test_the_demo_needs_a_paused_tool_span_and_query_records_do_not(self):
-        summary, rows, services, traces = jaeger_world()
-        drop(traces, self.first_trace(summary), lambda s: s["name"] != "queryshield.tool")
-        self.assertEqual(len(self.fails(summary, rows, services, traces)), 1)
-        self.assertEqual(self.fails(summary, rows, services, traces, demo=False), [])
+    def test_a_paused_tool_span_marked_error_fails_j4_when_no_run_failed(self):
+        """QS 不把暂停的工具调用标成 ERROR（夹具里那个不标）；它以后要是又标了，联调要报出来。"""
+        for code in ("approval_required", "clarification_required"):
+            summary, rows, services, traces = jaeger_world()
+            paused = next(s for s in traces[self.first_trace(summary)] if s["name"] == "queryshield.tool")
+            paused.update(error=True)
+            paused["attrs"]["queryshield.error_code"] = code
+            fails = self.fails(summary, rows, services, traces)
+            self.assertTrue(len(fails) == 1 and "(1 are not)" in fails[0], (code, fails))
 
     def failure_world(self, kind):
         """第一个 run 的第一次调用改成 QF 拒绝（refused）或超时（timeout）在 Jaeger 和日志里的样子。"""

@@ -55,9 +55,6 @@ UNKNOWN_RUNS = {
     "upstream_http_error": (0, ("USAGE_UNKNOWN", 504, "upstream_timeout")),  # QF 等上游超时，回 504
     "upstream_request_error": (0, ("USAGE_UNKNOWN", None, "reclaimed_in_flight")),  # 处理它的 QF 实例中途被杀，另一个实例回收
 }
-# 固定提交里的 QS 把因审批、追问而暂停的那次工具调用的 span 标成 ERROR（run 本身是正常暂停）。
-# QS 之后的版本不再标：到时改成空集合，演示摘要的要求就变成“没有 ERROR span”。
-QS_PAUSE_ERROR_CODES = frozenset({"approval_required", "clarification_required"})
 RUN_NOT_FINISHED = frozenset({"RUNNING", "CANCEL_REQUESTED", "WAITING_APPROVAL", "WAITING_USER"})
 SPAN_SERVER, SPAN_CLIENT, STATUS_ERROR = 2, 3, 2  # OTLP 的枚举值
 JAEGER_WAIT_SECONDS = 60
@@ -503,20 +500,18 @@ def jaeger_basics(records, log_rows, services, traces):
     ]
 
 
-def jaeger_errors(records, traces, demo):
-    """第四项：QS 的 ERROR span 只能是暂停的两种，或者这个场景里 QS 报 FAILED 的 run 自己的错误码；每个这样的 run 至少有一个。"""
+def jaeger_errors(records, traces):
+    """第四项：QS 的 ERROR span 只能是这个场景里 QS 报 FAILED 的 run 自己的错误码；每个这样的 run 至少有一个。"""
     failed = {record["trace_id"]: record["error_code"] for record in records if record.get("run_id") and record.get("error_code") in UNKNOWN_RUNS}
-    allowed = QS_PAUSE_ERROR_CODES | set(failed.values())
+    allowed = set(failed.values())
     errors = [(trace_id, s["attrs"].get("queryshield.error_code")) for trace_id, spans in traces.items() for s in spans
               if s["service"] == "queryshield" and s["error"]]
     bad = sum(1 for _, code in errors if code not in allowed)
     unmarked = sum(1 for trace_id, code in failed.items() if (trace_id, code) not in errors)
-    paused = not (demo and QS_PAUSE_ERROR_CODES) or any(code in QS_PAUSE_ERROR_CODES for _, code in errors)
     codes = dict(sorted(Counter(str(code) for _, code in errors).items()))
-    return [verdict(not bad and not unmarked and paused,
-                    f"jaeger: queryshield ERROR spans {codes} are all paused tools or the failed runs' own codes ({bad} are not);"
-                    f" {len(failed)} failed runs each have one with their code ({unmarked} do not)"
-                    + ("; the demo has a paused tool span" if demo and QS_PAUSE_ERROR_CODES else ""))]
+    return [verdict(not bad and not unmarked,
+                    f"jaeger: queryshield ERROR spans {codes} are all the failed runs' own codes ({bad} are not);"
+                    f" {len(failed)} failed runs each have one with their code ({unmarked} do not)")]
 
 
 def jaeger_failures(log_rows, traces):
@@ -556,9 +551,9 @@ def served_by_check(records, traces, run_id, instance):
     return verdict(roots and not others, f"jaeger: run {run_id} was served by {instance} only ({len(roots)} SERVER spans, {others} from another instance)")
 
 
-def jaeger_checks(records, log_rows, services, traces, demo, served_by=None):
+def jaeger_checks(records, log_rows, services, traces, served_by=None):
     """跨服务 trace 的检查（纯函数：run 记录、日志行和 Jaeger 里的 trace 进，结果行出）。只报个数，不打印 span 的内容。"""
-    out = jaeger_basics(records, log_rows, services, traces) + jaeger_errors(records, traces, demo) + jaeger_failures(log_rows, traces)
+    out = jaeger_basics(records, log_rows, services, traces) + jaeger_errors(records, traces) + jaeger_failures(log_rows, traces)
     if served_by:
         out.append(served_by_check(records, traces, *served_by))
     instances = dict(sorted(Counter(str(s["instance"]) for _, s in server_spans(traces)).items()))
@@ -619,7 +614,7 @@ def main(argv):
             traces = fetch_traces(args.jaeger, expected_spans(records, log_rows))
             # 等完 span 再取服务列表：QS 的 span 进了 Jaeger，queryshield 这个服务才一定在
             services = jaeger_get(f"{args.jaeger}/api/v3/services").get("services", [])
-            results += jaeger_checks(records, log_rows, services, traces, summary is not None, args.served_by and args.served_by.split("=", 1))
+            results += jaeger_checks(records, log_rows, services, traces, args.served_by and args.served_by.split("=", 1))
     except CannotRun as err:
         print(f"error: {err}", file=sys.stderr)
         return 2
