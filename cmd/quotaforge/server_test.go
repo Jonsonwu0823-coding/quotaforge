@@ -135,7 +135,7 @@ func serveGateway(t *testing.T) (string, string, *fakeupstream.Server, *syncLog)
 	}
 	t.Cleanup(func() { limiter.Close() })
 	logs := &syncLog{}
-	h := newHandler(gateway.New(cfg, dbtest.Store(t), limiter, slog.New(slog.NewJSONHandler(logs, nil)), telemetry.Disabled(telemetry.NewMetrics(noDBStats))))
+	h := newHandler(gateway.New(cfg, dbtest.Store(t), limiter, nil, slog.New(slog.NewJSONHandler(logs, nil)), telemetry.Disabled(telemetry.NewMetrics(noDBStats))))
 	return serveShort(t, h, readTimeout, time.Minute), key, fake, logs
 }
 

@@ -35,6 +35,7 @@ func addFailoverModels(addTargets func(alias, purpose string, spec ...any)) {
 	}
 	addTargets("fo-emb", "embeddings", "fake", "fake-embed", 1, "fake-b", "fake-embed", 0)
 	addTargets("fo-emb-hold", "embeddings", "fake", "fake-hold", 1, "fake-b", "fake-embed", 0)
+	addTargets("fo-emb-dead", "embeddings", "dead", "whatever-dead", 1, "fake-b", "fake-embed", 0)
 }
 
 // breakAfter 让熔断在连续 n 次失败后打开：harness 的配置是 1000000 次，碰不到。在发请求之前调。

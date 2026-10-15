@@ -405,8 +405,14 @@ func TestSpanAttributesAllowList(t *testing.T) {
 		"qf.endpoint", "qf.model_alias", "qf.upstream", "qf.call_status", "qf.outcome", "qf.replay_of", "qf.call_id",
 		"qf.reserved_tokens", "qf.usage.known", "qf.usage.prompt_tokens", "qf.usage.completion_tokens", "qf.usage.total_tokens",
 		"qf.client_disconnected", "qf.rate_limited_by", "qf.stream", "qf.stream.first_event_ms", "qf.stream.write_timeout",
-		"qf.failover_from"}
+		"qf.failover_from", "qf.cache", "qf.cached_from"}
 	h := newHarnessLimited(t, &rated{Ledger: newAllowAll(), key: bothRates}, &stubLimiter{})
+	cached := newCacheHarness(t, newAllowAll(), &stubLimiter{}, newMemCache())
+	for _, headers := range [][]string{nil, nil, {"Idempotency-Key", "IDEM-MARKER-3"}} { // 没命中、命中、带键绕过
+		if r := cached.emb(t, clientKey, `{"model":"shared","input":"REQ-MARKER-emb"}`, append(headers, "X-Run-Id", "RUN-MARKER")...); r.status != 200 {
+			t.Fatalf("got %d", r.status)
+		}
+	}
 	h.chat(t, `{"model":"fo-dead-b"}`)
 	h.chat(t, withModel(toolsBody, `"fake-tool-call"`), "X-Run-Id", "RUN-MARKER", "X-Client-Request-Id", "CRID-MARKER")
 	h.chat(t, streamOf("fake-stream-cut"), "X-Run-Id", "RUN-MARKER")
@@ -432,7 +438,7 @@ func TestSpanAttributesAllowList(t *testing.T) {
 	}) {
 		t.Fatal("no root span with qf.replay_of")
 	}
-	for _, spans := range [][]sdktrace.ReadOnlySpan{h.spans.Ended(), denied.spans.Ended(), replayed.spans.Ended()} {
+	for _, spans := range [][]sdktrace.ReadOnlySpan{h.spans.Ended(), denied.spans.Ended(), replayed.spans.Ended(), cached.spans.Ended()} {
 		checkAllowedAttributes(t, spans, allowed)
 	}
 }

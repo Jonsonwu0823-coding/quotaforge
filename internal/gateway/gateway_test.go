@@ -60,6 +60,8 @@ type harness struct {
 	upBody   []byte
 	upHeader http.Header
 	upResp   []byte
+
+	clientCtx context.Context // 嵌入缓存的并发测试发请求用的 context：测试结束时取消，挂住的请求不会卡住服务器的关闭
 }
 
 // newHarness 的账本是只放行的替身（allowAll），Key 是 clientKey 和 limitedKey。
@@ -101,6 +103,13 @@ func newHarnessTelemetry(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.
 // newHarnessChat 同 newHarnessTelemetry，chat 的上游超时用给定的（流式的测试要在一个流里来回几步）。
 func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry, chat time.Duration) *harness {
 	t.Helper()
+	return newHarnessSetup(t, l, lim, tel, chat, nil)
+}
+
+// newHarnessSetup 同 newHarnessChat；setup 不为 nil 时在 routes 之前调用，用来改网关（例如装上嵌入缓存）。
+func newHarnessSetup(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanProcessor, *telemetry.Metrics) telemetry.Telemetry,
+	chat time.Duration, setup func(*gateway)) *harness {
+	t.Helper()
 	h := &harness{fake: fakeupstream.New(), fakeB: fakeupstream.New(), logs: &syncBuffer{}, spans: tracetest.NewSpanRecorder(),
 		metrics: telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} })}
 	h.up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +148,9 @@ func newHarnessChat(t *testing.T, l Ledger, lim Limiter, tel func(sdktrace.SpanP
 
 	h.cfg = loadConfig(t, h.up.URL+"/v1", scripted.URL+"/v1", deadURL, upB.URL+"/v1", chat)
 	h.g = newGateway(h.cfg, l, lim, slog.New(slog.NewJSONHandler(h.logs, nil)), tel(h.spans, h.metrics))
+	if setup != nil {
+		setup(h.g)
+	}
 	h.qf = httptest.NewServer(WithRequestID(h.g.routes()))
 	t.Cleanup(h.qf.Close)
 	return h
@@ -159,6 +171,10 @@ func scriptedResponse(w http.ResponseWriter, model, fakeURL string) {
 	case model == "missing-fields":
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"chat.completion","marker":"RESP-MARKER-缺字段"}`))
+	case model == "emb-created":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"created","usage":{"prompt_tokens":1,"total_tokens":1}}`))
 	case model == "no-completion":
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"x","usage":{"prompt_tokens":3,"total_tokens":3}}`))
@@ -316,13 +332,21 @@ func loadConfig(t *testing.T, fakeURL, scriptedURL, deadURL, fakeBURL string, ch
 	add("emb-hang", "embeddings", "fake", "fake-hang")
 	add("emb-no-usage", "embeddings", "fake", "fake-no-usage")
 	add("emb-hold", "embeddings", "fake", "fake-hold") // embeddings 的超时长，挂住的请求等得起
+	// 嵌入缓存的测试：和 shared 同一个目标的另一个别名、同一个上游的另一个模型名、另一个上游、上游回错误
+	add("emb-alias2", "embeddings", "fake", "fake-embed")
+	add("emb-model2", "embeddings", "fake", "fake-embed-2")
+	add("emb-b", "embeddings", "fake-b", "fake-embed")
+	add("emb-500", "embeddings", "fake", "fake-500")
+	add("emb-400", "embeddings", "scripted", "status-400")
+	add("emb-201", "embeddings", "scripted", "emb-created") // 2xx 但不是 200，带合法的用量：结算，但不缓存
 	for _, s := range []string{"redirect", "missing-fields", "array", "null", "no-content-type", "empty", "no-completion", "status-201", "status-400", "status-404", "status-422", "status-403", "status-503"} {
 		add(s, "chat", "scripted", s)
 	}
 	// 32 MiB 的正文在 -race 下要传一阵，放在超时更长的 embeddings 上。
 	add("at-limit", "embeddings", "scripted", "at-limit")
 	// 快照上限附近的正文：1 MiB、正好 8 MiB、8 MiB 加 1 字节、32 MiB（上游正文的上限）。
-	for _, n := range []int{1 << 20, 8 << 20, 8<<20 + 1, 32 << 20} {
+	// 1 MiB 加 1 字节：嵌入缓存一条正文的上限之外。
+	for _, n := range []int{1 << 20, 1<<20 + 1, 8 << 20, 8<<20 + 1, 32 << 20} {
 		add(fmt.Sprintf("size-%d", n), "embeddings", "scripted", fmt.Sprintf("size-%d", n))
 	}
 	add("over-limit", "embeddings", "scripted", "over-limit")

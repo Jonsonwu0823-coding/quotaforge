@@ -112,6 +112,9 @@ jobs:
       # 多个上游：按权重分流、拨号失败时换上游、按上游熔断和恢复、可能已经发出的不换（两个假上游）
       - name: Multiple upstreams
         run: scripts/compose-failover.sh
+      # 嵌入缓存：命中、按账户隔离、带键绕过、并发合并只回源一次、缓存停掉时照常回源、过期（单独的缓存 Redis）
+      - name: Embedding cache
+        run: scripts/compose-cache.sh
       # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
       # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
       - name: Check out QueryShield at the pinned commit
@@ -136,5 +139,6 @@ jobs:
             evidence/compose-observability-summary.txt
             evidence/compose-stream-summary.txt
             evidence/compose-failover-summary.txt
+            evidence/compose-cache-summary.txt
             evidence/compose-qs-e2e-summary.txt
           if-no-files-found: warn

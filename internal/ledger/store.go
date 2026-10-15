@@ -38,13 +38,15 @@ var errInvalidDSN = errors.New("database DSN is invalid (want user:password@tcp(
 type Status string
 
 // 调用的状态。RESERVED：预留成功，还没落发送意图；IN_FLIGHT：发送意图已落库，请求可能已经发给上游；
-// SETTLED：按可信的用量结算；CANCELLED：确定上游没有消费，预留已释放；USAGE_UNKNOWN：可能已被上游计费，用量不知道，占着预留。
+// SETTLED：按可信的用量结算；CANCELLED：确定上游没有消费，预留已释放；USAGE_UNKNOWN：可能已被上游计费，用量不知道，占着预留；
+// CACHED：嵌入缓存命中，给的是原来那次结算过的响应，没有预留、没调上游、不动额度，写入时就已结清。
 const (
 	Reserved     Status = "RESERVED"
 	InFlight     Status = "IN_FLIGHT"
 	Settled      Status = "SETTLED"
 	Cancelled    Status = "CANCELLED"
 	UsageUnknown Status = "USAGE_UNKNOWN"
+	Cached       Status = "CACHED"
 )
 
 // Key 是一把可用的 Key，带着它自己和它所属账户的限流限额。
@@ -109,6 +111,24 @@ type Result struct {
 	UpstreamResponseID string
 	ResponseModel      string
 	Response           *Response
+}
+
+// CachedCall 是一次缓存命中：归属、调用的模型，和缓存里原来那次调用的结果。字符串为空的存 NULL。
+// Upstream、UpstreamModel 是这次选中的目标：缓存的键里有这两项，所以它们就是原来那次真正回答的目标。
+type CachedCall struct {
+	CallID          string
+	AccountID       int64
+	KeyID           int64
+	Purpose         string
+	Alias           string
+	Upstream        string
+	UpstreamModel   string
+	ClientRequestID string
+	RunID           string
+	CachedFrom      string // 原来那次的调用号
+	Usage           Usage  // 原来那次的用量，客户端拿到的就是它
+	ResponseID      string
+	ResponseModel   string
 }
 
 type Store struct{ db *sql.DB }
@@ -230,6 +250,27 @@ func reserveIn(ctx context.Context, tx *sql.Tx, r Reservation) error {
 		return fmt.Errorf("insert call: %w", err)
 	}
 	return insertEntry(ctx, tx, r.CallID, "reserve", r.Amount(), 0)
+}
+
+// RecordCached 记一次缓存命中：一条自动提交的 INSERT，状态 CACHED，预留量 0，没有账本行，不锁额度行、不动额度。
+// 写入时就已结清（网关凭 cache），收尾、回收和对账都没有从它出发的转换。外键检查只对账户和 Key 加共享锁，
+// 单条语句不持有别的锁，和预留、收尾构不成等待环。
+func (s *Store) RecordCached(ctx context.Context, c CachedCall) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO calls (id, account_id, key_id, status, purpose, model_alias,
+		upstream, upstream_model, est_input_tokens, est_output_tokens, reserved_tokens,
+		usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, client_request_id, run_id,
+		upstream_response_id, response_model, http_status, cached_from,
+		resolved_by, resolution_evidence, created_at, finished_at, resolved_at)
+		VALUES (?, ?, ?, 'CACHED', ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 200, ?, ?, ?,
+			UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`,
+		c.CallID, c.AccountID, c.KeyID, c.Purpose, c.Alias, c.Upstream, c.UpstreamModel,
+		c.Usage.Prompt, sql.NullInt64{Int64: c.Usage.Completion, Valid: c.Usage.HasCompletion}, c.Usage.Total,
+		nullString(c.ClientRequestID), nullString(c.RunID), nullString(c.ResponseID), nullString(c.ResponseModel),
+		c.CachedFrom, Gateway, Cache)
+	if err != nil {
+		return fmt.Errorf("record cached call: %w", err)
+	}
+	return nil
 }
 
 // ErrNotReserved 是发送意图没落成：调用已经不是 RESERVED（超过上界，被回收释放了）。这时不能发请求。

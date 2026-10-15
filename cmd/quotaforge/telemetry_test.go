@@ -40,7 +40,7 @@ func noDBStats() sql.DBStats { return sql.DBStats{} }
 func TestMetricsAreNotOnTheAPIListener(t *testing.T) {
 	spans := tracetest.NewSpanRecorder()
 	tel := telemetry.Enabled(telemetry.NewTracerProvider(spans, 1, "t"), telemetry.NewMetrics(noDBStats))
-	h := newHandler(gateway.New(ledgerConfig(t, "unused"), nil, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), tel))
+	h := newHandler(gateway.New(ledgerConfig(t, "unused"), nil, nil, nil, slog.New(slog.NewJSONHandler(io.Discard, nil)), tel))
 	for _, tc := range []struct {
 		method, path string
 		code         int

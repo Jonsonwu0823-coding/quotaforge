@@ -133,7 +133,7 @@ func TestExportUsageFormulaCells(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want := strings.Join(usageColumns, ",") + "\n" +
-		"2026-10-11T00:00:00Z,qf-1,cr-1,run-1,chat,shared,fake-chat,502,upstream_error,3,10,13,7,qf-0\n"; out.String() != want {
+		"2026-10-11T00:00:00Z,qf-1,cr-1,run-1,chat,shared,fake-chat,502,upstream_error,3,10,13,7,qf-0,\n"; out.String() != want {
 		t.Fatalf("plain row:\n%s\nwant\n%s", out.String(), want)
 	}
 

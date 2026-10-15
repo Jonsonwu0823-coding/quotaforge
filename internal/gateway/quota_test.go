@@ -24,13 +24,14 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
 
-// allowAll 是只放行的账本替身：认 clientKey 和 limitedKey，预留、发送意图、改道和收尾一律成功，记下收到的预留、
-// 发送意图的次数和改道。它不判断额度、不记余额，额度的规则只在 MySQL 里有一份，由下面用真库的测试检查。
+// allowAll 是只放行的账本替身：认 clientKey 和 limitedKey，预留、发送意图、改道、收尾和缓存命中一律成功，记下收到的预留、
+// 发送意图的次数、改道和缓存命中。它不判断额度、不记余额，额度的规则只在 MySQL 里有一份，由下面用真库的测试检查。
 type allowAll struct {
 	mu       sync.Mutex
 	reserved []ledger.Reservation
 	sent     int
 	reroutes []string // 每次改道一项：“旧上游/旧模型 -> 新上游/新模型”
+	cached   []ledger.CachedCall
 }
 
 func newAllowAll() *allowAll { return &allowAll{} }
@@ -70,6 +71,20 @@ func (a *allowAll) Finish(context.Context, ledger.Reservation, ledger.Result) er
 
 func (a *allowAll) Call(context.Context, int64, string) (*ledger.CallInfo, error) { return nil, nil }
 
+func (a *allowAll) RecordCached(_ context.Context, c ledger.CachedCall) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.cached = append(a.cached, c)
+	return nil
+}
+
+// counts 是到现在为止的预留数和缓存命中数。
+func (a *allowAll) counts() (reserved, cached int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.reserved), len(a.cached)
+}
+
 func (a *allowAll) lastReservation(t *testing.T) ledger.Reservation {
 	t.Helper()
 	a.mu.Lock()
@@ -84,9 +99,9 @@ func (a *allowAll) lastReservation(t *testing.T) ledger.Reservation {
 // markSentErr 不碰账本、直接失败；markSentCommits 时先真的落发送意图、再返回这个错误（提交成功了、网关却收到错误）。
 type faulty struct {
 	Ledger
-	keyErr, reserveErr, markSentErr, finishErr, lookupErr error
-	markSentCommits                                       bool
-	afterReserve                                          func()
+	keyErr, reserveErr, markSentErr, finishErr, lookupErr, cachedErr error
+	markSentCommits                                                  bool
+	afterReserve                                                     func()
 }
 
 func (f *faulty) KeyByHash(ctx context.Context, hash string) (*ledger.Key, error) {
@@ -131,6 +146,13 @@ func (f *faulty) Finish(ctx context.Context, r ledger.Reservation, res ledger.Re
 		return f.finishErr
 	}
 	return f.Ledger.Finish(ctx, r, res)
+}
+
+func (f *faulty) RecordCached(ctx context.Context, c ledger.CachedCall) error {
+	if f.cachedErr != nil {
+		return f.cachedErr
+	}
+	return f.Ledger.RecordCached(ctx, c)
 }
 
 func errorCode(t *testing.T, r reply) string {

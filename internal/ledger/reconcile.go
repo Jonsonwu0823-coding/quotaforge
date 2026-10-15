@@ -200,6 +200,9 @@ func judge(c *lockedCall, p Proof) (Verdict, string) {
 			return Inconsistent, fmt.Sprintf("the usage is not valid for a %s call", c.purpose)
 		}
 		return Settle, ""
+	case Cached:
+		// 缓存命中从没发给上游，任何证据都对不上它；它也不占预留，没有要结清的。
+		return Inconsistent, "this call was a cache hit and was never sent to the upstream"
 	case Settled:
 		if p.Status == Settled && c.usage != nil && *c.usage == *p.Usage {
 			return Consistent, ""

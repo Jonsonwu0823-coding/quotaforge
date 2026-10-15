@@ -36,6 +36,10 @@ type Metrics struct {
 	Failovers         *prometheus.CounterVec // endpoint, upstream
 	CircuitRejections *prometheus.CounterVec // endpoint
 
+	CacheLookups *prometheus.CounterVec // result
+	CacheWrites  *prometheus.CounterVec // result
+	CacheWaiting prometheus.Gauge
+
 	Reclaimed             *prometheus.CounterVec // result
 	Purged                prometheus.Counter
 	BackgroundErrors      *prometheus.CounterVec // task
@@ -66,13 +70,14 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 		"upstream", "endpoint", "result")
 	m.UpstreamDuration = histogram("qf_upstream_duration_seconds", "Time from sending an upstream request to reading its whole body.",
 		slowBuckets, "upstream", "endpoint")
-	m.Calls = counter("qf_calls_total", "Reserved calls by the gateway's outcome: settled, cancelled or usage_unknown.",
+	m.Calls = counter("qf_calls_total", "Calls in the ledger by the gateway's outcome: settled, cancelled, usage_unknown, or cached (an embedding cache hit, nothing reserved).",
 		"endpoint", "outcome")
 	m.UsageTokens = counter("qf_usage_tokens_total", "Tokens of settled calls; calls with unknown usage are counted in qf_calls_total, not here.",
 		"endpoint", "upstream", "type")
 	m.Replays = counter("qf_idempotent_replays_total", "Requests answered with the stored response of an earlier call.", "endpoint")
 	m.RateLimited = counter("qf_rate_limited_total", "Requests denied by a rate limit bucket.", "layer", "metric")
-	m.DependencyErrors = counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations.", "dependency", "operation")
+	m.DependencyErrors = counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations; requests fail with them. "+
+		"Embedding cache errors are not counted here: the request goes on to the upstream.", "dependency", "operation")
 	m.Streams = counter("qf_streams_total", "Streams the upstream started, by how they ended (ok or the upstream error code) "+
 		"and the client (connected, disconnected, write_timeout).", "result", "client")
 	m.StreamFirstEvent = histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
@@ -84,6 +89,12 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 		"endpoint", "upstream")
 	m.CircuitRejections = counter("qf_upstream_circuit_rejections_total", "Requests failed fast because the circuits of all their targets were open.",
 		"endpoint")
+
+	m.CacheLookups = counter("qf_embedding_cache_lookups_total", "Embedding requests by how the cache answered: hit, coalesced (shared the "+
+		"result of an identical request in flight), miss, bypass (an Idempotency-Key, or a body that cannot be canonicalized) or error "+
+		"(the cache failed; the request went on to the upstream).", "result")
+	m.CacheWrites = counter("qf_embedding_cache_writes_total", "Settled embedding responses written to the cache: ok or error.", "result")
+	m.CacheWaiting = gauge("qf_embedding_cache_waiting", "Embedding requests in this instance waiting for an identical request in flight.")
 
 	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
 	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()

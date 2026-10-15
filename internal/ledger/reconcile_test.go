@@ -318,9 +318,10 @@ func exec(t *testing.T, db *sql.DB, qs ...string) {
 // unmigrate3 把版本 3 的表结构退回版本 2，测试用来造“迁移前的库”。
 var unmigrate3 = []string{
 	`ALTER TABLE calls DROP INDEX calls_status_created, DROP COLUMN sent_at, DROP COLUMN resolved_by,
-		DROP COLUMN resolution_evidence, DROP COLUMN resolved_at,
+		DROP COLUMN resolution_evidence, DROP COLUMN resolved_at, DROP COLUMN cached_from,
 		MODIFY COLUMN status ENUM('RESERVED', 'SETTLED', 'CANCELLED', 'USAGE_UNKNOWN') NOT NULL`,
-	"DELETE FROM schema_migrations WHERE version >= 3", // 之后的迁移也随之重跑：0004 的列已经在了，跳过
+	// 之后的迁移也随之重跑：0004 的列已经在了，跳过；0005 的列一并去掉（它改的两个 ENUM 上面已经退回），重做一遍
+	"DELETE FROM schema_migrations WHERE version >= 3",
 }
 
 // alter3 是迁移 0003 里的那条 ALTER（和迁移文件相同）。

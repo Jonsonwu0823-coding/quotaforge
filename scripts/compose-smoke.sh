@@ -406,7 +406,7 @@ check "usage-export: no unparseable lines" [ ! -s "$work/export.err" ]
 check "usage-export: one row per call line" [ "$(($(wc -l <"$work/usage.csv") - 1))" = "$((${#calls[@]} + ${#replays[@]} + 1))" ]
 # 重放的行：最后一列 replay_of 是原来的调用号，usage 三列为空
 check "usage-export: the replay row has replay_of and no usage" \
-  grep -q ",200,,,,,[0-9]*,$(request_id idem_first)\$" "$work/usage.csv"
+  grep -q ",200,,,,,[0-9]*,$(request_id idem_first),\$" "$work/usage.csv"
 cat "$work/usage.csv" >>"$SUMMARY"
 
 say "== rate limits (Redis)"

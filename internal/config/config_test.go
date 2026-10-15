@@ -203,6 +203,47 @@ func TestParseCircuitBreaker(t *testing.T) {
 	}
 }
 
+// 嵌入缓存：没写这一段就不开；写了要有地址，过期时长默认 24 小时。
+func TestParseEmbeddingCache(t *testing.T) {
+	c, err := parseMap(t, base())
+	if err != nil || c.EmbeddingCache() != nil {
+		t.Fatalf("without embedding_cache: %+v, %v; want off", c.EmbeddingCache(), err)
+	}
+	file := filepath.ToSlash(writeFile(t, testRedisURL+"\n"))
+	ok := []struct {
+		section map[string]any
+		want    EmbeddingCache
+	}{
+		{map[string]any{"url_env": "REDIS_URL"}, EmbeddingCache{testRedisURL, 24 * time.Hour}},
+		{map[string]any{"url_env": "REDIS_URL", "ttl_ms": 0}, EmbeddingCache{testRedisURL, 24 * time.Hour}},
+		{map[string]any{"url_file": file, "ttl_ms": 5000}, EmbeddingCache{testRedisURL, 5 * time.Second}},
+	}
+	for _, tc := range ok {
+		m := base()
+		m["embedding_cache"] = tc.section
+		c, err := parseMap(t, m)
+		if err != nil || c.EmbeddingCache() == nil || *c.EmbeddingCache() != tc.want {
+			t.Fatalf("%v: got %+v, %v", tc.section, c.EmbeddingCache(), err)
+		}
+	}
+	bad := []map[string]any{
+		{},
+		{"ttl_ms": 1000},
+		{"url_env": "REDIS_URL", "url_file": file},
+		{"url_env": "NOT_SET"},
+		{"url_env": "REDIS_URL", "ttl_ms": -1},
+		{"url_env": "REDIS_URL", "max_body": 1},
+	}
+	for _, section := range bad {
+		m := base()
+		m["embedding_cache"] = section
+		_, err := parseMap(t, m)
+		if err == nil || strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("%v: err = %v, want an error without the URL", section, err)
+		}
+	}
+}
+
 func TestValidRate(t *testing.T) {
 	for n, want := range map[int64]bool{-1: false, 0: true, 1: true, MaxRate: true, MaxRate + 1: false} {
 		if ValidRate(n) != want {
@@ -516,6 +557,10 @@ func TestDeployConfigs(t *testing.T) {
 		if up := chat.Upstream; up.RPM != tc.rpm || up.TPM != tc.tpm {
 			t.Fatalf("%s: upstream limits = %d, %d; want %d, %d", tc.file, up.RPM, up.TPM, tc.rpm, tc.tpm)
 		}
+		// 开了缓存 QS 看得见变化（CACHED、命中时正文里的 id 是原来那次的），给 QS 用的配置都不开
+		if c.EmbeddingCache() != nil {
+			t.Fatalf("%s: the embedding cache must stay off", tc.file)
+		}
 	}
 }
 
@@ -600,5 +645,27 @@ func TestFailoverDemoConfig(t *testing.T) {
 	// 拨号失败在 Docker Desktop 上要等名字查不到（约 4 秒），chat 的超时要留出换上游之后的时间；回收的上界不变
 	if c.Breaker() != (Breaker{5, 5 * time.Second}) || c.Timeout(Chat) != 10*time.Second || c.ReclaimAfter() != 36*time.Second {
 		t.Fatalf("breaker %+v, chat timeout %v, reclaim after %v", c.Breaker(), c.Timeout(Chat), c.ReclaimAfter())
+	}
+}
+
+// 嵌入缓存的演示配置：两个上游、各一个嵌入别名；缓存的地址取自 QF_REDIS_CACHE_URL，条目 5 秒过期。
+func TestCacheDemoConfig(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "config.cache.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.ReplaceAll(string(data), "/run/secrets/app_dsn", filepath.ToSlash(writeFile(t, testDSN+"\n")))
+	const cacheURL = "redis://qf-redis-cache:6379/0"
+	c, err := parse([]byte(s), env(map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL, "QF_REDIS_CACHE_URL": cacheURL}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ec := c.EmbeddingCache(); ec == nil || *ec != (EmbeddingCache{cacheURL, 5 * time.Second}) {
+		t.Fatalf("embedding cache = %+v", ec)
+	}
+	a, b := only(t, c.Model(Embeddings, "cache-emb")), only(t, c.Model(Embeddings, "cache-emb-b"))
+	if a.Upstream.Name != "fake-a" || b.Upstream.Name != "fake-b" || a.UpstreamModel != "fake-embed" || b.UpstreamModel != "fake-embed" ||
+		b.Upstream.URL(Embeddings) != "http://qf-fake-upstream-b:8081/v1/embeddings" {
+		t.Fatalf("targets = %+v, %+v", a, b)
 	}
 }

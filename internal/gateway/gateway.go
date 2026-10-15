@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -35,7 +36,8 @@ func WithRequestID(h http.Handler) http.Handler {
 // Ledger 是网关用到的账本操作：生产里是 *ledger.Store。不存在或已吊销的 Key，KeyByHash 返回 nil, nil；
 // 额度不够时 Reserve 返回 ledger.ErrQuotaExhausted，带幂等键时还可能返回要重放的快照或幂等的几种拒绝。
 // MarkSent 落发送意图；Reroute 是换上游时的改道（调用不再是 IN_FLIGHT 时返回 ledger.ErrNotInFlight）；
-// Call 给调用状态查询用，不存在或不属于这个账户时返回 nil, nil。其它错误都当成账本不可用。
+// Call 给调用状态查询用，不存在或不属于这个账户时返回 nil, nil。RecordCached 记一次嵌入缓存命中。
+// 其它错误都当成账本不可用。
 type Ledger interface {
 	KeyByHash(ctx context.Context, hash string) (*ledger.Key, error)
 	Reserve(ctx context.Context, r ledger.Reservation) (*ledger.Replay, error)
@@ -43,6 +45,7 @@ type Ledger interface {
 	Reroute(ctx context.Context, r ledger.Reservation, upstream, upstreamModel string) error
 	Finish(ctx context.Context, r ledger.Reservation, res ledger.Result) error
 	Call(ctx context.Context, accountID int64, id string) (*ledger.CallInfo, error)
+	RecordCached(ctx context.Context, c ledger.CachedCall) error
 }
 
 type gateway struct {
@@ -54,17 +57,29 @@ type gateway struct {
 	log            *slog.Logger
 	tel            telemetry.Telemetry
 	quotaExhausted *apiError // 带上按配置算好的 Retry-After
+
+	cache    Cache          // 嵌入缓存；没开时为 nil
+	cacheTTL time.Duration  // 缓存条目的过期时长（写入时再乘以抖动）
+	jitter   func() float64 // 返回 [0, 1) 里的一个数；测试换成固定的
+	flights  *flights
 }
 
-// New 返回两个转发接口和调用状态查询的路由。外面要套 WithRequestID。
-func New(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger, tel telemetry.Telemetry) http.Handler {
-	return newGateway(cfg, l, lim, log, tel).routes()
+// New 返回两个转发接口和调用状态查询的路由。外面要套 WithRequestID。cache 为 nil 时不查缓存（配置里没开）。
+func New(cfg *config.Config, l Ledger, lim Limiter, cache Cache, log *slog.Logger, tel telemetry.Telemetry) http.Handler {
+	g := newGateway(cfg, l, lim, log, tel)
+	g.cache = cache
+	return g.routes()
 }
 
-// newGateway 建好网关；测试在 routes 之前换掉熔断的时钟、选目标的随机源或上游的 Transport。
+// newGateway 建好网关，不带缓存；测试在 routes 之前换掉熔断的时钟、选目标的随机源、上游的 Transport，或者装上缓存。
 func newGateway(cfg *config.Config, l Ledger, lim Limiter, log *slog.Logger, tel telemetry.Telemetry) *gateway {
-	return &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), router: newRouter(cfg, tel.Metrics),
-		log: log, tel: tel, quotaExhausted: errQuotaExhausted.withRetryAfter(retryAfterSeconds(cfg))}
+	g := &gateway{cfg: cfg, ledger: l, limiter: lim, client: newUpstreamClient(), router: newRouter(cfg, tel.Metrics),
+		log: log, tel: tel, quotaExhausted: errQuotaExhausted.withRetryAfter(retryAfterSeconds(cfg)),
+		jitter: mathrand.Float64, flights: newFlights(tel.Metrics.CacheWaiting)}
+	if ec := cfg.EmbeddingCache(); ec != nil {
+		g.cacheTTL = ec.TTL
+	}
+	return g
 }
 
 func (g *gateway) routes() http.Handler {
@@ -82,14 +97,15 @@ const (
 	lookupRoute     = "/v1/calls/{id}"
 )
 
-// endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、校验幂等键、选目标、估算（prepare）→ 准入（限流）→ 预留 → 落发送意图
-// → 转发（拨号失败时换上游）→ 收尾 → 写回（deliver）→ 修正限流的 TPM 桶 → 记录（日志、指标、根 span）。
-// 鉴权之后才建根 span（见 startTrace），之后的每一步都挂在它下面。
+// endpoint 是一次调用的全部步骤：鉴权 → 解析、检查模型、校验幂等键、选目标、估算（prepare）→ 准入（限流）→ 查嵌入缓存
+// → 预留 → 落发送意图 → 转发（拨号失败时换上游）→ 收尾 → 写嵌入缓存 → 写回（deliver）→ 修正限流的 TPM 桶
+// → 记录（日志、指标、根 span）。鉴权之后才建根 span（见 startTrace），之后的每一步都挂在它下面。
 // 收尾在写回之前：客户端拿到响应时，账本已经记好了。流式做不到（事件边读边写），改成流结束之后才收尾：
-// 客户端收到 [DONE] 时收尾还没做，读完上游的流才做，从不在流结束之前做。带幂等键、可以重放时，预留这一步直接给出原来的响应。
+// 客户端收到 [DONE] 时收尾还没做，读完上游的流才做，从不在流结束之前做。带幂等键、可以重放时，预留这一步直接给出原来的响应；
+// 嵌入缓存命中时不预留，记一条 CACHED、给出缓存里的响应。
 // 请求发出之后不再看客户端：断开了也等上游回答或超时（流式是读完上游的流），照常收尾（有界结算），只是不写回。
-// 修正在 defer 里，覆盖准入之后的每个出口；它在 handler 返回之前执行，所以响应要等它做完才发完（通常约 1 毫秒，
-// 最多 config.RateLimitTimeout）。
+// 写缓存在写回之前（客户端在响应开头多等这一次，见 storeCache）；修正在写回之后、handler 返回之前，所以响应要等它做完
+// 才发完（通常约 1 毫秒，最多 config.RateLimitTimeout）。修正在 defer 里，覆盖准入之后的每个出口。
 func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c := &call{
@@ -105,41 +121,60 @@ func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 		ctx := g.startTrace(r, c, route, e)
 		defer g.adjust(ctx, c) // 先于 record 执行：日志里要有修正的错误，根 span 要包住修正
 		defer g.router.release(c)
-
-		var rq request
-		if e == nil {
-			rq, e = g.prepare(w, r, c)
-		}
-		if e == nil {
-			e = g.admit(ctx, c)
-		}
-		var replay *ledger.Replay
-		if e == nil {
-			replay, e = g.reserve(ctx, c)
-		}
+		defer g.leaveFlight(c) // 只兜住出错和 panic 的出口：正常的路径在写回之前就已经离开了合并的表
 		if e != nil {
 			writeError(w, c, e)
 			return
 		}
-		if replay != nil {
-			c.replayOf = replay.CallID
-			w.Header().Set("x-request-id", replay.CallID)
-			w.Header().Set("Idempotent-Replayed", "true")
-			writeResponse(w, c, &replay.Response)
-			return
-		}
+		g.serve(ctx, w, r, c)
+	}
+}
+
+// serve 是鉴权之后的步骤：哪一步失败就写回它的错误；嵌入缓存命中、幂等重放、正常调用各自写回。
+func (g *gateway) serve(ctx context.Context, w http.ResponseWriter, r *http.Request, c *call) {
+	rq, e := g.prepare(w, r, c)
+	if e == nil {
+		e = g.admit(ctx, c)
+	}
+	var hit *cacheEntry
+	if e == nil {
+		hit, e = g.lookupCache(ctx, c, rq)
+	}
+	if s := cacheStatus[c.cache]; s != "" {
+		w.Header().Set("Cache-Status", s)
+	}
+	var replay *ledger.Replay
+	if e == nil && hit == nil {
+		replay, e = g.reserve(ctx, c)
+	}
+	switch {
+	case e != nil:
+		writeError(w, c, e)
+	case hit != nil:
+		g.serveCached(ctx, w, c, hit)
+	case replay != nil:
+		c.replayOf = replay.CallID
+		w.Header().Set("x-request-id", replay.CallID)
+		w.Header().Set("Idempotent-Replayed", "true")
+		writeResponse(w, c, &replay.Response)
+	default:
 		g.deliver(ctx, w, c, rq)
 	}
 }
 
-// deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写回。客户端已经断开就不写回，状态码留 0。
+// deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写嵌入缓存、写回。客户端已经断开就不写回，状态码留 0。
 // 流式已经写了响应头的，在 send 里写完了，这里只记错误码。
+// 合并只包住大家共享的几步（读缓存、回源、收尾、写缓存）：领头的在写回自己的客户端之前就离开合并的表，
+// 它的客户端读得慢（服务器没有全局的写期限），也不会让跟随的一直等。
 func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, rq request) {
 	res, e, finish := g.send(ctx, w, c, rq)
 	c.outcome, c.evidence = outcome(c, res, e)
 	if finish {
 		g.finish(ctx, c, res, e)
+		g.shareCache(c, rq, res)
 	}
+	g.storeCache(ctx, c)
+	g.leaveFlight(c)
 	switch {
 	case c.streamed:
 		if e != nil {

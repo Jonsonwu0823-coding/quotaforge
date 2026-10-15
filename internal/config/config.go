@@ -27,6 +27,10 @@ const LedgerTimeout = 2 * time.Second
 // RateLimitTimeout 是每次限流操作（准入、修正）的上限，等连接池也算在内。超了准入就是 503。
 const RateLimitTimeout = 500 * time.Millisecond
 
+// CacheTimeout 是每次读、写嵌入缓存的上限，等连接池和拨号也算在内。超了就当作没命中（读）或者不写了（写）：
+// 缓存只省钱，慢了不如直接回源。
+const CacheTimeout = 100 * time.Millisecond
+
 // MaxRate 是限流限额（每分钟的请求数或 token 数）的上限。0 表示不限。
 const MaxRate = 1_000_000_000_000
 
@@ -45,6 +49,8 @@ const (
 	defaultBreakerCooldown = 30 * time.Second
 	// MaxWeight 是目标权重的上限：几个目标的权重加起来也远在 int 之内。
 	MaxWeight = 1000
+	// 嵌入缓存条目的默认过期时长。
+	defaultCacheTTL = 24 * time.Hour
 )
 
 type Upstream struct {
@@ -81,6 +87,12 @@ type Breaker struct {
 	Cooldown time.Duration
 }
 
+// EmbeddingCache 是嵌入缓存的设置：缓存用的 Redis 地址（可能有密码，不能写进日志和报错）和条目的过期时长。
+type EmbeddingCache struct {
+	URL string
+	TTL time.Duration
+}
+
 type Config struct {
 	timeouts  map[Purpose]time.Duration
 	upstreams []*Upstream
@@ -88,6 +100,7 @@ type Config struct {
 	breaker   Breaker
 	dsn       string
 	redisURL  string
+	cache     *EmbeddingCache
 }
 
 type modelKey struct {
@@ -109,6 +122,9 @@ func (c *Config) DatabaseDSN() string { return c.dsn }
 
 // RedisURL 是限流用的 Redis 地址（redis://[:密码@]主机:端口/库号）。可能有密码，不能写进日志和报错。
 func (c *Config) RedisURL() string { return c.redisURL }
+
+// EmbeddingCache 是嵌入缓存的设置；配置里没有 embedding_cache 这一段时是 nil，不查缓存。
+func (c *Config) EmbeddingCache() *EmbeddingCache { return c.cache }
 
 // Timeout 是某个用途下调上游的超时。
 func (c *Config) Timeout(p Purpose) time.Duration { return c.timeouts[p] }
@@ -139,10 +155,18 @@ type fileConfig struct {
 		DSNEnv  string `json:"dsn_env"`
 		DSNFile string `json:"dsn_file"`
 	} `json:"database"`
-	Redis struct {
-		URLEnv  string `json:"url_env"`
-		URLFile string `json:"url_file"`
-	} `json:"redis"`
+	Redis          fileRedis           `json:"redis"`
+	EmbeddingCache *fileEmbeddingCache `json:"embedding_cache"` // 指针：分清“没写”（不开缓存）和“写了 {}”（报错）
+}
+
+type fileRedis struct {
+	URLEnv  string `json:"url_env"`
+	URLFile string `json:"url_file"`
+}
+
+type fileEmbeddingCache struct {
+	fileRedis
+	TTLMS int64 `json:"ttl_ms"`
 }
 
 type fileUpstream struct {
@@ -208,6 +232,29 @@ func parse(data []byte, getenv func(string) string) (*Config, error) {
 	}
 	if c.redisURL, err = Secret("url_env", "url_file", f.Redis.URLEnv, f.Redis.URLFile, getenv); err != nil {
 		return nil, fmt.Errorf("redis: %w", err)
+	}
+	if c.cache, err = embeddingCache(f.EmbeddingCache, getenv); err != nil {
+		return nil, fmt.Errorf("embedding_cache: %w", err)
+	}
+	return c, nil
+}
+
+// embeddingCache 取嵌入缓存的设置：没写这一段是 nil；写了就要有地址（url_env、url_file 二选一），
+// ttl_ms 为 0（不写）取默认值，负数报错。
+func embeddingCache(f *fileEmbeddingCache, getenv func(string) string) (*EmbeddingCache, error) {
+	if f == nil {
+		return nil, nil
+	}
+	url, err := Secret("url_env", "url_file", f.URLEnv, f.URLFile, getenv)
+	if err != nil {
+		return nil, err
+	}
+	c := &EmbeddingCache{URL: url, TTL: defaultCacheTTL}
+	switch {
+	case f.TTLMS < 0:
+		return nil, errors.New("ttl_ms must not be negative")
+	case f.TTLMS > 0:
+		c.TTL = time.Duration(f.TTLMS) * time.Millisecond
 	}
 	return c, nil
 }

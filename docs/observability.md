@@ -23,11 +23,14 @@ QF 有三个出口：每次调用一行 JSON 日志（一直有）、OpenTelemet
 POST /v1/chat/completions      SERVER  整个请求，起点是请求进来的时间（和日志的 duration_ms 同一个总耗时）
 ├── authenticate               INTERNAL  按 Key 的哈希查账本
 ├── admit                      INTERNAL  Redis 准入（有限流桶时）
+├── cache_lookup               INTERNAL  嵌入缓存：读缓存，或者等同时在进行的相同请求（开了缓存的嵌入请求）
+├── record_cached              INTERNAL  缓存命中：账本里记一条 CACHED（命中时到此为止，没有下面的几步）
 ├── reserve                    INTERNAL  账本预留（带幂等键时可能直接给出重放）
 ├── mark_sent                  INTERNAL  落发送意图
 ├── upstream                   CLIENT    发请求到读完正文（流式：整个流，含写给客户端的时间）；每次尝试一个
 ├── (admit, reroute, upstream) 换上游时：新上游的准入、账本改道、发给新上游（见下面的“多个上游和熔断”）
 ├── finish                     INTERNAL  账本收尾
+├── cache_store                INTERNAL  嵌入缓存：结算了的响应写进缓存（没命中、可以缓存时）
 └── adjust                     INTERNAL  修正 TPM 桶（有 TPM 桶时）
 
 GET /v1/calls/{id}             SERVER  调用状态查询
@@ -39,11 +42,11 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | span | 属性 |
 |---|---|
-| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游，字符串数组）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有） |
+| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游，字符串数组）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有）、`qf.cache`（开了缓存的嵌入请求：`hit`、`coalesced`、`miss`、`bypass`、`error`）、`qf.cached_from`（缓存命中时原来那次的调用号） |
 | `upstream` | `qf.upstream`、`http.request.method`、`http.response.status_code`（上游的） |
 | 出错的子 span | `error.type` |
 
-**出错**：一步失败时它的 span 标成 Error，描述和 `error.type` 都是错误码；收尾、修正失败不改变响应，也照样标。根 span 只有 5xx 标成 Error（HTTP 服务端 span 的惯例），错误码照记。底层错误的原文（驱动、Redis、网络的错误文字，可能带地址）只进日志的 `ledger_error`、`rate_limiter_error`，不进 span，所以 QF 不用 `RecordError`，span 上没有 event。
+**出错**：一步失败时它的 span 标成 Error，描述和 `error.type` 都是错误码；收尾、修正失败不改变响应，也照样标。根 span 只有 5xx 标成 Error（HTTP 服务端 span 的惯例），错误码照记。底层错误的原文（驱动、Redis、网络的错误文字，可能带地址）只进日志的 `ledger_error`、`rate_limiter_error`、`cache_error`，不进 span，所以 QF 不用 `RecordError`，span 上没有 event。
 
 ### 接 traceparent、采样
 
@@ -89,13 +92,16 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_upstream_circuit_state` | gauge | `upstream` | 这个实例里上游的熔断状态：0 关、1 半开（探测在飞）、2 开。启动时每个配置的上游都是 0 |
 | `qf_upstream_failovers_total` | counter | `endpoint`、`upstream` | 换上游的次数；`upstream` 是换走的那个（拨号失败、确定没收到请求） |
 | `qf_upstream_circuit_rejections_total` | counter | `endpoint` | 所有目标的上游都熔断着、快速失败的请求（502 `upstream_unavailable`） |
-| `qf_calls_total` | counter | `endpoint`、`outcome` | 预留过的调用按网关的判定：`settled`、`cancelled`、`usage_unknown` |
+| `qf_calls_total` | counter | `endpoint`、`outcome` | 账本里有的调用按网关的判定：预留过的 `settled`、`cancelled`、`usage_unknown`，嵌入缓存命中的 `cached` |
 | `qf_usage_tokens_total` | counter | `endpoint`、`upstream`、`type`（prompt、completion、total） | 只计结算的调用；用量未知的不计成 0，数在 `qf_calls_total{outcome="usage_unknown"}` 里 |
 | `qf_streams_total` | counter | `result`（`ok`、`upstream_error`、`upstream_timeout`、`upstream_invalid_response`）、`client`（`connected`、`disconnected`、`write_timeout`） | 上游回了 2xx 的流式调用，按流怎么结束、客户端有没有读完 |
 | `qf_stream_first_event_seconds` | histogram | `endpoint` | 流式：从调用开始到收到上游第一个事件 |
 | `qf_idempotent_replays_total` | counter | `endpoint` | 重放。幂等的几种拒绝看 `qf_requests_total` 的 `code` |
 | `qf_rate_limited_total` | counter | `layer`（key、account、upstream）、`metric`（rpm、tpm） | 限流拒绝 |
-| `qf_dependency_errors_total` | counter | `dependency`（ledger、rate_limiter）、`operation` | 账本、Redis 操作失败，含不改变响应的收尾、修正失败 |
+| `qf_dependency_errors_total` | counter | `dependency`（ledger、rate_limiter）、`operation` | 账本、限流的 Redis 操作失败，含不改变响应的收尾、修正失败。嵌入缓存的错误不计在这里（请求照常回源，见下面的[嵌入缓存](#嵌入缓存)） |
+| `qf_embedding_cache_lookups_total` | counter | `result`（hit、coalesced、miss、bypass、error） | 开了缓存的嵌入请求按查缓存的结果，取值同日志的 `cache` |
+| `qf_embedding_cache_writes_total` | counter | `result`（ok、error） | 结算了的响应写进缓存 |
+| `qf_embedding_cache_waiting` | gauge | — | 这个实例里正在等同时在进行的相同请求的嵌入请求数 |
 | `qf_background_reclaimed_total` | counter | `result`（released、marked_unknown） | 后台回收 |
 | `qf_background_purged_total` | counter | — | 清理掉的过期幂等记录 |
 | `qf_background_errors_total` | counter | `task`（reclaim、purge、unknown_scan） | 后台出错（清理到点停下不算） |
@@ -166,6 +172,15 @@ MSYS_NO_PATHCONV=1 docker run --rm -v ./deploy/prometheus:/etc/prometheus:ro --e
 - **指标**：`qf_upstream_requests_total` 每次尝试计一次；`qf_upstream_circuit_state` 按实例和上游看熔断；`qf_upstream_failovers_total`、`qf_upstream_circuit_rejections_total`。标签只取配置里的上游名和两个接口名，配置定了就不会再多。
 - **SLO**：快速失败的错误码是 `upstream_unavailable`，和连不上上游一样，不进 QF 的可用性。
 - 熔断每个实例各记各的，两个实例的 `qf_upstream_circuit_state` 可以短时间不同（见[两个实例](scaling.md#两个实例)）。
+
+## 嵌入缓存
+
+开了[嵌入缓存](api.md#嵌入缓存)时：
+
+- **日志**：嵌入请求的调用行多一个 `cache`：`hit`（读缓存命中）、`coalesced`（拿到了同时在进行的相同请求的结果）、`miss`（自己回源）、`bypass`（带幂等键或者请求体规范化不了，不走缓存）、`error`（读缓存出错或条目坏了，照常回源）。命中的（`hit`、`coalesced`）还有 `cached_from`（原来那次的调用号），`call_status`、`outcome` 都是 `CACHED`，没有 `usage`、`reserved_tokens`。读、写缓存出错时有 `cache_error`（错误原文，可能带缓存的主机和端口，不带 URL 和密码）；写出错的请求 `cache` 仍是它查缓存的结果。
+- **span**：`cache_lookup`、`record_cached`、`cache_store`（见上面的树），读、写出错时标成 Error，`error.type` 是 `cache_unavailable`；根 span 有 `qf.cache`、`qf.cached_from`。
+- **错误率**：缓存坏了请求照常回源，不是 QF 的失败，所以不计进 `qf_dependency_errors_total`，也不触发 `QFDependencyUnavailable`；它只让回源变多（花钱）。看 `sum(rate(qf_embedding_cache_lookups_total{result="error"}[5m])) / sum(rate(qf_embedding_cache_lookups_total{result!="bypass"}[5m]))` 和 `qf_embedding_cache_writes_total{result="error"}`，命中率是 `result` 为 `hit`、`coalesced` 的比例。
+- **合并**：`qf_embedding_cache_waiting` 是现在正在等的请求数；`coalesced` 的多少说明并发的相同请求有多少被合并掉。
 
 ## 演示环境
 

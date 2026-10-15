@@ -10,10 +10,11 @@ import (
 	"strings"
 )
 
-// usageColumns 是用量导出的表头，每次调用一行。重放的行 replay_of 是原来的调用号，usage 三列为空（没调上游）。
+// usageColumns 是用量导出的表头，每次调用一行。重放的行 replay_of 是原来的调用号，嵌入缓存命中的行 cached_from 是原来的调用号，
+// 这两种的 usage 三列为空（没调上游）。新列只加在最后：按列号读的脚本不受影响。
 var usageColumns = []string{
 	"time", "request_id", "client_request_id", "run_id", "endpoint", "model_alias", "upstream_model",
-	"status", "error_code", "prompt_tokens", "completion_tokens", "total_tokens", "duration_ms", "replay_of",
+	"status", "error_code", "prompt_tokens", "completion_tokens", "total_tokens", "duration_ms", "replay_of", "cached_from",
 }
 
 // callLine 是 logCall 写出的一行里导出要用的字段。
@@ -31,6 +32,7 @@ type callLine struct {
 	Usage           json.RawMessage `json:"usage"`
 	DurationMS      int64           `json:"duration_ms"`
 	ReplayOf        string          `json:"replay_of"`
+	CachedFrom      string          `json:"cached_from"`
 }
 
 var errNotCall = errors.New("not a call line")
@@ -93,7 +95,7 @@ func usageRow(line []byte) ([]string, error) {
 	}
 	return []string{
 		l.Time, l.RequestID, l.ClientRequestID, l.RunID, l.Endpoint, l.ModelAlias, l.UpstreamModel,
-		status, l.ErrorCode, prompt, completion, total, strconv.FormatInt(l.DurationMS, 10), l.ReplayOf,
+		status, l.ErrorCode, prompt, completion, total, strconv.FormatInt(l.DurationMS, 10), l.ReplayOf, l.CachedFrom,
 	}, nil
 }
 

@@ -54,6 +54,8 @@ var (
 
 	// 客户端已经断开：不写响应，只在日志里记下。
 	errClientCanceled = &apiError{code: "client_canceled"}
+	// 嵌入缓存读写出错：只记在 span 上，不返回给客户端（缓存出错时请求照常回源）。
+	errCacheUnavailable = &apiError{code: "cache_unavailable"}
 )
 
 // fromUpstreamStatus 把上游的非 2xx 状态映射成错误；2xx 返回 nil。

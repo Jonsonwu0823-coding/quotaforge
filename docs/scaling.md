@@ -12,8 +12,9 @@ curl -sS http://127.0.0.1:8081/healthz   # quotaforge-b
 docker compose -f compose.yaml -f compose.two.yaml down -v
 ```
 
-- **共享什么**：两个实例是同一个镜像、同一份配置、同一个 `app_dsn`，共用 `qf-mysql`（额度、账本、幂等记录）和 `qf-redis`（限流的桶）。除了上游的熔断，进程里没有会让两个实例结果不一致的状态：每个请求都查库鉴权，没有 Key 和额度的本地缓存；限流只在 Redis 的脚本里算，时间只取 Redis 的 `TIME`。
-- **熔断每个实例各记各的**（见[多个上游](operations.md#多个上游)）：它只决定“这个实例试不试某个上游”，不碰额度和账本，结局仍由账本的条件更新保证。两个实例可以短时间不一致：上游刚挂时，一个实例已经打开、另一个还在一个个试；上游恢复后，各自过了冷却、各自探测一次才关上。请求一个接一个来时，每个实例最多多试 `failure_threshold` 次、多等一个冷却，之后就收敛；并发时多试的次数可以更多（见[多个上游](operations.md#多个上游)的“熔断”）。不放进 Redis：Redis 只做限流，放进去要多一个职责，Redis 不可用时还得另定熔断怎么办；放进 MySQL 则每个请求多一次查询。指标 `qf_upstream_circuit_state` 按实例看（Prometheus 的 `instance` 标签）。
+- **共享什么**：两个实例是同一个镜像、同一份配置、同一个 `app_dsn`，共用 `qf-mysql`（额度、账本、幂等记录）和 `qf-redis`（限流的桶）；开了[嵌入缓存](api.md#嵌入缓存)时也共用缓存的 Redis（`qf-redis-cache`），一个实例写进去的，另一个实例也能命中。除了上游的熔断和嵌入缓存的合并，进程里没有会让两个实例结果不一致的状态：每个请求都查库鉴权，没有 Key 和额度的本地缓存；限流只在 Redis 的脚本里算，时间只取 Redis 的 `TIME`。
+- **嵌入缓存的合并只在实例内**：同一个实例里同时到的相同嵌入请求只回源一次，跨实例的不合并，两个实例同时没命中、第一个请求成功时各回源一次（最多两次）。不在 Redis 里加锁做跨实例合并：要多一套锁的过期和持有者挂掉之后的处理，省下的只是并发时多出的一次回源。缓存不影响额度和账本：命中只写一条 `CACHED`、不动额度，两个实例各自写的 `CACHED` 都由账本的不变量检查（`qfctl verify`）。
+- **熔断每个实例各记各的**（见[多个上游](operations.md#多个上游)）：它只决定“这个实例试不试某个上游”，不碰额度和账本，结局仍由账本的条件更新保证。两个实例可以短时间不一致：上游刚挂时，一个实例已经打开、另一个还在一个个试；上游恢复后，各自过了冷却、各自探测一次才关上。请求一个接一个来时，每个实例最多多试 `failure_threshold` 次、多等一个冷却，之后就收敛；并发时多试的次数可以更多（见[多个上游](operations.md#多个上游)的“熔断”）。不放进 Redis：限流的 Redis 只做限流，放进去要多一个职责，Redis 不可用时还得另定熔断怎么办；放进 MySQL 则每个请求多一次查询。指标 `qf_upstream_circuit_state` 按实例看（Prometheus 的 `instance` 标签）。
 - **写法**：`quotaforge-b` 用 `extends` 引用 `compose.yaml` 里的 `quotaforge`，安全设置、依赖（迁移成功、Redis 健康）、secret、`stop_grace_period` 只写一份；去掉 `build`（用同一个镜像）、换掉端口（`!override`，只发布 `127.0.0.1:8081`）。`extends` 要写明 `file: compose.yaml`：它只看那个文件，不看合并之后的项目。要 Compose v2.24 以上（`!reset`、`!override`）。
 - **不接 `qs-qf`**：QS 的两个覆盖文件只改 `quotaforge`，`quotaforge-b` 只在 Compose 的默认网络上。叠上 `compose.qs-e2e.yaml`（只给端到端联调用，见[接 QueryShield](queryshield.md)）时才接进 `qs-qf`，带网络别名 `quotaforge`。
 - **没有负载均衡器**：测试和压测工具自己轮流发给两个实例。负载均衡器会多一层超时、断开和请求体上限的行为，这里要证明的是两个进程共享状态时的正确性。

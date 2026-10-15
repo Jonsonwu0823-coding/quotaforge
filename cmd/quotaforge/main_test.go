@@ -220,6 +220,38 @@ func ledgerConfig(t *testing.T, dsn string) *config.Config {
 	return cfg
 }
 
+// 配置没开嵌入缓存时，交给网关的是值为 nil 的接口（不查缓存）；开了就连它的 Redis（不立即拨号），地址不对时报错不带地址。
+func TestOpenCache(t *testing.T) {
+	cache, closeCache, err := openCache(ledgerConfig(t, "unused"))
+	if err != nil || cache != nil {
+		t.Fatalf("without embedding_cache: %v, %v", cache, err)
+	}
+	closeCache()
+	load := func(url string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
+			"models":[{"alias":"m","purpose":"embeddings","targets":[{"upstream":"u","upstream_model":"m","weight":1}]}],
+			"database":{"dsn_env":"K"},"redis":{"url_env":"K"},"embedding_cache":{"url_env":"C"}}`
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(path, func(k string) string { return map[string]string{"K": "k", "C": url}[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	cache, closeCache, err = openCache(load("redis://127.0.0.1:1/0"))
+	if err != nil || cache == nil {
+		t.Fatalf("with embedding_cache: %v, %v", cache, err)
+	}
+	closeCache()
+	if _, _, err := openCache(load("redis://:password@[::1")); err == nil || strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "::1") {
+		t.Fatalf("bad URL: %v", err)
+	}
+}
+
 // 启动时数据库的版本和程序要求的不一致（或连不上），QF 拒绝启动，报错里说明原因、不带连接串。
 func TestOpenLedgerChecksSchema(t *testing.T) {
 	store, err := openLedger(context.Background(), ledgerConfig(t, dbtest.AppDSN(t)))
@@ -299,8 +331,8 @@ func runCommand(t *testing.T, name, stdin string) (code int, stdout, stderr stri
 func TestUsageExportCommand(t *testing.T) {
 	const call = `{"time":"t","level":"INFO","msg":"call","request_id":"qf-1","endpoint":"chat","status":200,"usage":"unknown","duration_ms":3}`
 	const listening = `{"time":"t","level":"INFO","msg":"listening","addr":"0.0.0.0:8080"}`
-	const header = "time,request_id,client_request_id,run_id,endpoint,model_alias,upstream_model,status,error_code,prompt_tokens,completion_tokens,total_tokens,duration_ms,replay_of\n"
-	const row = "t,qf-1,,,chat,,,200,,unknown,unknown,unknown,3,\n"
+	const header = "time,request_id,client_request_id,run_id,endpoint,model_alias,upstream_model,status,error_code,prompt_tokens,completion_tokens,total_tokens,duration_ms,replay_of,cached_from\n"
+	const row = "t,qf-1,,,chat,,,200,,unknown,unknown,unknown,3,,\n"
 	cases := []struct {
 		name, stdin, stderr string
 		code                int

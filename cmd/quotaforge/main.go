@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/embcache"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/gateway"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ratelimit"
@@ -77,6 +78,20 @@ func openLedger(ctx context.Context, cfg *config.Config) (*ledger.Store, error) 
 		return nil, err
 	}
 	return store, nil
+}
+
+// openCache 在配置开了嵌入缓存时连它的 Redis（不立即拨号：它不可用只算没命中，恢复后不用重启）。没开时返回 nil：
+// 是值为 nil 的接口，不是装着 nil 指针的接口，网关据此不查缓存。
+func openCache(cfg *config.Config) (gateway.Cache, func(), error) {
+	ec := cfg.EmbeddingCache()
+	if ec == nil {
+		return nil, func() {}, nil
+	}
+	c, err := embcache.Open(ec.URL, "qf:emb:")
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, func() { c.Close() }, nil
 }
 
 // listenAddr 是服务监听的地址，健康检查也按它去连。
@@ -150,6 +165,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer limiter.Close()
+	cache, closeCache, err := openCache(cfg)
+	if err != nil {
+		slog.Error("embedding cache", "err", err)
+		os.Exit(1)
+	}
+	defer closeCache()
 
 	ln, err := net.Listen("tcp", listenAddr())
 	if err != nil {
@@ -180,7 +201,7 @@ func main() {
 		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, logger, metrics)
 	}()
 	slog.Info("listening", "addr", ln.Addr().String())
-	err = run(ctx, ln, newServer(newHandler(gateway.New(cfg, store, limiter, logger, tel))), cfg.ShutdownTimeout())
+	err = run(ctx, ln, newServer(newHandler(gateway.New(cfg, store, limiter, cache, logger, tel))), cfg.ShutdownTimeout())
 	stop()
 	<-done
 	if ferr := flushSpans(); ferr != nil {

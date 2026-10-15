@@ -611,6 +611,8 @@ func TestReadCallLog(t *testing.T) {
 		``,
 		`{"msg":"call","request_id":"` + c + `","outcome":"CANCELLED","call_status":"RESERVED"}`,
 		`{"msg":"call","request_id":"` + u + `","outcome":"USAGE_UNKNOWN","usage":"unknown"}`,
+		// 缓存命中：写入时就已结清、从没发给上游，不是任何调用的证据，跳过
+		`{"msg":"call","request_id":"` + "qf-" + rand.Text() + `","outcome":"CACHED","call_status":"CACHED","cache":"hit"}`,
 	}, "\n")
 	proofs, unknown, err := ReadCallLog(strings.NewReader(good))
 	if err != nil || unknown != 1 || len(proofs) != 2 {

@@ -122,6 +122,9 @@ QF 调上游用 Go 默认的 HTTP 客户端，会读 `HTTP_PROXY`、`HTTPS_PROXY
 | `database.dsn_file` | 从这个文件读连接串（容器里是 secret `/run/secrets/app_dsn`）。和 `dsn_env` 正好写一个 |
 | `redis.url_env` | 限流用的 Redis 地址（`redis://[:密码@]主机:端口/库号`）所在的环境变量名。必填：没有任何限流限额时请求不会用到 Redis，但这一节不能缺 |
 | `redis.url_file` | 从这个文件读 Redis 地址。和 `url_env` 正好写一个。地址可能带密码，按机密处理：不进日志和报错 |
+| `embedding_cache` | 可选。写了就开[嵌入缓存](#嵌入缓存)，对所有嵌入别名生效；不写就完全不查缓存 |
+| `embedding_cache.url_env`、`embedding_cache.url_file` | 缓存用的 Redis 地址，规则和 `redis.url_env`、`redis.url_file` 一样，正好写一个。不要和限流用同一个 Redis（见[嵌入缓存](#嵌入缓存)） |
+| `embedding_cache.ttl_ms` | 缓存条目的过期时长，毫秒；写入时再乘以 0.9 到 1.1 之间的随机数。不写或 0 用默认 86400000（24 小时） |
 
 base URL 只接受 http 和 https，必须有主机名，不能带账号密码、查询串和片段。
 
@@ -187,6 +190,32 @@ scripts/compose-failover.sh   # Compose 项目名 qf-failover，叠加 compose.f
 - 恢复：起回 `fake-b`，冷却过后的一个请求是探测，去 `fake-b`，熔断关上。
 - 不换：`docker compose pause` 掉 `fake-b`（它照样完成 TCP 握手、收下请求）。5 个并发请求都在 10 秒后 504 `upstream_timeout`、用量未知、账本的上游是 `fake-b`，不换到 `fake-a`；5 次超时打开熔断，之后的请求直接去 `fake-a`。取消暂停、冷却过后探测成功，又回到按权重分流。
 - 演示配置的 chat 超时是 10 秒、冷却 5 秒。Docker Desktop 上停着的容器名约 4 秒才查不到，换上游的请求也就慢这么多；脚本只看结局，不看用时。8080 被占（例如别的 QF 项目在跑）就不跑。
+
+## 嵌入缓存
+
+配置里写了 `embedding_cache` 就开（行为见[接口](api.md#嵌入缓存)）：
+
+```json
+"embedding_cache": {"url_env": "QF_REDIS_CACHE_URL", "ttl_ms": 86400000}
+```
+
+- **单独的 Redis**：缓存要有内存上限、满了要淘汰；限流的 `qf-redis` 不能这样用。淘汰会删掉限流的桶，而桶不在就当满桶（见[限流](rate-limiting.md)），会多放请求；改成只淘汰带过期时间的键也不行，桶也带过期时间。所以缓存放在另一个 Redis：`maxmemory`（演示里 64 MB）加 `allkeys-lru`，不持久化（丢了只是多回源几次）。两个实例共用这一个。
+- **QF 启动时不连它**：它不可用只算没命中，请求照常回源，恢复后不用重启 QF（每次读写最多 0.1 秒，拨号也限在 0.1 秒、只试一次）。Docker Desktop 上停着的容器名约 4 秒才查不到，缓存起回来之后可能要等这么久才重新命中。
+- **别名的几个目标应当是同一个模型**：缓存按“上游、上游模型名、请求体”精确匹配，不会把一个模型的向量给另一个模型；但同一个别名的几个目标如果是不同的模型，向量本来就不在同一个空间里，按权重分到不同的目标，结果就不能互相比较（不论开不开缓存）。
+- **清空或恢复数据库时，同时清空缓存的 Redis**（例如 `docker compose restart qf-redis-cache`：它不持久化）。缓存的键按账户编号隔离，账户编号会从 1 重新开始，旧条目可能落到新的同号账户上；`CACHED` 记的原来那次的调用也不在了（`qfctl verify` 会报 `cached`）。
+- 指标和日志见[可观测](observability.md#嵌入缓存)。
+
+演示（bash，Linux 和 CI 用；约 1 分钟，构建镜像另算）：
+
+```bash
+# 在项目根目录下运行
+scripts/compose-cache.sh   # Compose 项目名 qf-cache，叠加 compose.cache.yaml
+```
+
+- 同一个请求发两次：第二次是 `CACHED`、`Cache-Status: quotaforge; hit`，正文逐字节相同，假上游只收到一次，已消费只算一次；另一个账户发同样的请求不命中；带 `Idempotency-Key` 的不走缓存（第二次是重放）；额度用完的账户照样命中。
+- 并发：暂停第二个假上游，8 个相同的请求一起发，等到 `qf_embedding_cache_waiting` 是 7 再取消暂停：上游只收到 1 个，其余 7 个 `collapsed`、各记一条 `CACHED`。
+- 停掉 `qf-redis-cache`：请求照样 200，日志记 `cache: error`；起回来之后不重启 QF 就又能写、能命中。演示配置的条目 5 秒过期：读出的剩余时间符合 5 秒 ±10%，过期之后再发会重新回源。
+- 最后核对日志一个调用一行、没有 Key 和正文，缓存的键只有账户号和哈希，`qfctl verify` 通过。
 
 ## qfctl
 

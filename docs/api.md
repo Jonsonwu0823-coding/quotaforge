@@ -5,7 +5,7 @@
 | 方法与路径 | 作用 |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI 兼容的聊天转发；`stream: true` 时按 SSE 逐个转发上游的事件（见[流式](#流式)） |
-| `POST /v1/embeddings` | OpenAI 兼容的嵌入转发 |
+| `POST /v1/embeddings` | OpenAI 兼容的嵌入转发；配置开了缓存时，相同的请求可以命中缓存（见[嵌入缓存](#嵌入缓存)） |
 | `GET /v1/calls/{id}` | 调用状态查询：按 QF 的调用号查这次调用的结局（见[调用状态查询](ledger.md#调用状态回收和对账未知用量)） |
 | `GET /healthz` | 存活检查，不需要鉴权，不查数据库 |
 
@@ -14,7 +14,7 @@
 - 发给上游的请求头只有 `Authorization`（上游的 Key）、`Content-Type`、`Accept`（`application/json`，流式时是 `text/event-stream`）和 `X-Client-Request-Id`。最后这个的值是这次调用的 QF 调用号：上游超时、拿不到上游的请求号时，凭它向上游查这次调用、要按调用的账单（OpenAI 的 API 文档里这个头就是这个用途：调用方自己设、每个请求一个值、ASCII、不超过 512 个字符）。客户端发来的 `X-Client-Request-Id`、`X-Run-Id` 只记录，不转发。
 - QF 读请求体顶层的 `model`、`stream`、`max_tokens` 三个字段，流式时还有 `stream_options`（见[流式](#流式)）。它们重复出现，或者有大小写、Unicode 折叠变体（`MODEL`、`Max_Tokens`、`ſtream`），一律 400 `invalid_request`：有的上游解析键名不区分大小写，QF 和上游必须读到同一个值。`max_tokens` 必须是 0 到 2³¹−1 的整数（`1.5`、`1e3`、`"8"` 都是 400），`null` 当作没写。
 - 每个响应都带 `x-request-id`（QF 的调用号，也是账本里调用的编号）。错误体是 OpenAI 格式：`{"error":{"message":…,"type":…,"param":null,"code":…}}`。
-- 每次调用写一行 JSON 日志到标准输出：调用号、Key 编号（数据库里的数字 id）、账户、别名、上游、写回客户端的状态（`status`；客户端已断开、什么都没写回时没有）、上游的状态、耗时、错误码、`X-Client-Request-Id`、`X-Run-Id`、上游的请求号和模型名、用量（拿不到就是 `"unknown"`）、`call_status`（账本里实际记下的调用状态）、`outcome`（网关自己判定的结局，和账本写没写成功无关，见[上游结果怎么收尾](ledger.md#调用状态回收和对账未知用量)；只有预留成功的调用有）、`reserved_tokens`（预留量）、`ledger_error`（账本操作失败的原因）、`failover_from`（换过上游时才有：之前试过、确定没收到请求的上游）、`circuit_open`（所有目标的上游都熔断着、快速失败时才有）、`client_disconnected`（写回之前客户端已经断开；流式是流结束之前）、`stream`（流式的调用才有，值是 `true`）、`first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`write_timeout`（流式：客户端不读，写一个事件超过了期限，同时有 `client_disconnected`）、`idempotency_key`（请求带的幂等键，和客户端头同一条规则记）、`replay_of`（重放时是原来的调用号）、`rate_limited_by`（被限流时是哪个桶，例如 `key/rpm`）、`rate_limiter_error`（准入或修正时 Redis 的错误原文，不含 URL）、`invalid_reason`（400 `invalid_request` 的原因，取值固定，见[日志关联](observability.md#日志关联)）、`trace_id` 和 `span_id`（开着追踪、这次调用被采样时才有：所在的 trace 和根 span）、`parent_span_id`（同样的条件下，请求带了合法的 `traceparent` 时才有：其中的 parent-id，即客户端那一次请求的 span id）。不记 Key、密码、连接串和正文。
+- 每次调用写一行 JSON 日志到标准输出：调用号、Key 编号（数据库里的数字 id）、账户、别名、上游、写回客户端的状态（`status`；客户端已断开、什么都没写回时没有）、上游的状态、耗时、错误码、`X-Client-Request-Id`、`X-Run-Id`、上游的请求号和模型名、用量（拿不到就是 `"unknown"`）、`call_status`（账本里实际记下的调用状态）、`outcome`（网关自己判定的结局，和账本写没写成功无关，见[上游结果怎么收尾](ledger.md#调用状态回收和对账未知用量)；只有预留成功的调用和缓存命中有，命中的是 `CACHED`）、`reserved_tokens`（预留量，预留过才有）、`cache`、`cached_from`、`cache_error`（开了缓存的嵌入请求才有，见[嵌入缓存](#嵌入缓存)）、`ledger_error`（账本操作失败的原因）、`failover_from`（换过上游时才有：之前试过、确定没收到请求的上游）、`circuit_open`（所有目标的上游都熔断着、快速失败时才有）、`client_disconnected`（写回之前客户端已经断开；流式是流结束之前）、`stream`（流式的调用才有，值是 `true`）、`first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`write_timeout`（流式：客户端不读，写一个事件超过了期限，同时有 `client_disconnected`）、`idempotency_key`（请求带的幂等键，和客户端头同一条规则记）、`replay_of`（重放时是原来的调用号）、`rate_limited_by`（被限流时是哪个桶，例如 `key/rpm`）、`rate_limiter_error`（准入或修正时 Redis 的错误原文，不含 URL）、`invalid_reason`（400 `invalid_request` 的原因，取值固定，见[日志关联](observability.md#日志关联)）、`trace_id` 和 `span_id`（开着追踪、这次调用被采样时才有：所在的 trace 和根 span）、`parent_span_id`（同样的条件下，请求带了合法的 `traceparent` 时才有：其中的 parent-id，即客户端那一次请求的 span id）。不记 Key、密码、连接串和正文。
 - 调用状态查询每次写一行 `msg: "lookup"`（调用号、Key 编号、账户、被查的调用号、状态码、错误码、耗时），不是 `msg: "call"`：不算一次模型调用，用量导出和对账都不读它。
 
 ### 额度和限流的错误
@@ -23,7 +23,7 @@
 |---|---|---|---|
 | 429 | `quota_exhausted` | 账户的可用额度不够这次预留。立即返回，不排队。`type` 是 `insufficient_quota` | 不调 |
 | 429 | `rate_limited` | 被限流：Key、账户或上游的某个令牌桶不够（见[限流](rate-limiting.md)）。立即返回，不排队。`type` 是 `rate_limit_error`，带 `Retry-After` | 不调 |
-| 503 | `ledger_unavailable` | 账本数据库不可用或超时（查 Key、预留、发送意图，每次操作 2 秒），或者发送意图没落成（调用已被回收）。拒绝，不放行 | 不调 |
+| 503 | `ledger_unavailable` | 账本数据库不可用或超时（查 Key、预留、发送意图、记缓存命中，每次操作 2 秒），或者发送意图没落成（调用已被回收）。拒绝，不放行 | 不调 |
 | 503 | `rate_limiter_unavailable` | 限流用的 Redis 不可用或超时（每次操作 0.5 秒）。只影响要检查令牌桶的请求。拒绝，不放行；`type` 是 `server_error`，不带 `Retry-After` | 不调 |
 | 502 | `upstream_unavailable` | 这个别名所有目标的上游都熔断着（见[多个上游](operations.md#多个上游)）。立即返回，在准入和预留之前，账本里没有这次调用；`type` 是 `upstream_error`，不带 `Retry-After`。和“连不上上游”是同一个错误码，日志有 `circuit_open: true` | 不调 |
 
@@ -105,6 +105,24 @@ curl.exe -sS -i http://127.0.0.1:8080/v1/embeddings -H "Authorization: Bearer $k
 ```
 
 （`utf8NoBOM` 需要 PowerShell 7；Windows PowerShell 5.1 用 `[IO.File]::WriteAllText("$PWD\chat.json", '…')`。）
+
+## 嵌入缓存
+
+配置里有 `embedding_cache` 这一段时（见[嵌入缓存](operations.md#嵌入缓存)），`POST /v1/embeddings` 的相同请求可以直接用之前结算过的响应，不再调上游、不扣额度。没有这一段时什么都不查，和没有这个功能时一样。聊天不缓存。
+
+- **什么算相同**：同一个账户，发给同一个上游、同一个上游模型名、规范化之后相同的请求体（规范化和[幂等](#幂等idempotency-key)的请求指纹是同一条规则：键的顺序、空白、转义的写法不影响）。别名不算：两个别名指向同一个目标，可以互相命中。缓存的键是“账户号:SHA-256”，没有明文。
+- **什么时候查**：鉴权、请求体和模型检查、选目标、准入（[限流](rate-limiting.md)）之后，预留之前。所有目标都熔断着的 502 在更前面，不拿缓存兜底。
+- **不走缓存**：带 `Idempotency-Key` 的请求不读也不写缓存（重试拿到同一个结果由幂等管，重放的 `x-request-id` 是原来的调用号）；请求体规范化不了的（非法 UTF-8、孤立的代理项转义）照常转发。日志记 `cache: bypass`，响应不带 `Cache-Status`。
+- **命中时**：不预留、不调上游、额度不动，额度用完的账户也照样命中（和重放一样）。账本里记一条 `CACHED` 的调用（预留量 0，用量照抄原来那次，`cached_from` 是原来那次的调用号，见[调用状态](ledger.md#调用状态回收和对账未知用量)）；这一条写不进去时返回 503 `ledger_unavailable`（不带 `Cache-Status`），不给缓存里的正文：QF 返回的 `x-request-id` 都要在账本里查得到。
+  - 状态码、`Content-Type`、正文逐字节照原来那次。所以正文里的 `id`、`model` 是原来那次上游给的，和这次的 `x-request-id`（这次 `CACHED` 调用自己的号）不同。
+  - 限流：照样占 1 个 RPM；TPM 先按估算扣，结束时全部退回（和重放一样）。
+- **响应头 `Cache-Status`**（RFC 9211）：`quotaforge; hit` 是从缓存读到的；`quotaforge; fwd=miss; collapsed` 是和同时在进行的相同请求合并、拿到了它的结果（见下面的“并发”），也是 `CACHED`；`quotaforge; fwd=miss` 是这次去了上游（没命中、缓存出错，或者合并的那一个没拿到结果）。不走缓存的、写 `CACHED` 失败的 503 不带这个头。
+- **什么会被缓存**：结算了的（账本里是 `SETTLED`）、上游回 200、正文不超过 1 MiB 的响应。错误、用量未知、收尾没写成的都不缓存。条目在配置的过期时长（默认 24 小时）乘以 0.9 到 1.1 之间的随机数之后过期：同一批写进去的不会同时过期，不会一起回源（雪崩）。
+- **一致性**：上游悄悄换掉同一个模型名背后的模型时，旧的向量最多再用一个过期时长。要马上换，就换一个上游模型名，或者清掉缓存。
+- **并发**（防击穿）：同一个实例里同时到的相同请求，只有第一个去读缓存、回源，其余的等它。它结算成功，其余的都当命中（`collapsed`），各记一条 `CACHED`；它没成功（上游出错、超时、收尾失败，或者换了上游、回答它的是另一个目标），其余的各自照常回源，不共享它的失败。等的时候客户端断开就不再等，不留账本记录。两个实例各自合并，第一个请求成功时，跨实例同一个请求最多各回源一次。
+  - **最坏的延迟**：等的请求不另设上限：它只等第一个请求读缓存、回源、收尾、写缓存这几步，每一步都有上限；第一个请求结算之后（成功或失败）就不再让别人等，和它自己的客户端读得快慢无关。最坏是“等它超时（默认约 25 秒，加上几次账本操作），再自己回源一次、也等到超时”，大约是平时的两倍。只在上游慢到超时、又正好有并发的相同请求时出现；连续失败让这个上游的熔断打开之后，请求立即得到 502，就不会再出现。
+- **多花的时间**：读缓存、写缓存各最多 0.1 秒（`config.CacheTimeout`），通常约 1 毫秒。命中：读一次缓存，加上一次账本写入。没命中：读一次缓存；结算之后先写缓存，再写回（客户端在响应开头多等这一次，总时长不变）。
+- **缓存出错**（缓存的 Redis 停了、超时、条目坏了）：当作没命中，照常回源，不是 503。只有 Redis 出错（停了、超时）的，结算后也不写，所以缓存坏着时每个请求最多多等一次读（0.1 秒）；条目坏了的照常回源，结算后用新的条目覆盖它。原因记在日志的 `cache_error`。
 
 ## 幂等（Idempotency-Key）
 

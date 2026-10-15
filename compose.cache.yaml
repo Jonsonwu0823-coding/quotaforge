@@ -1,0 +1,31 @@
+# 嵌入缓存的演示环境，叠加在 compose.yaml 之上（见 docs/operations.md 的“嵌入缓存”）：
+#   docker compose -f compose.yaml -f compose.cache.yaml up -d --build --wait
+# 缓存放在单独的 qf-redis-cache 里：有内存上限、满了按 LRU 淘汰，不持久化。不和限流共用 qf-redis：淘汰会删掉限流的桶，
+# 而桶不在就当满桶，会多放请求。QF 换成 deploy/config.cache.json（缓存条目 5 秒过期，演示过期用）。
+# 第二个假上游 qf-fake-upstream-b 和 qf-fake-upstream 是同一个镜像：演示并发合并时暂停它，把请求挂在上游。
+# QF 的指标在 9464 上，只在 Compose 的网络里，不发布到宿主机。
+services:
+  quotaforge:
+    environment:
+      QF_REDIS_CACHE_URL: redis://qf-redis-cache:6379/0 # 配置里 embedding_cache.url_env 指向它；只在 Compose 的内部网络上，不设密码
+      QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9464
+    volumes: !override
+      - ./deploy/config.cache.json:/etc/quotaforge/config.json:ro
+    # 不依赖 qf-redis-cache：QF 启动时不连它，它停了只算没命中。
+
+  qf-redis-cache:
+    image: redis:8
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+
+  qf-fake-upstream-b:
+    extends:
+      file: compose.yaml
+      service: qf-fake-upstream
+    build: !reset null # 用 qf-fake-upstream 构建的同一个镜像

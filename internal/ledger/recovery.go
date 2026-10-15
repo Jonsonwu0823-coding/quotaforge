@@ -27,9 +27,11 @@ const (
 	LateResponse Evidence = "late_response" // 调用已被回收标成未知之后，网关自己拿到的结果
 	CallLog      Evidence = "call_log"      // QF 调用日志里确定的结局（账本里的收尾没写成）
 	Bill         Evidence = "bill"          // 导入的上游按调用的账单
+	Cache        Evidence = "cache"         // 嵌入缓存命中：给的是原来那次结算过的响应（cached_from）
 )
 
-// transitions 是允许的状态转换：谁、从哪个状态、到哪些状态。其余一律不允许，SETTLED、CANCELLED 是终态。
+// transitions 是允许的状态转换：谁、从哪个状态、到哪些状态。其余一律不允许，SETTLED、CANCELLED、CACHED 是终态。
+// CACHED 不在表里：它写入时就已结清（RecordCached），没有转换能从它出发或者转到它。
 // RESERVED → IN_FLIGHT（发送意图）只有 MarkSent 一条路，不经过这里。网关换上游时的改道（Reroute）只在 IN_FLIGHT 上
 // 改上游两列、状态不变，也不经过这里；Verify 不读这两列。
 var transitions = map[Actor]map[Status][]Status{
@@ -40,12 +42,12 @@ var transitions = map[Actor]map[Status][]Status{
 
 // resolutions 是结清时合法的证据：谁把调用结清成什么状态，可以凭哪些证据。转换时按它填值，Verify 按它检查。
 var resolutions = map[Actor]map[Status][]Evidence{
-	Gateway:   {Settled: {Answered, LateResponse}, Cancelled: {Answered, NotSent, LateResponse}},
+	Gateway:   {Settled: {Answered, LateResponse}, Cancelled: {Answered, NotSent, LateResponse}, Cached: {Cache}},
 	Reclaim:   {Cancelled: {NotSent}},
 	Reconcile: {Settled: {CallLog, Bill}, Cancelled: {CallLog, Bill}},
 }
 
-func terminal(s Status) bool { return s == Settled || s == Cancelled }
+func terminal(s Status) bool { return s == Settled || s == Cancelled || s == Cached }
 
 // ErrNotAllowed 表示转换表不允许这次转换（包括调用已经结清过）。什么都没改。
 var ErrNotAllowed = errors.New("transition not allowed")

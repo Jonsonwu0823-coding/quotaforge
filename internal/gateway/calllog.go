@@ -36,7 +36,7 @@ type call struct {
 	planned     ledger.Reservation  // prepare 建好的预留（估算见 estimate）；准入的 TPM 花费和预留量都是它的 Amount
 	reservation *ledger.Reservation // 预留成功后才有，指向 planned
 	callStatus  ledger.Status       // 账本里记下的调用状态；收尾失败时还是收尾前的状态
-	outcome     ledger.Status       // 网关自己判定的结局（见 outcome），和账本写没写成功无关；预留成功后才有
+	outcome     ledger.Status       // 网关自己判定的结局（见 outcome），和账本写没写成功无关；账本里有这次调用（预留成功、缓存命中）才有
 	evidence    ledger.Evidence     // 结清时凭的证据
 	ledgerError string              // 账本操作失败的原因（驱动的错误文字，不含连接串）
 
@@ -51,6 +51,11 @@ type call struct {
 	fingerprint     []byte // 请求带了合法的幂等键时才有
 	replayOf        string // 重放时是原来的调用号
 	lookupOf        string // 调用状态查询：被查的调用号，格式合格的才有
+
+	cache      string       // 开了缓存的嵌入请求查缓存的结果（cacheHit 等）；没查时为空
+	cachedFrom string       // 缓存命中时原来那次的调用号
+	cacheError string       // 读、写缓存的错误文字（不含 URL）
+	lookup     *cacheLookup // 查过缓存（没绕过）的请求才有
 
 	status             int  // 写回客户端的 HTTP 状态；什么都没写回（客户端已断开）时是 0
 	clientDisconnected bool // 写回之前（流式：流结束之前）客户端已经断开
@@ -144,7 +149,7 @@ func appendChecked(attrs []slog.Attr, name, v string) []slog.Attr {
 	}
 }
 
-// logCall 每次调用写一行，d 是总耗时。不记 Key、上游 Key、请求体和响应体。重放的请求没调上游，所以没有 usage。
+// logCall 每次调用写一行，d 是总耗时。不记 Key、上游 Key、请求体和响应体。重放和缓存命中的请求没调上游，所以没有 usage。
 func (g *gateway) logCall(c *call, d time.Duration) {
 	attrs := []slog.Attr{
 		slog.String("request_id", c.id),
@@ -181,10 +186,13 @@ func (g *gateway) logCall(c *call, d time.Duration) {
 	if c.upstreamCalled {
 		attrs = append(attrs, usageAttr(c.usage))
 	}
-	if c.reservation != nil {
-		attrs = append(attrs, slog.String("call_status", string(c.callStatus)), slog.String("outcome", string(c.outcome)),
-			slog.Int64("reserved_tokens", c.reservation.Amount()))
+	if c.outcome != "" {
+		attrs = append(attrs, slog.String("call_status", string(c.callStatus)), slog.String("outcome", string(c.outcome)))
 	}
+	if c.reservation != nil {
+		attrs = append(attrs, slog.Int64("reserved_tokens", c.reservation.Amount()))
+	}
+	attrs = cacheLogAttrs(attrs, c)
 	if c.clientDisconnected {
 		attrs = append(attrs, slog.Bool("client_disconnected", true))
 	}
@@ -212,6 +220,21 @@ func routeLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
 	}
 	if c.circuitOpen {
 		attrs = append(attrs, slog.Bool("circuit_open", true))
+	}
+	return attrs
+}
+
+// cacheLogAttrs 是开了缓存的嵌入请求多的字段：cache（查缓存的结果）、cached_from（命中时原来那次的调用号）、
+// cache_error（读、写缓存出错时）。
+func cacheLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
+	if c.cache != "" {
+		attrs = append(attrs, slog.String("cache", c.cache))
+	}
+	if c.cachedFrom != "" {
+		attrs = append(attrs, slog.String("cached_from", c.cachedFrom))
+	}
+	if c.cacheError != "" {
+		attrs = append(attrs, slog.String("cache_error", c.cacheError))
 	}
 	return attrs
 }
@@ -253,6 +276,7 @@ type logProof struct {
 // ReadCallLog 从 QF 的调用日志（每行一个 JSON，docker compose logs --no-log-prefix 的原样输出）里取出证据。
 // 只看预留过的调用（有 outcome 的 msg=call 行）：outcome 是 SETTLED 且 usage 是对象的，凭日志里的用量结算；
 // outcome 是 CANCELLED 的（确定没发出、上游 4xx）释放。outcome 是 USAGE_UNKNOWN 的不算证据，只计数（unknown）。
+// outcome 是 CACHED 的（缓存命中，写入时就已结清、从没发给上游）不是任何调用的证据，跳过。
 // 别的行（启动日志、查询、鉴权失败、重放）跳过。不是 JSON 的行、字段不对的调用行、同一个调用号出现两次，返回 ledger.ErrBadEvidence。
 func ReadCallLog(r io.Reader) (proofs []ledger.Proof, unknown int, err error) {
 	sc := bufio.NewScanner(r)
@@ -274,6 +298,8 @@ func ReadCallLog(r io.Reader) (proofs []ledger.Proof, unknown int, err error) {
 			return nil, 0, fmt.Errorf("%w: line %d: request_id is not a QF call id", ledger.ErrBadEvidence, n)
 		case l.Outcome == ledger.UsageUnknown:
 			unknown++
+			continue
+		case l.Outcome == ledger.Cached:
 			continue
 		case l.Outcome == ledger.Settled:
 			if p.Usage = decodeUsage(l.Usage); p.Usage == nil {

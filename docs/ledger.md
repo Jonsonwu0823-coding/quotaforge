@@ -4,7 +4,7 @@
 
 账本在 MySQL 里，是额度的唯一权威。单位是 token，每个账户一个上限，不按周期重置。
 
-一次请求：鉴权 → 解析 → 模型检查 → 选目标（[多个上游](operations.md#多个上游)）→ **估算** → 准入（[限流](rate-limiting.md)）→ **预留** → **发送意图** → 转发（拨号失败时[换上游](#换上游)）→ **收尾** → 写回 → 修正限流的 TPM 桶（收尾在写回之前，客户端拿到响应时账本已经记好）。
+一次请求：鉴权 → 解析 → 模型检查 → 选目标（[多个上游](operations.md#多个上游)）→ **估算** → 准入（[限流](rate-limiting.md)）→ 查嵌入缓存（开了[嵌入缓存](api.md#嵌入缓存)时，只对嵌入；命中就记一条 `CACHED`、不预留，到此为止）→ **预留** → **发送意图** → 转发（拨号失败时[换上游](#换上游)）→ **收尾** → 写嵌入缓存 → 写回 → 修正限流的 TPM 桶（收尾在写回之前，客户端拿到响应时账本已经记好）。
 
 - **估算**（保守的上界）：
   - 输入 = 转发给上游的请求体字节数（一个 token 一般至少对应一个字节，不用解析消息）。请求体是按第一次选中的目标的上游模型名改写过的（流式还加上 QF 替客户端要的 `include_usage`），所以别名有多个目标时，预留量会随选中的目标差几个字节；换上游时预留量不变，不重新预留，新上游的 TPM 也按这个量扣。结算按实际用量，差的这几个字节不影响已消费；
@@ -13,7 +13,7 @@
 - **预留**（一个事务）：先对额度行做条件更新（`上限 − 已预留 − 已消费 ≥ 预留量` 才扣），再插调用记录（`RESERVED`）和账本的 reserve。不够就回滚、429。不先读后写，不用分布式锁。
 - **发送意图**、**收尾**、回收和对账见下一节[调用状态、回收和对账](#调用状态回收和对账未知用量)。
 - **超用**：实际用量超过预留时如实记账，已消费可以超过上限（余额为负），之后的预留都会被拒。
-- **锁的顺序**：每个改额度的事务（预留、收尾、回收、对账、清理幂等记录）都先锁这个账户的额度行，再按主键动 `calls`、`ledger`、`idempotency_keys`；同一账户的这些事务在额度行上排队，不会互相等成死锁。不锁额度行的写只有发送意图和[换上游](#换上游)时的改道：它们只锁调用这一行，持锁时不等别的锁，构不成等待环。
+- **锁的顺序**：每个改额度的事务（预留、收尾、回收、对账、清理幂等记录）都先锁这个账户的额度行，再按主键动 `calls`、`ledger`、`idempotency_keys`；同一账户的这些事务在额度行上排队，不会互相等成死锁。不锁额度行的写只有发送意图、[换上游](#换上游)时的改道和缓存命中的 `CACHED`：前两个只锁调用这一行，`CACHED` 是一条自动提交的 INSERT（外键检查只对账户和 Key 加共享锁），都不在持锁时等别的锁，构不成等待环。
 - **等锁的上限**：每次账本操作最多 2 秒（`config.LedgerTimeout`，由 context 限住，超了是 503 `ledger_unavailable`）。数据库连接的会话级 `innodb_lock_wait_timeout` 也设成 2 秒（`ledger.Open` 解析连接串时加上，驱动在每个新连接上 `SET`，不用改 secret 文件）：
   - 没有它时，context 到期、驱动关掉连接，数据库那边的语句却还在等锁，要等到默认的 50 秒才放弃；额度行被锁住、并发又高时，等锁的线程越堆越多。有了它，等锁最多 2 秒左右就由数据库自己放弃。测试：另一个连接锁住额度行，预留在数据库时间 2 到 3.5 秒返回 1205；网关返回 503，之后 3 秒内数据库那边没有这个请求的等锁线程。
   - 等锁超时后 MySQL 默认（`innodb_rollback_on_timeout` 关）只回滚那一条语句，事务还开着；QF 的事务出错一律整个回滚，连接回到池里是干净的（context 先到期时，驱动直接关掉连接，不放回池里）。
@@ -26,19 +26,20 @@
 | `budget_reserved` | 额度行的已预留 = 账本里预留变动之和 |
 | `budget_consumed` | 额度行的已消费 = 账本里消费变动之和 |
 | `reserved_not_negative` | 已预留不为负 |
-| `reserve_entry` | 每个调用恰有一条 reserve，变动 = 它的预留量 |
+| `reserve_entry` | 每个调用（`CACHED` 除外）恰有一条 reserve，变动 = 它的预留量 |
 | `settled` | `SETTLED`：有 settle、没有 release，预留变动合计 0，消费变动 = usage 合计 |
 | `cancelled` | `CANCELLED`：有 release、没有 settle，变动合计都是 0 |
 | `open` | `RESERVED`、`IN_FLIGHT`、`USAGE_UNKNOWN`：只有 reserve，继续占着自己的预留 |
-| `sent` | 发送意图的时间 `sent_at`：`RESERVED` 和回收释放的（确定没发出）没有；`IN_FLIGHT`、`USAGE_UNKNOWN`、`SETTLED`，以及凭上游的回答、迟到的结果或由 `reconcile` 结清的都有。迁移前的调用（`created_at` 早于版本 3 的迁移时间）推不出发送的时间，不要求有 |
-| `resolution` | `SETTLED`、`CANCELLED` 的审计三列（谁、凭什么、什么时候）都有，而且是合法的组合（见下一节）；其余状态三列都是空的 |
+| `cached` | `CACHED`（嵌入缓存命中）：没有任何账本行，预留量 0，用量合法，`http_status` 是 200，没有幂等键；`cached_from` 指向同一账户里一个 `SETTLED` 的调用，用量和它相同。别的状态的调用没有 `cached_from`。凭空写一条 `CACHED`、改它的用量、给它补账本行，都会被报出来 |
+| `sent` | 发送意图的时间 `sent_at`：`RESERVED`、`CACHED` 和回收释放的（确定没发出）没有；`IN_FLIGHT`、`USAGE_UNKNOWN`、`SETTLED`，以及凭上游的回答、迟到的结果或由 `reconcile` 结清的都有。迁移前的调用（`created_at` 早于版本 3 的迁移时间）推不出发送的时间，不要求有 |
+| `resolution` | `SETTLED`、`CANCELLED`、`CACHED` 的审计三列（谁、凭什么、什么时候）都有，而且是合法的组合（见下一节）；其余状态三列都是空的 |
 | `idem_call` | 幂等记录指向的调用属于同一个账户，而且那次调用记着的键就是这个键 |
 | `idem_snapshot` | 有快照的记录：调用是 `SETTLED` 或 `USAGE_UNKNOWN`，状态码是 2xx 且等于调用的 `http_status`，正文长度对得上（不超过 8 MiB 的存了正文，超过的只记长度）；结算了的流只记状态码、其余三列都是空的（流式的标记，见[幂等](api.md#幂等idempotency-key)），这种调用必须是 `SETTLED`；没有快照的记录，快照的几列都是空的 |
 | `idem_settled_snapshot` | 指向 `SETTLED` 调用的记录有快照，或者标明正文超过 8 MiB，或者是流式的标记；只有凭证据由 `reconcile` 结算的调用可以没有（QF 没拿到或没存下响应） |
 
 校验在一个只读、可重复读的事务里做，读的是同一个快照，服务运行中也能跑。
 
-**限制**：不按周期重置额度；没有证据的 `USAGE_UNKNOWN` 一直占着预留（见下一节的“真实上游的限制”），没有手工核销；没有 Key 的本地缓存；不按钱计费、不按模型加权。
+**限制**：不按周期重置额度；没有证据的 `USAGE_UNKNOWN` 一直占着预留（见下一节的“真实上游的限制”），没有手工核销；没有 Key 的本地缓存；不按钱计费、不按模型加权。`qfctl usage` 按状态数调用的那几列没有 `CACHED`（列的位置不变，脚本按列号读）：`CACHED` 不占额度，要数它查 `calls` 表或用量导出。
 
 ## 调用状态、回收和对账（未知用量）
 
@@ -51,8 +52,9 @@
 | `SETTLED` | 有可信的用量，按实际用量结算 | 释放预留，已消费加上 usage 的 total |
 | `CANCELLED` | 确定上游没有消费 | 释放预留 |
 | `USAGE_UNKNOWN` | 可能已经被上游执行并计费，用量不知道 | 继续占着预留，不补 0 |
+| `CACHED` | 嵌入缓存命中：给的是原来那次（`cached_from`）结算过的响应，没调上游。写入时就已结清 | 不预留、不动额度；用量照抄原来那次，只作记录 |
 
-**允许的转换**（其余一律不允许，`SETTLED`、`CANCELLED` 是终态；转换表在 `internal/ledger/recovery.go` 里只写一份）：
+**允许的转换**（其余一律不允许，`SETTLED`、`CANCELLED`、`CACHED` 是终态；转换表在 `internal/ledger/recovery.go` 里只写一份。`CACHED` 不在表里：它写入时就已结清，收尾、回收、对账都没有从它出发或者转到它的转换）：
 
 | 从 | 到 | 谁做 | 依据 |
 |---|---|---|---|
@@ -66,7 +68,7 @@
 | `USAGE_UNKNOWN` | `SETTLED` 或 `CANCELLED` | 网关（迟到的结果）或 `qfctl reconcile` | 证据（见下） |
 
 - 每次转换都在一个事务里：先锁账户的额度行，再按主键锁住调用这一行、重新读它现在的状态，按转换表判断，再按主键做带状态条件的更新。多个实例同时回收、回收和收尾或对账同时碰到同一个调用，后拿到锁的看到的已经是新的状态，每个调用只转换一次。账本 `(call_id, kind)` 唯一是最后一道防线。
-- **审计**：结清（变成 `SETTLED` 或 `CANCELLED`）的那一次转换在 `calls` 里写 `resolved_by`（`gateway`、`reclaim`、`reconcile`）、`resolution_evidence`、`resolved_at`。合法的组合：网关结算凭 `response`、`late_response`，网关释放凭 `response`、`not_sent`、`late_response`；回收只释放，凭 `not_sent`；`reconcile` 凭 `call_log`、`bill`。被标成未知是谁做的看 `error_code`：网关记自己返回的错误码，回收记 `reclaimed_in_flight`（回收释放的记 `reclaimed_before_send`）。`finished_at` 仍是网关收尾的时间。
+- **审计**：结清（变成 `SETTLED` 或 `CANCELLED`）的那一次转换在 `calls` 里写 `resolved_by`（`gateway`、`reclaim`、`reconcile`）、`resolution_evidence`、`resolved_at`。合法的组合：网关结算凭 `response`、`late_response`，网关释放凭 `response`、`not_sent`、`late_response`，缓存命中由网关凭 `cache` 记下；回收只释放，凭 `not_sent`；`reconcile` 凭 `call_log`、`bill`。被标成未知是谁做的看 `error_code`：网关记自己返回的错误码，回收记 `reclaimed_in_flight`（回收释放的记 `reclaimed_before_send`）。`finished_at` 仍是网关收尾的时间。
 
 **上游结果怎么收尾**（网关，日志的 `outcome` 就是这一列）：
 
@@ -135,7 +137,7 @@ qf-CDEFGHIJKLMNOPQRSTUVWXYZAB,no,,,
 
 表头固定；`call_id` 是 QF 的调用号（`qf-` 加 26 个 base32 字符）；`yes` 要有非负的 `prompt_tokens`、`total_tokens`（嵌入可以没有 `completion_tokens`，chat 必须有，否则判不一致）；`no` 的三列都空。任何一行不对、同一个调用号出现两次，整份文件都不用。
 
-**日志当证据**：直接读 QF 的日志（`docker compose logs --no-log-prefix quotaforge` 的原样输出，每行一个 JSON），不用改格式。只采用有 `outcome` 的调用行：`SETTLED` 带用量的凭日志里的用量结算，`CANCELLED` 的释放；`USAGE_UNKNOWN` 的不是证据，只计数；别的行（启动、查询、鉴权失败、重放）跳过。
+**日志当证据**：直接读 QF 的日志（`docker compose logs --no-log-prefix quotaforge` 的原样输出，每行一个 JSON），不用改格式。只采用有 `outcome` 的调用行：`SETTLED` 带用量的凭日志里的用量结算，`CANCELLED` 的释放；`USAGE_UNKNOWN` 的不是证据，只计数；别的行（启动、查询、鉴权失败、重放、缓存命中的 `CACHED`）跳过。
 
 **`qfctl reconcile`**：
 
@@ -154,7 +156,7 @@ docker compose run --rm -T --no-deps qfctl reconcile -log - < qf.log
 
 - 证据从 `-bill` 或 `-log` 指定的文件读，`-` 是标准输入（`qfctl` 在容器里跑时用这个）。先把整份证据读完，格式不对就退出 2，不连库。
 - 每条证据一行输出（制表符分隔）：动作、调用号、账户、处理前的状态、证据和原因。动作：预演是 `would-settle`、`would-release`，执行是 `settled`、`released`；两种都可能有 `consistent`、`INCONSISTENT`、`in-progress`、`not-found`、`FAILED`。最后一行是汇总（`dry run: …; nothing was changed`、`applied: …`，或者 `nothing to change: …`）。只有调用号、账户、状态和数字，没有正文和 Key。
-- 只结清 `USAGE_UNKNOWN` 的调用，每个调用一个事务，锁住之后再判断一次；已经是 `SETTLED`、`CANCELLED` 的只比对（和证据一致记 `consistent`，否则 `INCONSISTENT`），不改；还在 `RESERVED`、`IN_FLIGHT` 的跳过（`in-progress`，等回收先处理）；账本里没有的报 `not-found`。同样的证据执行第二遍时都是 `consistent`，什么都不改。
+- 只结清 `USAGE_UNKNOWN` 的调用，每个调用一个事务，锁住之后再判断一次；`CACHED` 的调用从没发给上游，任何证据都对不上它，记 `INCONSISTENT`、不改；已经是 `SETTLED`、`CANCELLED` 的只比对（和证据一致记 `consistent`，否则 `INCONSISTENT`），不改；还在 `RESERVED`、`IN_FLIGHT` 的跳过（`in-progress`，等回收先处理）；账本里没有的报 `not-found`。同样的证据执行第二遍时都是 `consistent`，什么都不改。
 - 按证据结算只写状态、用量和审计列：当时 QF 返回的 `http_status`、`error_code` 和快照保留。
 - **退出码**：0 没有要人看的东西（每一条都是结清、将要结清或一致）；1 有不一致、进行中、账本里没有的，或某个调用的事务失败（其它的照常处理）；2 用法错误、证据文件读不了或格式不对。预演和执行用同一套退出码。
 
@@ -200,7 +202,7 @@ docker compose run --rm -T --no-deps qfctl reconcile -log - < qf.log
 
 ### 数据库和迁移
 
-- MySQL 8.4。表：`accounts`、`budgets`（每个账户一行：上限、已预留、已消费）、`api_keys`（Key 的 SHA-256、前缀、允许的别名、状态）、`calls`（每次预留成功的调用一行，带键的调用记着它的幂等键）、`ledger`（追加式，`(call_id, kind)` 唯一）、`idempotency_keys`（幂等记录和响应快照，见[幂等](api.md#幂等idempotency-key)）、`schema_migrations`。定义在 `internal/ledger/migrations/`，现在的版本是 3。
+- MySQL 8.4。表：`accounts`、`budgets`（每个账户一行：上限、已预留、已消费）、`api_keys`（Key 的 SHA-256、前缀、允许的别名、状态）、`calls`（每次预留成功的调用一行，带键的调用记着它的幂等键）、`ledger`（追加式，`(call_id, kind)` 唯一）、`idempotency_keys`（幂等记录和响应快照，见[幂等](api.md#幂等idempotency-key)）、`schema_migrations`。定义在 `internal/ledger/migrations/`，现在的版本是 5。
 - 迁移只往前，SQL 文件打进程序；版本号是文件名前缀。重复运行什么都不做；两个进程同时迁移时用 MySQL 的命名锁串行（加锁、迁移、释放在同一个连接上）。
 - 权限分开：迁移只由 `qfctl` 用能建表的账号做；QF 服务用只能增删改查的账号。
 - QF 启动时检查数据库的版本，和程序要求的不一致（或者还没迁移、连不上）就拒绝启动，报错里说明原因，不带连接串。
@@ -209,13 +211,18 @@ docker compose run --rm -T --no-deps qfctl reconcile -log - < qf.log
   - 旧的 `SETTLED`、`CANCELLED` 记网关收尾，`resolved_at` 取 `finished_at`，证据按状态和错误码推（上游 4xx 的错误码是 `response`，其余释放是 `not_sent`）；
   - 推不出的 `sent_at` 留空，`verify` 不要求迁移前的调用有它。
 - **升级步骤**：先 `docker compose stop quotaforge`，再 `docker compose up -d --build --wait`（`qfctl` 先迁移，QF 再启动）。原因：旧代码不认识 `IN_FLIGHT`，迁移之后它新建的 `RESERVED` 会直接发出，这些可能已经发出的调用会被新版本的回收当成没发出而释放。脚本每次都从空库起（`down -v`），不受影响。
+- **版本 4** 给 Key 和账户加了限流限额（`rpm_limit`、`tpm_limit`），迁移前的都是 0（不限）。
+- **版本 5** 给嵌入缓存加了 `CACHED` 状态、证据 `cache`（两个 ENUM 都加在末尾）和列 `cached_from`（原来那次的调用号，可为 NULL，不加外键）。只改元数据（`ALGORITHM=INSTANT`，不拷表），已有的行不变。
+  - 不加外键：原来那次的调用不在了（例如数据库清空或者恢复了、缓存的 Redis 还留着），命中照常写入，由 `qfctl verify` 的 `cached` 规则报出来，而不是让命中变成 503。所以清空或恢复数据库时，要同时清空缓存的 Redis（见[嵌入缓存](operations.md#嵌入缓存)）。
+  - **上线顺序**：可以不停服务。先用新版本的 `qfctl migrate`，再逐个把实例换成新版本。正在跑的旧版本照常工作：它不写 `CACHED`，回收只扫 `RESERVED`、`IN_FLIGHT`，版本只在启动时检查；但旧版本在新库上**重启会因为版本不对起不来**，所以迁移之后重启的实例都要换成新版本。新旧混跑时用新版本的 `qfctl`：旧版本的 `verify` 不认识 `CACHED`，会把它报成违规；旧版本的 `reconcile -log` 遇到 `CACHED` 的日志行会拒绝整份日志（偏安全，换新版本再跑）。
 
 ## 用量导出
 
 `quotaforge usage-export` 从标准输入读 QF 的日志，向标准输出写 CSV，每次调用一行。账本（`qfctl usage`、`calls` 表）是额度的权威；导出是按调用核对用的。
 
-- 列：`time, request_id, client_request_id, run_id, endpoint, model_alias, upstream_model, status, error_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, replay_of`。
+- 列：`time, request_id, client_request_id, run_id, endpoint, model_alias, upstream_model, status, error_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, replay_of, cached_from`。新列只加在最后，按列号读的脚本不受影响。
 - 幂等重放的请求也有一行：`replay_of` 是原来的调用号，用量三列为空（没调上游），不算成新的用量；`request_id` 是这次重放自己的号，只出现在日志里（客户端收到的 `x-request-id` 是原来的调用号）。
+- 嵌入缓存命中的请求也有一行：`cached_from` 是原来那次的调用号，用量三列为空（没调上游，不算成新的用量）；`request_id` 是这次 `CACHED` 调用自己的号，也就是客户端收到的 `x-request-id`。
 - 用量三列：
   - 日志里是 `unknown` 的，导出里也是 `unknown`，不会变成 0；
   - 没调上游的留空（包括转发前客户端已断开的）；

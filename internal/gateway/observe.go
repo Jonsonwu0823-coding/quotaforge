@@ -43,6 +43,8 @@ var (
 	attrStream         = attribute.Key("qf.stream")
 	attrFirstEventMS   = attribute.Key("qf.stream.first_event_ms")
 	attrWriteTimeout   = attribute.Key("qf.stream.write_timeout")
+	attrCache          = attribute.Key("qf.cache")
+	attrCachedFrom     = attribute.Key("qf.cached_from")
 )
 
 // startTrace 在鉴权之后建根 span：起点回填成 c.start（和日志的 duration_ms 同一个起点），鉴权的子 span 也按显式的起止时间补上。
@@ -114,8 +116,11 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 	if c.circuitOpen {
 		m.CircuitRejections.WithLabelValues(endpoint).Inc()
 	}
-	if c.reservation != nil {
+	if c.outcome != "" {
 		m.Calls.WithLabelValues(endpoint, strings.ToLower(string(c.outcome))).Inc()
+	}
+	if c.cache != "" {
+		m.CacheLookups.WithLabelValues(c.cache).Inc()
 	}
 	if c.stream && c.upstreamStatus >= 200 && c.upstreamStatus < 300 { // 上游开始了流的调用
 		m.Streams.WithLabelValues(streamResult(c), streamClient(c)).Inc()
@@ -184,10 +189,7 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 	if len(c.failoverFrom) > 0 {
 		attrs = append(attrs, attrFailoverFrom.StringSlice(c.failoverFrom))
 	}
-	if c.reservation != nil {
-		attrs = append(attrs, attrCallStatus.String(string(c.callStatus)), attrOutcome.String(string(c.outcome)),
-			attrReservedTokens.Int64(c.reservation.Amount()))
-	}
+	attrs = ledgerAttrs(attrs, c)
 	if c.replayOf != "" {
 		attrs = append(attrs, attrReplayOf.String(c.replayOf))
 	}
@@ -211,6 +213,23 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 	}
 	if c.writeTimeout {
 		attrs = append(attrs, attrWriteTimeout.Bool(true))
+	}
+	return attrs
+}
+
+// ledgerAttrs 是根 span 上账本和缓存的属性：账本里有这次调用时的状态和结局，预留过的预留量，查过缓存的结果和命中时原来的调用号。
+func ledgerAttrs(attrs []attribute.KeyValue, c *call) []attribute.KeyValue {
+	if c.outcome != "" {
+		attrs = append(attrs, attrCallStatus.String(string(c.callStatus)), attrOutcome.String(string(c.outcome)))
+	}
+	if c.reservation != nil {
+		attrs = append(attrs, attrReservedTokens.Int64(c.reservation.Amount()))
+	}
+	if c.cache != "" {
+		attrs = append(attrs, attrCache.String(c.cache))
+	}
+	if c.cachedFrom != "" {
+		attrs = append(attrs, attrCachedFrom.String(c.cachedFrom))
 	}
 	return attrs
 }

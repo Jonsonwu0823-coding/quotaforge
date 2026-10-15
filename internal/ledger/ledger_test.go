@@ -563,7 +563,7 @@ func TestFinishLocksBudgetFirst(t *testing.T) {
 var unmigrate4 = []string{
 	"ALTER TABLE api_keys DROP COLUMN rpm_limit, DROP COLUMN tpm_limit",
 	"ALTER TABLE accounts DROP COLUMN rpm_limit, DROP COLUMN tpm_limit",
-	"DELETE FROM schema_migrations WHERE version = 4",
+	"DELETE FROM schema_migrations WHERE version >= 4", // 0005 随之重跑：它的列已经在了，跳过
 }
 
 // 迁移 0004：版本 3 的库里已有的 Key 和账户，迁移后限流限额都是 0（不限）；只做了一张表的 ALTER 就中断时，重跑能补完。
@@ -594,7 +594,7 @@ func TestMigration4RateLimits(t *testing.T) {
 			exec(t, admin, "ALTER TABLE api_keys ADD COLUMN rpm_limit BIGINT NOT NULL DEFAULT 0, ADD COLUMN tpm_limit BIGINT NOT NULL DEFAULT 0")
 		}
 		from, to, err := ledger.Migrate(ctx, dsn)
-		if err != nil || from != 3 || to != 4 {
+		if err != nil || from != 3 || to != ledger.SchemaVersion {
 			t.Fatalf("partial=%v: Migrate = %d, %d, %v", partial, from, to, err)
 		}
 		if got := limits(); got != "0|0|0|0" {
