@@ -69,7 +69,20 @@ var eventBuckets = []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600}
 // NewMetrics 建好全部指标。dbStats 是账本连接池的统计（ledger.Store.Stats），每次抓取时读。
 func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 	m := &Metrics{reg: prometheus.NewRegistry()}
-	counter, histogram, gauge := m.counter, m.histogram, m.gauge
+	m.requestMetrics()
+	m.routingMetrics()
+	m.cacheMetrics()
+	m.backgroundMetrics()
+	m.usageEventMetrics()
+	m.TraceErrors = m.counter("qf_trace_export_errors_total", "Errors reported by the tracing SDK, mostly failed span exports.").WithLabelValues()
+	m.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m.registerDBStats(dbStats)
+	return m
+}
+
+// requestMetrics 是每次调用的指标：请求、耗时、上游的尝试、结局、用量、重放、限流、依赖出错、流式。
+func (m *Metrics) requestMetrics() {
+	counter, histogram := m.counter, m.histogram
 	m.Requests = counter("qf_requests_total", "Requests by endpoint, HTTP status written (0: the client was gone) and error code.",
 		"endpoint", "status", "code")
 	m.RequestDuration = histogram("qf_request_duration_seconds", "Total time of a request.", slowBuckets, "endpoint")
@@ -91,77 +104,80 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 		"and the client (connected, disconnected, write_timeout).", "result", "client")
 	m.StreamFirstEvent = histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
 		slowBuckets, "endpoint")
-
-	m.CircuitState = m.gaugeVec("qf_upstream_circuit_state", "Circuit breaker state of an upstream in this instance: 0 closed, 1 half-open (a probe is in flight), 2 open.",
-		"upstream")
-	m.Failovers = counter("qf_upstream_failovers_total", "Calls moved to another target after the upstream could not be connected (the request was not sent to it).",
-		"endpoint", "upstream")
-	m.CircuitRejections = counter("qf_upstream_circuit_rejections_total", "Requests failed fast because the circuits of all their targets were open.",
-		"endpoint")
-
-	m.CacheLookups = counter("qf_embedding_cache_lookups_total", "Embedding requests by how the cache answered: hit, coalesced (shared the "+
-		"result of an identical request in flight), miss, bypass (an Idempotency-Key, or a body that cannot be canonicalized) or error "+
-		"(the cache failed; the request went on to the upstream).", "result")
-	m.CacheWrites = counter("qf_embedding_cache_writes_total", "Settled embedding responses written to the cache: ok or error.", "result")
-	m.CacheWaiting = gauge("qf_embedding_cache_waiting", "Embedding requests in this instance waiting for an identical request in flight.")
-
-	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
-	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()
-	m.BackgroundErrors = counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge, unknown_scan, "+
-		"outbox_purge, usage_forward (QF), or usage_consume (the usage event consumer).", "task")
-	m.BackgroundLastSuccess = gauge("qf_background_last_success_timestamp_seconds", "When the last background round without errors finished.")
-	m.BackgroundInterval = gauge("qf_background_interval_seconds", "Interval between background rounds.")
-	m.UnknownCalls = gauge("qf_unknown_usage_calls", "Calls with unknown usage that still hold their reservation.")
-	m.UnknownOldestAge = gauge("qf_unknown_usage_oldest_age_seconds", "Age of the oldest call with unknown usage; 0 when there is none.")
-
-	m.OutboxUnsent = gauge("qf_usage_outbox_unsent", "Usage events in the outbox not yet sent to the message queue (all instances share the outbox).")
-	m.OutboxOldestAge = gauge("qf_usage_outbox_oldest_age_seconds", "Age of the oldest usage event not yet sent; 0 when there is none.")
-	m.EventsForwarded = counter("qf_usage_events_forwarded_total", "Usage events sent to the message queue and marked sent by this instance.").WithLabelValues()
-	m.EventsConsumed = counter("qf_usage_events_consumed_total", "Usage events taken from the message queue by the consumer: applied to the "+
-		"daily totals, duplicate (the call was counted before), or malformed (skipped).", "result")
-	m.EventDelay = histogram("qf_usage_event_delay_seconds", "Time from resolving a call to adding its event to the daily totals.",
-		eventBuckets).WithLabelValues()
-
-	m.TraceErrors = counter("qf_trace_export_errors_total", "Errors reported by the tracing SDK, mostly failed span exports.").WithLabelValues()
-
-	m.reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	m.registerDBStats(dbStats)
-	return m
 }
 
-// counter、histogram、gaugeVec、gauge 建一个指标并注册。
+// routingMetrics 是熔断和换上游。
+func (m *Metrics) routingMetrics() {
+	m.CircuitState = m.gaugeVec("qf_upstream_circuit_state", "Circuit breaker state of an upstream in this instance: 0 closed, 1 half-open (a probe is in flight), 2 open.",
+		"upstream")
+	m.Failovers = m.counter("qf_upstream_failovers_total", "Calls moved to another target after the upstream could not be connected (the request was not sent to it).",
+		"endpoint", "upstream")
+	m.CircuitRejections = m.counter("qf_upstream_circuit_rejections_total", "Requests failed fast because the circuits of all their targets were open.",
+		"endpoint")
+}
+
+// cacheMetrics 是嵌入缓存。
+func (m *Metrics) cacheMetrics() {
+	m.CacheLookups = m.counter("qf_embedding_cache_lookups_total", "Embedding requests by how the cache answered: hit, coalesced (shared the "+
+		"result of an identical request in flight), miss, bypass (an Idempotency-Key, or a body that cannot be canonicalized) or error "+
+		"(the cache failed; the request went on to the upstream).", "result")
+	m.CacheWrites = m.counter("qf_embedding_cache_writes_total", "Settled embedding responses written to the cache: ok or error.", "result")
+	m.CacheWaiting = m.gauge("qf_embedding_cache_waiting", "Embedding requests in this instance waiting for an identical request in flight.")
+}
+
+// backgroundMetrics 是后台循环：回收、清理、出错、最近一次成功、间隔、未知用量的积压。
+func (m *Metrics) backgroundMetrics() {
+	m.Reclaimed = m.counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
+	m.Purged = m.counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()
+	m.BackgroundErrors = m.counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge, unknown_scan, "+
+		"outbox_purge, usage_forward (QF), or usage_consume (the usage event consumer).", "task")
+	m.BackgroundLastSuccess = m.gauge("qf_background_last_success_timestamp_seconds", "When the last background round without errors finished.")
+	m.BackgroundInterval = m.gauge("qf_background_interval_seconds", "Interval between background rounds.")
+	m.UnknownCalls = m.gauge("qf_unknown_usage_calls", "Calls with unknown usage that still hold their reservation.")
+	m.UnknownOldestAge = m.gauge("qf_unknown_usage_oldest_age_seconds", "Age of the oldest call with unknown usage; 0 when there is none.")
+}
+
+// usageEventMetrics 是用量事件：outbox 的积压、转发（QF 实例）、消费和延迟（消费者进程）。
+func (m *Metrics) usageEventMetrics() {
+	m.OutboxUnsent = m.gauge("qf_usage_outbox_unsent", "Usage events in the outbox not yet sent to the message queue (all instances share the outbox).")
+	m.OutboxOldestAge = m.gauge("qf_usage_outbox_oldest_age_seconds", "Age of the oldest usage event not yet sent; 0 when there is none.")
+	m.EventsForwarded = m.counter("qf_usage_events_forwarded_total", "Usage events sent to the message queue and marked sent by this instance.").WithLabelValues()
+	m.EventsConsumed = m.counter("qf_usage_events_consumed_total", "Usage events taken from the message queue by the consumer: applied to the "+
+		"daily totals, duplicate (the call was counted before), or malformed (skipped).", "result")
+	m.EventDelay = m.histogram("qf_usage_event_delay_seconds", "Time from resolving a call to adding its event to the daily totals.",
+		eventBuckets).WithLabelValues()
+}
+
+// register 注册 c 并返回它。counter、histogram、gaugeVec、gauge 建一个指标并注册。
+func register[C prometheus.Collector](m *Metrics, c C) C {
+	m.reg.MustRegister(c)
+	return c
+}
+
 func (m *Metrics) counter(name, help string, labels ...string) *prometheus.CounterVec {
-	v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
-	m.reg.MustRegister(v)
-	return v
+	return register(m, prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels))
 }
 
 func (m *Metrics) histogram(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
-	v := prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels)
-	m.reg.MustRegister(v)
-	return v
+	return register(m, prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help, Buckets: buckets}, labels))
 }
 
 func (m *Metrics) gaugeVec(name, help string, labels ...string) *prometheus.GaugeVec {
-	v := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
-	m.reg.MustRegister(v)
-	return v
+	return register(m, prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels))
 }
 
 func (m *Metrics) gauge(name, help string) prometheus.Gauge {
-	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help})
-	m.reg.MustRegister(g)
-	return g
+	return register(m, prometheus.NewGauge(prometheus.GaugeOpts{Name: name, Help: help}))
 }
 
 // registerDBStats 导出账本连接池的统计。ledger.Store 不暴露 *sql.DB，所以不用 collectors.NewDBStatsCollector，
 // 每个数一个函数，抓取时读 Stats()。
 func (m *Metrics) registerDBStats(stats func() sql.DBStats) {
 	gauge := func(name, help string, f func(sql.DBStats) float64) {
-		m.reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
+		register(m, prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
 	}
 	counter := func(name, help string, f func(sql.DBStats) float64) {
-		m.reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
+		register(m, prometheus.NewCounterFunc(prometheus.CounterOpts{Name: name, Help: help}, func() float64 { return f(stats()) }))
 	}
 	gauge("qf_db_open_connections", "Open ledger connections.", func(s sql.DBStats) float64 { return float64(s.OpenConnections) })
 	gauge("qf_db_in_use_connections", "Ledger connections in use.", func(s sql.DBStats) float64 { return float64(s.InUse) })

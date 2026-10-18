@@ -76,7 +76,19 @@ func writeEvent(ctx context.Context, tx *sql.Tx, callID string) error {
 // EnableUsageEvents 打开用量事件，只开不关；已经开着就什么都不改（enabled_at 不随重启变）。
 // 先不加锁地读：读到“开”就一直是开的，直接返回，不去排开关行的排他锁（排队时所有实例的结清都排在它后面）。
 // 关着才锁住开关行再看一次，还是关的才记下现在的时间。时间在拿到锁之后的另一条语句里取（见 writeEvent）。
+//
+// 等开关行的排他锁超过会话的上限（1205，2 秒：有结清事务拿着它的共享锁不放）时，在 ctx 的期限里重试，别的错误不重试。
+// 代价：等锁的这段时间，新的结清也排在它后面（每个最多等 2 秒）；只在第一次打开时发生。
 func (s *Store) EnableUsageEvents(ctx context.Context) error {
+	for {
+		err := s.enableUsageEvents(ctx)
+		if !isMySQLError(err, 1205) || ctx.Err() != nil { // ER_LOCK_WAIT_TIMEOUT
+			return err
+		}
+	}
+}
+
+func (s *Store) enableUsageEvents(ctx context.Context) error {
 	var on bool
 	if err := s.db.QueryRowContext(ctx, "SELECT enabled_at IS NOT NULL FROM usage_events WHERE id = 1").Scan(&on); err != nil {
 		return fmt.Errorf("read usage events switch: %w", err)

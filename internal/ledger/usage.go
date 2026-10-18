@@ -3,11 +3,8 @@ package ledger
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"sort"
-
-	"github.com/go-sql-driver/mysql"
 )
 
 // 消费者那一边：按调用号去重、按账户按天汇总（usage_seen、usage_daily），以及拿汇总和账本对账。
@@ -51,8 +48,7 @@ func (s *Store) ApplyUsageEvent(ctx context.Context, e UsageEvent) (bool, error)
 	err := s.inTx(ctx, readCommitted, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO usage_seen (call_id, account_id, day, purpose, consumed_at)
 			VALUES (?, ?, ?, ?, UTC_TIMESTAMP(6))`, e.CallID, e.AccountID, e.Day(), e.Purpose)
-		var me *mysql.MySQLError
-		if errors.As(err, &me) && me.Number == 1062 { // ER_DUP_ENTRY：处理过了
+		if isMySQLError(err, 1062) { // ER_DUP_ENTRY：处理过了
 			applied = false
 			return nil
 		}

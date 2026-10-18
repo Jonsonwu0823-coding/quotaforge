@@ -503,10 +503,10 @@ def jaeger_basics(records, log_rows, services, traces):
 def jaeger_errors(records, traces):
     """第四项：QS 的 ERROR span 只能是这个场景里 QS 报 FAILED 的 run 自己的错误码；每个这样的 run 至少有一个。"""
     failed = {record["trace_id"]: record["error_code"] for record in records if record.get("run_id") and record.get("error_code") in UNKNOWN_RUNS}
-    allowed = set(failed.values())
     errors = [(trace_id, s["attrs"].get("queryshield.error_code")) for trace_id, spans in traces.items() for s in spans
               if s["service"] == "queryshield" and s["error"]]
-    bad = sum(1 for _, code in errors if code not in allowed)
+    # 按 span 所在的 trace 比：不是失败的 run 的 trace，或者码不是那个 run 自己的，都不对（不能只看码在不在所有失败的码里）
+    bad = sum(1 for trace_id, code in errors if trace_id not in failed or failed[trace_id] != code)
     unmarked = sum(1 for trace_id, code in failed.items() if (trace_id, code) not in errors)
     codes = dict(sorted(Counter(str(code) for _, code in errors).items()))
     return [verdict(not bad and not unmarked,

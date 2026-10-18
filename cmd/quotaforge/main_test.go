@@ -163,6 +163,26 @@ func TestRunReturnsShutdownTimeout(t *testing.T) {
 	}
 }
 
+// 退出的顺序：停后台循环，等它真的停下，再等转发停下，最后冲刷 span。后台循环晚一点才停，drain 要等它。
+func TestDrainOrder(t *testing.T) {
+	var steps []string
+	background := make(chan struct{})
+	stop := func() {
+		steps = append(steps, "stop")
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			steps = append(steps, "background stopped")
+			close(background)
+		}()
+	}
+	drain(stop, background,
+		func() { steps = append(steps, "forwarding stopped") },
+		func() error { steps = append(steps, "spans flushed"); return nil })
+	if got, want := strings.Join(steps, ", "), "stop, background stopped, forwarding stopped, spans flushed"; got != want {
+		t.Fatalf("steps = %s, want %s", got, want)
+	}
+}
+
 // 未注册的路径、错误的方法、健康检查：响应都带 x-request-id。
 func TestEveryResponseHasRequestID(t *testing.T) {
 	h := newHandler(http.NotFoundHandler())
@@ -203,16 +223,23 @@ func TestMain(m *testing.M) {
 	dbtest.Main(m)
 }
 
-// ledgerConfig 是连接串取自环境变量 DSN 的最小配置。
-func ledgerConfig(t *testing.T, dsn string) *config.Config {
+// writeConfig 把配置写进测试的临时目录，返回文件的路径。
+func writeConfig(t *testing.T, data string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")
-	data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
-		"models":[{"alias":"m","purpose":"chat","targets":[{"upstream":"u","upstream_model":"m","weight":1}],"default_max_tokens":1}],
-		"database":{"dsn_env":"DSN"},"redis":{"url_env":"K"}}`
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return path
+}
+
+// ledgerConfig 是连接串取自环境变量 DSN 的最小配置。
+func ledgerConfig(t *testing.T, dsn string) *config.Config {
+	t.Helper()
+	data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
+		"models":[{"alias":"m","purpose":"chat","targets":[{"upstream":"u","upstream_model":"m","weight":1}],"default_max_tokens":1}],
+		"database":{"dsn_env":"DSN"},"redis":{"url_env":"K"}}`
+	path := writeConfig(t, data)
 	cfg, err := config.Load(path, func(k string) string { return map[string]string{"K": "k", "DSN": dsn}[k] })
 	if err != nil {
 		t.Fatal(err)
@@ -229,13 +256,10 @@ func TestOpenCache(t *testing.T) {
 	closeCache()
 	load := func(url string) *config.Config {
 		t.Helper()
-		path := filepath.Join(t.TempDir(), "config.json")
 		data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
 			"models":[{"alias":"m","purpose":"embeddings","targets":[{"upstream":"u","upstream_model":"m","weight":1}]}],
 			"database":{"dsn_env":"K"},"redis":{"url_env":"K"},"embedding_cache":{"url_env":"C"}}`
-		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		path := writeConfig(t, data)
 		cfg, err := config.Load(path, func(k string) string { return map[string]string{"K": "k", "C": url}[k] })
 		if err != nil {
 			t.Fatal(err)

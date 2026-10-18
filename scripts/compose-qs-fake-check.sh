@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# 联调覆盖文件 compose.qs-fake.yaml 的连通检查（云端和 CI 用）。QS 的假上游还没进 QS 公开仓库，
-# 这里在外部网络 qs-qf 上起一个临时替身：QF 自己的假上游镜像，网络别名 fake-upstream，端口 8000。
+# 联调覆盖文件 compose.qs-fake.yaml 的连通检查（云端和 CI 用）。只验证 QF 这一侧，不用 QS 的检出：
+# 在外部网络 qs-qf 上起一个临时替身代替 QS 的假上游：QF 自己的假上游镜像，网络别名 fake-upstream，端口 8000。
+# 接 QS 的真假上游跑整套联调的是 compose-qs-e2e.sh。
 # 替身只在本脚本里，不进仓库的 Compose 文件（和 QS 约定：QF 自己的假上游服务不能叫 fake-upstream）。
 # 这不是 QS 端到端，只验证网络、联调配置和覆盖文件是通的，以及账本数据库不在 qs-qf 上。
 # QF Key 由 qfctl 现发，只存在本脚本的临时目录里，不打印。摘要写到 evidence/compose-qs-fake-check-summary.txt。

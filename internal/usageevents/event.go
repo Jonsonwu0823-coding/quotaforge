@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
 
@@ -60,10 +61,14 @@ func Encode(e ledger.UsageEvent) []byte {
 	return b
 }
 
+// maxEventTokens 是事件里每一项用量的上限：远大于任何真实的调用，又让很多条加到汇总的同一行（BIGINT）也不越界
+// （要 920 万条这么大的事件才会越界）。超过的能解码、写库却必然出错，消费者会一直重试它、卡住整个分区，所以算格式不对。
+const maxEventTokens = 1_000_000_000_000
+
 // ErrMalformed 表示消息不是这个版本的合法事件。
 var ErrMalformed = errors.New("malformed usage event")
 
-// Decode 解析并校验一条消息（消息队列是信任边界）：版本、调用号的格式、字段齐全、状态是终态、用量合法、时间是 UTC。
+// Decode 解析并校验一条消息（消息队列是信任边界）：版本、调用号的格式、字段齐全、状态是终态、用量合法且不超过上限、时间是 UTC。
 // 不认识的字段也算格式不对。
 func Decode(b []byte) (ledger.UsageEvent, error) {
 	var w wire
@@ -100,13 +105,14 @@ func invalid(w wire, e ledger.UsageEvent, timeErr error) string {
 		return "call_id"
 	case e.AccountID <= 0 || e.Alias == "" || e.Upstream == "" || e.UpstreamModel == "":
 		return "missing fields"
-	case e.Purpose != "chat" && e.Purpose != "embeddings":
+	case e.Purpose != string(config.Chat) && e.Purpose != string(config.Embeddings):
 		return "purpose"
 	case e.Status != ledger.Settled && e.Status != ledger.Cancelled && e.Status != ledger.Cached:
 		return "status"
 	case timeErr != nil:
 		return "resolved_at"
-	case e.Usage == nil && e.Status != ledger.Cancelled, e.Usage != nil && !e.Usage.Valid(e.Purpose):
+	case e.Usage == nil && e.Status != ledger.Cancelled, e.Usage != nil && !e.Usage.Valid(e.Purpose),
+		e.Usage != nil && max(e.Usage.Prompt, e.Usage.Completion, e.Usage.Total) > maxEventTokens:
 		return "usage"
 	case (e.CachedFrom != "") != (e.Status == ledger.Cached):
 		return "cached_from"

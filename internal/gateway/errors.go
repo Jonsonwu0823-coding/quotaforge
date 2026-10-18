@@ -101,13 +101,14 @@ func writeError(w http.ResponseWriter, c *call, e *apiError) {
 		c.clientDisconnected = true
 		return
 	}
+	limitWrite(w)
 	c.status = e.status
 	var b errorBody
 	b.Error.Message, b.Error.Type, b.Error.Code = e.message, e.typ, e.code
 	if e.retryAfter != "" {
-		w.Header().Set("Retry-After", e.retryAfter)
+		w.Header().Set(headerRetryAfter, e.retryAfter)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.status)
-	_ = json.NewEncoder(w).Encode(b)
+	c.wrote(json.NewEncoder(w).Encode(b))
 }

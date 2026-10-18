@@ -250,9 +250,9 @@ func (s *Store) resolve(ctx context.Context, accountID int64, it *Item) {
 			return err
 		}
 		set, args := "", []any(nil)
-		if u := it.Usage; u != nil {
-			set = "usage_prompt_tokens = ?, usage_completion_tokens = ?, usage_total_tokens = ?"
-			args = []any{u.Prompt, sql.NullInt64{Int64: u.Completion, Valid: u.HasCompletion}, u.Total}
+		if it.Usage != nil {
+			prompt, completion, total := usageColumns(it.Usage)
+			set, args = "usage_prompt_tokens = ?, usage_completion_tokens = ?, usage_total_tokens = ?", []any{prompt, completion, total}
 		}
 		if err := setStatus(ctx, tx, it.CallID, c.status, it.Status, Reconcile, it.Source, set, args...); err != nil {
 			return err

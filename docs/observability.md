@@ -42,7 +42,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | span | 属性 |
 |---|---|
-| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游，字符串数组）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有）、`qf.cache`（开了缓存的嵌入请求：`hit`、`coalesced`、`miss`、`bypass`、`error`）、`qf.cached_from`（缓存命中时原来那次的调用号） |
+| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游。导出成一个字符串，写法是 JSON 数组，例如 `["fake-a"]`）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有）、`qf.cache`（开了缓存的嵌入请求：`hit`、`coalesced`、`miss`、`bypass`、`error`）、`qf.cached_from`（缓存命中时原来那次的调用号） |
 | `upstream` | `qf.upstream`、`http.request.method`、`http.response.status_code`（上游的） |
 | 出错的子 span | `error.type` |
 
@@ -76,7 +76,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 - 400 `invalid_request` 的调用行有 `invalid_reason`，取值固定：`unreadable_body`、`not_object`、`malformed_json`、`trailing_data`、`ambiguous_field`、`model_not_string`、`model_missing`、`stream_not_boolean`、`max_tokens_invalid`、`fingerprint_failed`、`stream_options_invalid`（流式请求的 `stream_options` 不是对象或 null，或者 `include_usage` 不是布尔值或 null）。不写 `encoding/json` 的错误原文：它会带上请求体里的字符。
 - 请求体没发完客户端就断开时，和写回之前断开一样：日志没有 `status`，有 `client_disconnected: true`，错误码 `client_canceled`。请求体超过读整个请求的上限（30 秒，见[运行](operations.md#配置文件)）还没发完的，连接已被服务器断开，也这样记。
 - 调用行的 `upstream` 是这次调用最后发给的上游。换过上游的有 `failover_from`：之前试过、拨号失败（确定没收到请求）的上游，按顺序的数组。所有目标的上游都熔断着、快速失败的有 `circuit_open: true`（这种请求没有预留，没有 `upstream`、`reserved_tokens`、`outcome`）。
-- 流式的调用行有 `stream: true`、`first_event_ms`。流开始之后中途断开的，`status` 是已经写出的 200，加上 `client_disconnected: true`；客户端不读、写超过期限的另有 `write_timeout: true`。流截断时 `error_code` 是补给客户端的错误事件里的那个（`upstream_timeout`、`upstream_error`、`upstream_invalid_response`），流里的内容一律不记。
+- 流式的调用行有 `stream: true`、`first_event_ms`。流开始之后中途断开的，`status` 是已经写出的 200，加上 `client_disconnected: true`；客户端不读、写超过期限的另有 `write_timeout: true`。非流式也一样：写回整个响应超过 5 秒的期限时，`status` 照记，加上 `client_disconnected: true` 和 `write_timeout: true`（收尾在写回之前，账本照常）。流截断时 `error_code` 是补给客户端的错误事件里的那个（`upstream_timeout`、`upstream_error`、`upstream_invalid_response`），流里的内容一律不记。
 
 ## 指标
 
@@ -110,10 +110,10 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_unknown_usage_calls` | gauge | — | 还占着预留的未知用量调用，全部账户 |
 | `qf_unknown_usage_oldest_age_seconds` | gauge | — | 其中最早一条从预留到现在的秒数，没有时为 0 |
 | `qf_usage_outbox_unsent` | gauge | — | [用量事件](ledger.md#用量事件)的 outbox 里还没发出的条数（全部实例共用一张表）。配了用量事件的实例转发每轮更新；没配的实例也导出，值一直是 0 |
-| `qf_usage_outbox_oldest_age_seconds` | gauge | — | 其中最早写入的一条到现在的秒数，没有时为 0 |
-| `qf_usage_events_forwarded_total` | counter | — | 这个实例发到消息队列、标成已发出的事件数 |
-| `qf_usage_events_consumed_total` | counter | `result`（applied、duplicate、malformed） | 消费者进程：写进汇总的、按调用号去重跳过的、格式不对跳过的 |
-| `qf_usage_event_delay_seconds` | histogram | — | 消费者进程：从调用结清到写进汇总 |
+| `qf_usage_outbox_oldest_age_seconds` | gauge | — | 其中最早写入的一条到现在的秒数，没有时为 0。没配用量事件的实例也导出，值一直是 0 |
+| `qf_usage_events_forwarded_total` | counter | — | 这个实例发到消息队列、标成已发出的事件数。没配用量事件的实例也导出，值一直是 0 |
+| `qf_usage_events_consumed_total` | counter | `result`（applied、duplicate、malformed） | 消费者进程：写进汇总的、按调用号去重跳过的、格式不对跳过的。带标签，没计过数就没有序列，QF 实例上没有它 |
+| `qf_usage_event_delay_seconds` | histogram | — | 消费者进程：从调用结清到写进汇总。QF 实例也导出，次数一直是 0 |
 | `qf_trace_export_errors_total` | counter | — | 追踪 SDK 报的错误，主要是导出失败 |
 | `qf_db_*` | gauge、counter | — | 账本连接池：`open`、`in_use`、`idle`、`max_open` 的连接数，等连接的次数和总时长 |
 | `go_*`、`process_*` | — | — | Go 运行时和进程 |
@@ -155,10 +155,12 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | 告警 | 条件 | 持续 | 级别 |
 |---|---|---|---|
-| `QFBackgroundStalled` | 某个实例的后台循环约 10 轮没有成功：`time() − 最近一次成功 > 10 × 间隔`（默认约 90 秒） | 1 分钟 | warning |
+| `QFBackgroundStalled` | 某个实例的后台循环约 10 轮没有成功：`time() − 最近一次成功 > 10 × 间隔`（默认约 90 秒）。只看间隔大于 0 的：用量事件的消费者进程也导出这两个数，都是 0 | 1 分钟 | warning |
 | `QFUnknownUsageUnreconciled` | 有未知用量的调用超过一天没对账（对账要人按上游的账单做：`qfctl unknown`、`qfctl reconcile`） | 10 分钟 | warning |
 | `QFDependencyUnavailable` | 账本或 Redis 持续出错（没有请求时不会出错，也就不告警：没有用户受影响） | 5 分钟 | critical |
 | `QFUsageOutboxBacklog` | 用量事件的 outbox 里最老的一条超过 5 分钟没有发出：`max(qf_usage_outbox_oldest_age_seconds) > 300`（消息队列不可用或转发停了；请求不受影响，只是下游的汇总落后，恢复后自动补发） | 2 分钟 | warning |
+| `QFUsageConsumerStalled` | 用量事件在发、消费者没在取：10 分钟里 `qf_usage_events_forwarded_total` 涨了，`qf_usage_events_consumed_total` 没涨或者根本没有这条序列（消费者停了、没被抓，或者所有分区都卡住了）。没有流量时不报 | 5 分钟 | warning |
+| `QFUsageConsumerFailing` | 消费者持续出错（写库、取消息、提交位点）：`qf_background_errors_total{task="usage_consume"}` 每秒超过 0.1 个（按 5 分钟算）。被一条事件卡住时每隔 1 秒加最多一次账本操作重试一次，至少每秒 1/3 个；几个消费者里只有一个卡住、别的照常取时，上一条不响、这一条响 | 10 分钟 | warning |
 | `QFUpstreamCircuitOpen` | 某个实例里某个上游的熔断 5 分钟里一直没关上：`min_over_time(qf_upstream_circuit_state[5m]) >= 1`（一直开着，或者开和半开交替、探测一直失败） | — | warning |
 
 - `QFUpstreamCircuitOpen` 用 `min_over_time` 而不是 `for`：半开的探测会让状态短暂离开“开”，`for` 会被它打断、重新计时。**没有请求时熔断不会去探测**：上游已经恢复、却没有流量的话，熔断一直开着、告警也一直在；发一个请求就会触发探测，探测成功就关上，5 分钟后告警解除。
@@ -194,7 +196,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v ./deploy/prometheus:/etc/prometheus:ro --e
 
 - **日志**：转发出错时记一行 `msg: "usage_forward"`（`forwarded` 是这一轮已经标记的条数，`error`）；消费者进程的日志行是 `msg: "usage_consumer"`：取消息、写库、提交位点出错（`step`、`error`），或者跳过格式不对的消息（`partition`、`offset`、`error`，不记消息的内容）。都不是 `call`，用量导出和对账读日志时不会把它们当成调用。
 - **指标**：积压看 `qf_usage_outbox_unsent`、`qf_usage_outbox_oldest_age_seconds`（消息队列停了也照样每轮更新）；转发看 `qf_usage_events_forwarded_total` 和 `qf_background_errors_total{task="usage_forward"}`；消费者看 `qf_usage_events_consumed_total`（重复多说明发生过重发或位点回退，汇总不受影响）和 `qf_usage_event_delay_seconds`。消费者进程照 `QUOTAFORGE_METRICS_ADDR` 开自己的指标端口。
-- **告警**：`QFUsageOutboxBacklog`（见上面的运行告警）。
+- **告警**：`QFUsageOutboxBacklog`、`QFUsageConsumerStalled`、`QFUsageConsumerFailing`（见上面的运行告警）。**消费者进程的指标端口也要让 Prometheus 抓**：`QFUsageConsumerStalled` 按症状判断，抓不到消费者时，有流量就会响。仓库里的演示没有同时跑 Prometheus 和消费者，`prometheus.yml` 只抓 QF 的实例。
 - 转发和消费不在请求路径上，没有 span。
 
 ## 演示环境

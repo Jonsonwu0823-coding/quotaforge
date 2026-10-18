@@ -74,9 +74,10 @@ func (g *gateway) lookupCall(ctx context.Context, w http.ResponseWriter, c *call
 	case info == nil:
 		writeError(w, c, errCallNotFound)
 	default:
+		limitWrite(w)
 		c.status = http.StatusOK
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(newCallBody(info))
+		c.wrote(json.NewEncoder(w).Encode(newCallBody(info)))
 	}
 	endStep(span, nil)
 }

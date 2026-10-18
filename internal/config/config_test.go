@@ -15,9 +15,12 @@ func env(m map[string]string) func(string) string { return func(k string) string
 const (
 	testDSN      = "qf_app:dsn-SECRET@tcp(127.0.0.1:3306)/quotaforge"
 	testRedisURL = "redis://:redis-SECRET@127.0.0.1:6379/0"
+	testCacheURL = "redis://127.0.0.1:6380/0" // 缓存用另一个 Redis
 )
 
-var testEnv = env(map[string]string{"UP_KEY": "upstream-secret", "UP_URL": "https://example.test/v1", "DB_DSN": testDSN, "REDIS_URL": testRedisURL})
+var testEnv = env(map[string]string{"UP_KEY": "upstream-secret", "UP_URL": "https://example.test/v1", "DB_DSN": testDSN, "REDIS_URL": testRedisURL,
+	"CACHE_URL": testCacheURL, "SAME_REDIS_OTHER_DB": "redis://127.0.0.1:6379/1", "SAME_REDIS_DEFAULT_PORT": "redis://127.0.0.1/2",
+	"NAMED_REDIS": "redis://qf-redis:6379/0", "NAMED_REDIS_OTHER_CASE": "redis://QF-Redis:6379/1"})
 
 // base 是一份合法配置，各个用例在它上面改一处。
 func base() map[string]any {
@@ -209,14 +212,14 @@ func TestParseEmbeddingCache(t *testing.T) {
 	if err != nil || c.EmbeddingCache() != nil {
 		t.Fatalf("without embedding_cache: %+v, %v; want off", c.EmbeddingCache(), err)
 	}
-	file := filepath.ToSlash(writeFile(t, testRedisURL+"\n"))
+	file := filepath.ToSlash(writeFile(t, testCacheURL+"\n"))
 	ok := []struct {
 		section map[string]any
 		want    EmbeddingCache
 	}{
-		{map[string]any{"url_env": "REDIS_URL"}, EmbeddingCache{testRedisURL, 24 * time.Hour}},
-		{map[string]any{"url_env": "REDIS_URL", "ttl_ms": 0}, EmbeddingCache{testRedisURL, 24 * time.Hour}},
-		{map[string]any{"url_file": file, "ttl_ms": 5000}, EmbeddingCache{testRedisURL, 5 * time.Second}},
+		{map[string]any{"url_env": "CACHE_URL"}, EmbeddingCache{testCacheURL, 24 * time.Hour}},
+		{map[string]any{"url_env": "CACHE_URL", "ttl_ms": 0}, EmbeddingCache{testCacheURL, 24 * time.Hour}},
+		{map[string]any{"url_file": file, "ttl_ms": 5000}, EmbeddingCache{testCacheURL, 5 * time.Second}},
 	}
 	for _, tc := range ok {
 		m := base()
@@ -229,10 +232,13 @@ func TestParseEmbeddingCache(t *testing.T) {
 	bad := []map[string]any{
 		{},
 		{"ttl_ms": 1000},
-		{"url_env": "REDIS_URL", "url_file": file},
+		{"url_env": "CACHE_URL", "url_file": file},
 		{"url_env": "NOT_SET"},
-		{"url_env": "REDIS_URL", "ttl_ms": -1},
-		{"url_env": "REDIS_URL", "max_body": 1},
+		{"url_env": "CACHE_URL", "ttl_ms": -1},
+		{"url_env": "CACHE_URL", "max_body": 1},
+		{"url_env": "REDIS_URL"},
+		{"url_env": "SAME_REDIS_OTHER_DB"},
+		{"url_env": "SAME_REDIS_DEFAULT_PORT"},
 	}
 	for _, section := range bad {
 		m := base()
@@ -309,9 +315,13 @@ func TestParseTimeouts(t *testing.T) {
 	}
 }
 
-// 关闭上限要容得下一个请求最坏的情况：4 次账本操作（查 Key、预留、发送意图、收尾）、2 次限流操作（准入、修正），
-// 再加较大的上游超时。默认配置测一次；上游超时没有上限，再用 24 小时测一次（两边都随它变，差值和它无关）。
-// 把 RateLimitTimeout 改成 2 秒、或者少算一次账本操作，都过不了。
+// 关闭上限要容得下一个请求读完请求体之后最坏的情况：4 次账本操作（查 Key、预留、发送意图、收尾）、2 次限流操作（准入、修正）、
+// 2 次缓存操作（开了缓存的嵌入：读、写），再加较大的上游超时。默认配置测一次；上游超时没有上限，再用 24 小时测一次
+// （两边都随它变，差值和它无关）。把 RateLimitTimeout 改成 2 秒、或者少算一次账本操作，都过不了。
+// 不算在里面的两段，都不影响账本：
+//   - 读请求体：在 handler 里、预留之前，最多是服务器的 ReadTimeout（30 秒）。排空开始时还在上传的请求可能被截断，那时什么都还没预留。
+//   - 写回：每次写最多 5 秒（网关的 writeTimeout），除了流式的事件（它们有写的上限管着，算在流里），写回都在收尾之后，被截断的写回
+//     不影响账本，带幂等键的重试拿到重放。
 func TestShutdownCoversTheWorstRequest(t *testing.T) {
 	long := base()
 	long["timeouts"] = map[string]any{"chat_ms": 1000, "embeddings_ms": 24 * 3600 * 1000}
@@ -320,7 +330,7 @@ func TestShutdownCoversTheWorstRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		worst := 4*LedgerTimeout + 2*RateLimitTimeout + max(c.Timeout(Chat), c.Timeout(Embeddings))
+		worst := 4*LedgerTimeout + 2*RateLimitTimeout + 2*CacheTimeout + max(c.Timeout(Chat), c.Timeout(Embeddings))
 		if worst > c.ShutdownTimeout() {
 			t.Errorf("%s: the worst request takes %v, longer than the shutdown cap %v", name, worst, c.ShutdownTimeout())
 		}
@@ -411,6 +421,12 @@ func TestParseErrors(t *testing.T) {
 		{"redis file missing", func(m map[string]any) { m["redis"] = map[string]any{"url_file": "/nonexistent/url"} }, "read url_file"},
 		{"negative upstream rpm", func(m map[string]any) { item(m, "upstreams")["rpm"] = -1 }, "rpm and tpm must be integers from 0"},
 		{"upstream tpm too large", func(m map[string]any) { item(m, "upstreams")["tpm"] = MaxRate + 1 }, "rpm and tpm must be integers from 0"},
+		{"cache on the rate limiter's redis", func(m map[string]any) { m["embedding_cache"] = map[string]any{"url_env": "SAME_REDIS_OTHER_DB"} },
+			"embedding_cache: must not use the same Redis server (host:port) as redis"},
+		{"cache on the rate limiter's redis, host name in another case", func(m map[string]any) {
+			m["redis"] = map[string]any{"url_env": "NAMED_REDIS"}
+			m["embedding_cache"] = map[string]any{"url_env": "NAMED_REDIS_OTHER_CASE"}
+		}, "embedding_cache: must not use the same Redis server (host:port) as redis"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

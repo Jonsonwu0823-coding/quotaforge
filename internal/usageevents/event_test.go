@@ -52,28 +52,41 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-// 消息队列是信任边界：版本不对、调用号不合格式（太长、不是 ASCII、小写）、缺字段、不认识的字段、不是终态、时间不是 UTC、用量和状态对不上，都是格式不对。
+// 用量正好在上限（10^12）的事件照常解码。
+func TestDecodeUsageAtTheLimit(t *testing.T) {
+	e := settledChat()
+	e.Usage = &ledger.Usage{Prompt: maxEventTokens, Completion: maxEventTokens, Total: maxEventTokens, HasCompletion: true}
+	if got, err := Decode(Encode(e)); err != nil || !reflect.DeepEqual(got, e) {
+		t.Fatalf("Decode = %+v, %v", got, err)
+	}
+}
+
+// 消息队列是信任边界：版本不对、调用号不合格式（太长、不是 ASCII、小写）、缺字段、不认识的字段、不是终态、时间不是 UTC、
+// 用量和状态对不上、用量超过上限，都是格式不对。
 func TestDecodeRejects(t *testing.T) {
 	good := string(Encode(settledChat()))
 	for name, body := range map[string]string{
-		"not json":                "{",
-		"version 2":               strings.Replace(good, `"v":1`, `"v":2`, 1),
-		"no version":              strings.Replace(good, `"v":1,`, ``, 1),
-		"no call id":              strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":""`, 1),
-		"call id too long":        strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAAA"`, 1),
-		"call id not ascii":       strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAé"`, 1),
-		"call id lower case":      strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-aaaaaaaaaaaaaaaaaaaaaaaaaa"`, 1),
-		"no account":              strings.Replace(good, `"account_id":7`, `"account_id":0`, 1),
-		"unknown field":           strings.Replace(good, `"v":1`, `"v":1,"run_id":"r"`, 1),
-		"purpose":                 strings.Replace(good, `"chat"`, `"images"`, 1),
-		"not resolved":            strings.Replace(good, `"SETTLED"`, `"USAGE_UNKNOWN"`, 1),
-		"offset":                  strings.Replace(good, `59.999999Z`, `59.999999+08:00`, 1),
-		"no microseconds":         strings.Replace(good, `59.999999Z`, `59Z`, 1),
-		"settled without usage":   strings.Replace(good, `"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}`, `"usage":null`, 1),
-		"chat without completion": strings.Replace(good, `"completion_tokens":3,`, ``, 1),
-		"negative usage":          strings.Replace(good, `"total_tokens":13`, `"total_tokens":-1`, 1),
-		"cached_from on settled":  strings.Replace(good, `"cached_from":null`, `"cached_from":"qf-B"`, 1),
-		"cached without origin":   strings.Replace(good, `"SETTLED"`, `"CACHED"`, 1),
+		"not json":                  "{",
+		"version 2":                 strings.Replace(good, `"v":1`, `"v":2`, 1),
+		"no version":                strings.Replace(good, `"v":1,`, ``, 1),
+		"no call id":                strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":""`, 1),
+		"call id too long":          strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAAA"`, 1),
+		"call id not ascii":         strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAé"`, 1),
+		"call id lower case":        strings.Replace(good, `"call_id":"qf-AAAAAAAAAAAAAAAAAAAAAAAAAA"`, `"call_id":"qf-aaaaaaaaaaaaaaaaaaaaaaaaaa"`, 1),
+		"no account":                strings.Replace(good, `"account_id":7`, `"account_id":0`, 1),
+		"unknown field":             strings.Replace(good, `"v":1`, `"v":1,"run_id":"r"`, 1),
+		"purpose":                   strings.Replace(good, `"chat"`, `"images"`, 1),
+		"not resolved":              strings.Replace(good, `"SETTLED"`, `"USAGE_UNKNOWN"`, 1),
+		"offset":                    strings.Replace(good, `59.999999Z`, `59.999999+08:00`, 1),
+		"no microseconds":           strings.Replace(good, `59.999999Z`, `59Z`, 1),
+		"settled without usage":     strings.Replace(good, `"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}`, `"usage":null`, 1),
+		"chat without completion":   strings.Replace(good, `"completion_tokens":3,`, ``, 1),
+		"negative usage":            strings.Replace(good, `"total_tokens":13`, `"total_tokens":-1`, 1),
+		"prompt over the limit":     strings.Replace(good, `"prompt_tokens":10`, `"prompt_tokens":1000000000001`, 1),
+		"completion over the limit": strings.Replace(good, `"completion_tokens":3`, `"completion_tokens":1000000000001`, 1),
+		"total over the limit":      strings.Replace(good, `"total_tokens":13`, `"total_tokens":1000000000001`, 1),
+		"cached_from on settled":    strings.Replace(good, `"cached_from":null`, `"cached_from":"qf-B"`, 1),
+		"cached without origin":     strings.Replace(good, `"SETTLED"`, `"CACHED"`, 1),
 	} {
 		if _, err := Decode([]byte(body)); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%s: %v, want ErrMalformed", name, err)

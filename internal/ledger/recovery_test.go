@@ -77,6 +77,18 @@ func (f *fixture) reclaim(t *testing.T) ledger.ReclaimStats {
 	return stats
 }
 
+// 回收和清理一轮里的错误：没有出错时是 nil；出错时报个数，并留着第一个错误（后面的不覆盖它）。
+func TestFailuresKeepsTheFirstError(t *testing.T) {
+	if err := ledger.FailuresErr("reclaim", "calls"); err != nil {
+		t.Fatalf("no failures = %v", err)
+	}
+	first, second := errors.New("first"), errors.New("second")
+	err := ledger.FailuresErr("reclaim", "calls", first, second)
+	if err == nil || err.Error() != "reclaim: 2 calls failed, first: first" || !errors.Is(err, first) || errors.Is(err, second) {
+		t.Fatalf("two failures = %v", err)
+	}
+}
+
 // 上界两侧：差一秒不回收，超过一秒就回收。RESERVED 是确定没发出，释放；IN_FLIGHT 可能已经发出，标成未知、继续占着预留。
 func TestReclaimBound(t *testing.T) {
 	f := newFixture(t, 1000)
@@ -244,17 +256,7 @@ const lockBudgetSQL = "SELECT 1 FROM budgets WHERE account_id = % FOR UPDATE"
 // holdBudget 用管理连接锁住这个账户的额度行，返回放开它的函数。
 func (f *fixture) holdBudget(t *testing.T) func() {
 	t.Helper()
-	holder, err := f.admin.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := holder.Exec("SELECT 1 FROM budgets WHERE account_id = ? FOR UPDATE", f.key.AccountID); err != nil {
-		t.Fatal(err)
-	}
-	var once sync.Once
-	release := func() { once.Do(func() { _ = holder.Rollback() }) }
-	t.Cleanup(release)
-	return release
+	return dbtest.LockBudget(t, f.admin, f.key.AccountID)
 }
 
 // 两个回收同时碰到同一批调用（两个实例）：每个调用只转换一次，没有死锁。
@@ -500,21 +502,7 @@ func TestVerifyFindsRecoveryTampering(t *testing.T) {
 			if it := f.s.Reconcile(ctx, []ledger.Proof{{CallID: c.reconciled.CallID, Status: ledger.Settled, Usage: u, Source: ledger.Bill}}, true); !it[0].Applied {
 				t.Fatalf("reconcile: %+v", it)
 			}
-			if got := rules(t, f); len(got) != 0 {
-				t.Fatalf("before tampering: %v", got)
-			}
-			for _, q := range tc.tamper(c) {
-				res, err := f.admin.Exec(q, f.key.AccountID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if n, _ := res.RowsAffected(); n != 1 {
-					t.Fatalf("tampering changed %d rows: %s", n, q)
-				}
-			}
-			if got := rules(t, f); !slices.Equal(got, tc.want) {
-				t.Errorf("rules = %v, want %v", got, tc.want)
-			}
+			f.tamperRules(t, tc.tamper(c), tc.want)
 		})
 	}
 }

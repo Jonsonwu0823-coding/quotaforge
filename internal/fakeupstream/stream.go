@@ -119,27 +119,41 @@ func (st *streamer) send(fields map[string]any) bool {
 }
 
 // event 先按场景等（延迟、等 Release），再写一个 data 事件并刷新，计入 StreamEvents。请求被取消了返回 false。
+// 计数在写成功之后、事件的最后一个字节能到客户端之前：先写除最后一个字节以外的部分（fake-stream-bytewise 一个字节一个字节地
+// 写并刷新），计数，再写最后一个字节、刷新。最后一个字节一定留在 ResponseWriter 自己的缓冲里，刷新之前到不了客户端，
+// 所以客户端读完这个事件时计数一定已经加上，事件再大（前面的部分写穿缓冲）也一样。写失败的不计数。
 func (st *streamer) event(data string) bool {
 	if !st.pause() {
 		return false
 	}
 	b := []byte("data: " + data + "\n\n")
-	if st.model == "fake-stream-bytewise" {
-		for ; len(b) > 1; b = b[1:] { // 最后一个字节留到计数之后
-			if _, err := st.w.Write(b[:1]); err != nil {
-				return false
-			}
-			st.w.(http.Flusher).Flush()
-		}
-	}
-	if _, err := st.w.Write(b); err != nil {
+	head, last := b[:len(b)-1], b[len(b)-1:]
+	if !st.write(head) {
 		return false
 	}
-	st.s.sent.Add(1) // 最后一次刷新之前就计数：客户端读完这个事件时，计数一定已经加上
+	st.s.sent.Add(1)
+	if _, err := st.w.Write(last); err != nil {
+		return false
+	}
 	st.w.(http.Flusher).Flush()
 	if st.ctx.Err() != nil {
 		st.s.canceled.Add(1)
 		return false
+	}
+	return true
+}
+
+// write 写一段字节；fake-stream-bytewise 一次只写一个字节并刷新（事件跨越多次读）。
+func (st *streamer) write(b []byte) bool {
+	if st.model != "fake-stream-bytewise" {
+		_, err := st.w.Write(b)
+		return err == nil
+	}
+	for i := range b {
+		if _, err := st.w.Write(b[i : i+1]); err != nil {
+			return false
+		}
+		st.w.(http.Flusher).Flush()
 	}
 	return true
 }

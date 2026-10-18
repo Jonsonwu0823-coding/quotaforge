@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -97,15 +96,12 @@ func gatewayConfig(t *testing.T) (string, *config.Config, string, *fakeupstream.
 	fake := fakeupstream.New()
 	up := httptest.NewServer(fake)
 	t.Cleanup(up.Close)
-	path := filepath.Join(t.TempDir(), "config.json")
 	data := fmt.Sprintf(`{"timeouts":{"chat_ms":10000},"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
 		"models":[{"alias":"step","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-stream-step","weight":1}],"default_max_tokens":16},
 			{"alias":"slow","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-slow-600","weight":1}],"default_max_tokens":16},
 			{"alias":"flow","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-stream-slow-100","weight":1}],"default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	path := writeConfig(t, data)
 	env := map[string]string{"QF_KILL_UPSTREAM_KEY": "test-only-upstream-key", "QF_KILL_DSN": dbtest.AppDSN(t), "QF_KILL_REDIS": dbtest.RedisURL(t)}
 	for k, v := range env {
 		t.Setenv(k, v)

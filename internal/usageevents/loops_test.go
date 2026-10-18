@@ -14,7 +14,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
@@ -37,13 +36,7 @@ type account struct {
 func newAccount(t *testing.T) *account {
 	t.Helper()
 	a := &account{s: dbtest.Store(t), admin: dbtest.Admin(t)}
-	issued, err := a.s.IssueKey(ctx, dbtest.Account(t, a.s, 1<<40), []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.key, err = a.s.KeyByHash(ctx, apikey.Hash(issued.Secret)); err != nil || a.key == nil {
-		t.Fatalf("KeyByHash = %v, %v", a.key, err)
-	}
+	a.key = dbtest.Key(t, a.s, dbtest.Account(t, a.s, 1<<40))
 	return a
 }
 
@@ -113,18 +106,7 @@ func (a *account) records(t *testing.T) []Record {
 // hold 在管理连接的事务里执行 query，不提交；返回回滚它的函数（测试结束时也会回滚）。
 func (a *account) hold(t *testing.T, query string, args ...any) func() {
 	t.Helper()
-	tx, err := a.admin.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(query, args...); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	var once sync.Once
-	release := func() { once.Do(func() { _ = tx.Rollback() }) }
-	t.Cleanup(release)
-	return release
+	return dbtest.Hold(t, a.admin, query, args...)
 }
 
 // fakeSource 是假的消息来源：按顺序交出 batches，交完就一直等到 ctx 取消。onCommit 在提交时调用，可以返回错误。

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,10 +33,7 @@ func TestProcessServesWhileKafkaIsDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	withEvents := strings.TrimSuffix(strings.TrimSpace(string(data)), "}") + `,"usage_events":{"brokers":["127.0.0.1:1"]}}`
-	cfgPath = filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(cfgPath, []byte(withEvents), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cfgPath = writeConfig(t, withEvents)
 	p := startObservedQF(t, cfgPath, collector)
 	api, metricsAddr := p.addr(t, "listening"), p.addr(t, "metrics")
 
@@ -85,14 +81,10 @@ func TestNoForwardingWithoutUsageEvents(t *testing.T) {
 
 // usage-consumer 要配置里有 usage_events，没有就以 1 退出。
 func TestUsageConsumerNeedsUsageEvents(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
 	data := `{"upstreams":[{"name":"u","base_url":"http://127.0.0.1:1/v1","api_key_env":"K"}],
 		"models":[{"alias":"m","purpose":"chat","targets":[{"upstream":"u","upstream_model":"m","weight":1}],"default_max_tokens":1}],
 		"database":{"dsn_env":"K"},"redis":{"url_env":"K"}}`
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	path := writeConfig(t, data)
 	t.Setenv("QUOTAFORGE_CONFIG", path)
 	t.Setenv("K", "k")
 	if code := usageConsumer(); code != 1 {

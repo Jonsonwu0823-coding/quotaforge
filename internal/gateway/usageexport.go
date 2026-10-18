@@ -99,7 +99,8 @@ func usageRow(line []byte) ([]string, error) {
 	}, nil
 }
 
-// usageCells 把日志里的 usage 换成三列：没有这个字段（没调上游）是空，"unknown" 原样，对象照抄数字。
+// usageCells 把日志里的 usage 换成三列：没有这个字段（没调上游）是空，"unknown" 原样，对象照抄数字（和对账读日志同一个
+// decodeUsage）。
 func usageCells(raw json.RawMessage) (prompt, completion, total string, err error) {
 	if raw == nil {
 		return "", "", "", nil
@@ -111,21 +112,14 @@ func usageCells(raw json.RawMessage) (prompt, completion, total string, err erro
 		}
 		return "unknown", "unknown", "unknown", nil
 	}
-	var u struct {
-		Prompt     *int64 `json:"prompt_tokens"`
-		Completion *int64 `json:"completion_tokens"`
-		Total      *int64 `json:"total_tokens"`
+	u := decodeUsage(raw)
+	if u == nil {
+		return "", "", "", errors.New("usage is not an object with prompt_tokens and total_tokens")
 	}
-	if err := json.Unmarshal(raw, &u); err != nil {
-		return "", "", "", err
+	if u.HasCompletion {
+		completion = strconv.FormatInt(u.Completion, 10)
 	}
-	if u.Prompt == nil || u.Total == nil {
-		return "", "", "", errors.New("usage without prompt_tokens or total_tokens")
-	}
-	if u.Completion != nil {
-		completion = strconv.FormatInt(*u.Completion, 10)
-	}
-	return strconv.FormatInt(*u.Prompt, 10), completion, strconv.FormatInt(*u.Total, 10), nil
+	return strconv.FormatInt(u.Prompt, 10), completion, strconv.FormatInt(u.Total, 10), nil
 }
 
 // formulaPrefixes 是表格软件可能当成公式开头的字符，加上单引号本身（为了能还原）。

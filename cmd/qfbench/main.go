@@ -69,56 +69,70 @@ func dispatch(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		return writeSummary(out, summarize(m, rows))
 	}
-
-	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	var targets, bodies repeated
-	fs.Var(&targets, "target", "base URL of QF or the upstream, e.g. http://quotaforge:8080 (repeat for round robin)")
-	fs.Var(&bodies, "body", "request body (repeat for round robin)")
-	idemEach := fs.Bool("idem-each", false, "a new Idempotency-Key on every request")
-	var c, n *int
-	var warmup, duration *time.Duration
-	var idemKey *string
-	timeout := 30 * time.Second
-	switch args[0] {
-	case "sustain":
-		c = fs.Int("c", 1, "concurrent workers")
-		warmup = fs.Duration("warmup", 5*time.Second, "warm-up period, not counted")
-		duration = fs.Duration("duration", 30*time.Second, "measured period")
-	case "burst":
-		n = fs.Int("n", 10, "requests released together")
-		idemKey = fs.String("idem-key", "", "the same Idempotency-Key on every request")
-		timeout = 60 * time.Second
-	default:
-		return errUsage
-	}
-	fs.DurationVar(&timeout, "timeout", timeout, "client timeout per request")
-	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || len(targets) == 0 || len(bodies) == 0 || timeout <= 0 {
-		return errUsage
-	}
-	keys, err := readKeys(stdin)
+	b, start, err := parseBench(args)
 	if err != nil {
 		return err
 	}
-	b := &bench{targets: targets, bodies: bodies, keys: keys, timeout: timeout, idemEach: *idemEach}
-	var m meta
-	var rows []result
-	switch {
-	case c != nil:
-		if *c < 1 || *warmup < 0 || *duration <= 0 {
-			return errUsage
-		}
-		m = meta{Mode: "sustain", C: *c, WarmupMS: warmup.Milliseconds(), DurationMS: duration.Milliseconds()}
-		rows = b.sustain(*c, *warmup, *duration)
-	default:
-		if *n < 1 || (*idemKey != "" && *idemEach) {
-			return errUsage
-		}
-		b.idemKey = *idemKey
-		m = meta{Mode: "burst", N: *n}
-		rows = b.burst(*n)
+	if b.keys, err = readKeys(stdin); err != nil {
+		return err
+	}
+	m, rows, err := start(b)
+	if err != nil {
+		return err
 	}
 	return writeRaw(out, m, rows)
+}
+
+// parseBench 读 sustain、burst 共有的参数并校验，返回压测的设置和跑它的函数。各自的参数在跑之前（读完 Key 之后）才校验。
+func parseBench(args []string) (*bench, func(*bench) (meta, []result, error), error) {
+	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	b := &bench{timeout: 30 * time.Second}
+	fs.Var((*repeated)(&b.targets), "target", "base URL of QF or the upstream, e.g. http://quotaforge:8080 (repeat for round robin)")
+	fs.Var((*repeated)(&b.bodies), "body", "request body (repeat for round robin)")
+	fs.BoolVar(&b.idemEach, "idem-each", false, "a new Idempotency-Key on every request")
+	var start func(*bench) (meta, []result, error)
+	switch args[0] {
+	case "sustain":
+		start = sustainFlags(fs)
+	case "burst":
+		start = burstFlags(fs)
+		b.timeout = 60 * time.Second
+	default:
+		return nil, nil, errUsage
+	}
+	fs.DurationVar(&b.timeout, "timeout", b.timeout, "client timeout per request")
+	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || len(b.targets) == 0 || len(b.bodies) == 0 || b.timeout <= 0 {
+		return nil, nil, errUsage
+	}
+	return b, start, nil
+}
+
+// sustainFlags 定义 sustain 的参数，返回校验它们、跑压测的函数。
+func sustainFlags(fs *flag.FlagSet) func(*bench) (meta, []result, error) {
+	c := fs.Int("c", 1, "concurrent workers")
+	warmup := fs.Duration("warmup", 5*time.Second, "warm-up period, not counted")
+	duration := fs.Duration("duration", 30*time.Second, "measured period")
+	return func(b *bench) (meta, []result, error) {
+		if *c < 1 || *warmup < 0 || *duration <= 0 {
+			return meta{}, nil, errUsage
+		}
+		m := meta{Mode: "sustain", C: *c, WarmupMS: warmup.Milliseconds(), DurationMS: duration.Milliseconds()}
+		return m, b.sustain(*c, *warmup, *duration), nil
+	}
+}
+
+// burstFlags 定义 burst 的参数，返回校验它们、齐发的函数。
+func burstFlags(fs *flag.FlagSet) func(*bench) (meta, []result, error) {
+	n := fs.Int("n", 10, "requests released together")
+	idemKey := fs.String("idem-key", "", "the same Idempotency-Key on every request")
+	return func(b *bench) (meta, []result, error) {
+		if *n < 1 || (*idemKey != "" && b.idemEach) {
+			return meta{}, nil, errUsage
+		}
+		b.idemKey = *idemKey
+		return meta{Mode: "burst", N: *n}, b.burst(*n), nil
+	}
 }
 
 // readKeys 读 stdin 上的 Key，一行一把，空行跳过。至少要有一把（直连上游时随便写一行）。

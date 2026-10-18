@@ -918,14 +918,16 @@ class JaegerChecks(unittest.TestCase):
         next(s for s in traces[trace] if s["id"] == root["parent"])["kind"] = 1  # 名字对，kind 不是 CLIENT
         self.assertTrue(any("(1 do not)" in t and "SERVER" in t for t in self.fails(summary, rows, services, traces)))
 
-    def error_span(self, code, trace):
-        return cq.flatten(otlp({("queryshield", None): [span(f"{0xb1:016x}", f"{0xa000:016x}", "queryshield.step.model_decision", error=True,
+    def error_span(self, traces, code, trace):
+        """trace 这个 run 里一个 ERROR 的 QS span，挂在这个 run 的 run span 下面。"""
+        run_span = next(s["id"] for s in traces[trace] if s["name"] == "queryshield.run")
+        return cq.flatten(otlp({("queryshield", None): [span(f"{0xb1:016x}", run_span, "queryshield.step.model_decision", error=True,
                                                              **({"queryshield__error_code": code} if code else {}))]}))
 
     def test_an_error_outside_the_allowed_codes_or_without_a_code_fails_j4(self):
         for code in ("upstream_http_error", "model_quota_exhausted", None):
             summary, rows, services, traces = jaeger_world()
-            traces[self.first_trace(summary)] += self.error_span(code, self.first_trace(summary))
+            traces[self.first_trace(summary)] += self.error_span(traces, code, self.first_trace(summary))
             fails = self.fails(summary, rows, services, traces)
             self.assertTrue(len(fails) == 1 and "(1 are not)" in fails[0], (code, fails))
 
@@ -935,8 +937,29 @@ class JaegerChecks(unittest.TestCase):
         fails = self.fails(summary, rows, services, traces)
         self.assertTrue(len(fails) == 1 and "1 failed runs each have one with their code (1 do not)" in fails[0], fails)
         trace = record_of(summary, RUN_IDS[1])["trace_id"]
-        traces[trace] += self.error_span("upstream_http_error", trace)
+        traces[trace] += self.error_span(traces, "upstream_http_error", trace)
         self.assertEqual(self.fails(summary, rows, services, traces), [])
+
+    def test_each_failed_run_needs_its_own_code_on_its_own_trace(self):
+        """两个失败的 run 的码对调：每个码都是某个失败的 run 的，但都不在那个 run 自己的 trace 上。"""
+        summary, rows, services, traces = jaeger_world()
+        one, two = record_of(summary, RUN_IDS[1]), record_of(summary, RUN_IDS[2])
+        one.update(error_code="upstream_http_error")
+        two.update(error_code="model_quota_exhausted")
+        traces[one["trace_id"]] += self.error_span(traces, "model_quota_exhausted", one["trace_id"])
+        traces[two["trace_id"]] += self.error_span(traces, "upstream_http_error", two["trace_id"])
+        fails = self.fails(summary, rows, services, traces)
+        self.assertTrue(len(fails) == 1 and "(2 are not)" in fails[0] and "2 failed runs each have one with their code (2 do not)" in fails[0], fails)
+
+    def test_a_failed_runs_code_on_another_runs_trace_fails_j4(self):
+        """失败的 run 自己的 trace 上有它的码；同一个码又出现在一个成功的 run 的 trace 上，也不对。"""
+        summary, rows, services, traces = jaeger_world()
+        failed = record_of(summary, RUN_IDS[1])
+        failed.update(error_code="upstream_http_error")
+        traces[failed["trace_id"]] += self.error_span(traces, "upstream_http_error", failed["trace_id"])
+        traces[self.first_trace(summary)] += self.error_span(traces, "upstream_http_error", self.first_trace(summary))
+        fails = self.fails(summary, rows, services, traces)
+        self.assertTrue(len(fails) == 1 and "(1 are not)" in fails[0] and "(0 do not)" in fails[0], fails)
 
     def test_a_paused_tool_span_marked_error_fails_j4_when_no_run_failed(self):
         """QS 不把暂停的工具调用标成 ERROR（夹具里那个不标）；它以后要是又标了，联调要报出来。"""

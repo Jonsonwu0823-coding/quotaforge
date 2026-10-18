@@ -3,8 +3,10 @@ package embcache_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +82,24 @@ func openWith(t *testing.T, dial func(context.Context, string, string) (net.Conn
 	c := embcache.OpenOptions(opt, "x:")
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// 拨号失败（连接被拒）：一次读只拨一次就把错误交回。go-redis 把拨号的错误当成可以重试的命令错误，
+// 不关掉命令的重试（MaxRetries = -1）或者拨号的重试（DialerRetries = 1）都会拨不止一次。
+func TestDialTriesOnce(t *testing.T) {
+	var dials atomic.Int32
+	c := openWith(t, func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	})
+	octx, cancel := opCtx()
+	defer cancel()
+	if _, err := c.Get(octx, "k"); err == nil {
+		t.Fatal("Get succeeded without a connection")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("%d dials for one Get, want 1", n)
+	}
 }
 
 // 缓存的 Redis 停着、名字解析一直没有应答：读在上限左右返回错误，后台的拨号也在上限左右自己结束，

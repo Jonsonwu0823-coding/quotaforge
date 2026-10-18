@@ -146,7 +146,7 @@ b=$(($(chats qf-fake-upstream-b) - b0))
 say "fake-a got $a, fake-b got $b"
 check "weights: all 200 are 200" [ "$(statuses w 200)" = "200/none=200" ]
 check "weights: the two fake upstreams got 200 together" [ $((a + b)) = 200 ]
-check "weights: fake-b got 5-40 of them (expected 20)" [ "$b" -ge 5 ] && [ "$b" -le 40 ]
+check "weights: fake-b got 5-40 of them (expected 20)" [ "$((b >= 5 && b <= 40))" = 1 ]
 check "weights: the ledger has the same split, all settled" [ "$(upstreams_of w 200)" = "fake-a/SETTLED=$a,fake-b/SETTLED=$b" ]
 
 say "== 2. failover: fake-b is stopped (its name does not resolve, the dial fails)"
@@ -207,7 +207,7 @@ burst r split 100 8
 a=$(($(chats qf-fake-upstream) - a0))
 b=$(($(chats qf-fake-upstream-b) - b0))
 say "split again: fake-a got $a, fake-b got $b"
-check "recovery: split goes to both again (100 together, each > 0)" [ "$(statuses r 100)/$((a + b))" = "200/none=100/100" ] && [ "$a" -gt 0 ] && [ "$b" -gt 0 ]
+check "recovery: split goes to both again (100 together, each > 0)" [ "$(statuses r 100)/$((a + b))/$((a > 0 && b > 0))" = "200/none=100/100/1" ]
 
 say "== 6. logs and ledger"
 dc logs --no-log-prefix quotaforge >"$work/qf.log" 2>&1

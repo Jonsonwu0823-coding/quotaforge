@@ -10,14 +10,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/redisconn"
 )
-
-// go-redis 自己的日志丢掉：错误都作为返回值回到调用方，记在那次调用的日志里（同 ratelimit 包）。
-func init() { redis.SetLogger(discard{}) }
-
-type discard struct{}
-
-func (discard) Printf(context.Context, string, ...any) {}
 
 // Client 用一个 Redis 连接池读写缓存。可以并发使用。
 type Client struct {
@@ -35,17 +29,9 @@ func Open(url, prefix string) (*Client, error) {
 	return newClient(opt, prefix), nil
 }
 
-// newClient 把缓存要求的设置加在 opt 上，再建连接池。每次读写的上限是调用方给的 context（config.CacheTimeout）：
-//   - ContextTimeoutEnabled：Redis 接受连接却不回答时，按 context 的期限放弃，而不是等 go-redis 自己几秒的读超时；
-//   - 不重试（MaxRetries = -1）：缓存慢了不如直接回源，重试只会把这次请求拖得更久；
-//   - 拨号最多 CacheTimeout、只试一次：go-redis 在后台拨号，拨号不随请求取消。缓存的 Redis 停着时，名字解析要好几秒
-//     才失败（Docker Desktop 上约 4 秒），不限住的话拨号活得比请求久，恢复之后的请求还要等这次过时的查询。
+// newClient 按 redisconn 的共同设置建连接池，每次读写（和拨号）的上限是 config.CacheTimeout：慢了不如直接回源。
 func newClient(opt *redis.Options, prefix string) *Client {
-	opt.ContextTimeoutEnabled = true
-	opt.MaxRetries = -1
-	opt.DialTimeout = config.CacheTimeout
-	opt.DialerRetries = 1
-	return &Client{rdb: redis.NewClient(opt), prefix: prefix}
+	return &Client{rdb: redisconn.New(opt, config.CacheTimeout), prefix: prefix}
 }
 
 // Close 关闭连接池。

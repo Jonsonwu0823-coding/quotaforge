@@ -133,62 +133,54 @@ func main() {
 	if len(os.Args) > 1 {
 		os.Exit(command(os.Args[1]))
 	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	if step, err := serve(logger); err != nil {
+		slog.Error(step, "err", err)
+		os.Exit(1)
+	}
+}
 
+// serve 依次读配置、开账本、限流和缓存的 Redis、监听、指标、追踪、用量事件，然后提供服务，直到收到 SIGINT 或 SIGTERM
+// 并退完（drain）。出错时返回出错的那一步（日志的 msg）和错误。
+func serve(logger *slog.Logger) (step string, err error) {
 	cfg, telCfg, err := loadConfig()
 	if err != nil {
-		slog.Error("config", "err", err)
-		os.Exit(1)
+		return "config", err
 	}
-
 	store, err := openLedger(context.Background(), cfg)
 	if err != nil {
-		slog.Error("ledger", "err", err)
-		os.Exit(1)
+		return "ledger", err
 	}
 	defer store.Close()
-
 	// 不在启动时连 Redis：它不可用只影响要检查桶的请求（503），恢复后不用重启。
 	limiter, err := ratelimit.Open(cfg.RedisURL(), "qf:rl:")
 	if err != nil {
-		slog.Error("rate limiter", "err", err)
-		os.Exit(1)
+		return "rate limiter", err
 	}
 	defer limiter.Close()
 	cache, closeCache, err := openCache(cfg)
 	if err != nil {
-		slog.Error("embedding cache", "err", err)
-		os.Exit(1)
+		return "embedding cache", err
 	}
 	defer closeCache()
-
 	ln, err := net.Listen("tcp", listenAddr())
 	if err != nil {
-		slog.Error("listen", "err", err)
-		os.Exit(1)
+		return "listen", err
 	}
 	metrics := telemetry.NewMetrics(store.Stats)
 	stopMetrics, err := listenMetrics(telCfg.MetricsAddr, metrics)
 	if err != nil {
-		slog.Error("listen", "err", err)
-		os.Exit(1)
+		return "listen", err
 	}
 	defer stopMetrics()
 	tel, flushSpans := telemetry.Setup(telCfg, metrics, logger)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	waitForwarding, err := startForwarding(ctx, cfg, store, logger, metrics)
 	if err != nil {
-		slog.Error("usage events", "err", err)
-		os.Exit(1)
+		return "usage events", err
 	}
-
-	// 退出的顺序：在途请求处理完（最多 ShutdownTimeout）、后台循环和转发也停下之后，才把还没导出的 span 发完（最多
-	// telemetry.FlushTimeout，不占在途请求的时间；到点没发完的 span 丢掉，账本在这之前已经收完尾）；
-	// 然后关指标的监听（排空期间 Prometheus 仍能抓），最后关 Redis 和账本（defer）。
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -196,15 +188,19 @@ func main() {
 	}()
 	slog.Info("listening", "addr", ln.Addr().String())
 	err = run(ctx, ln, newServer(newHandler(gateway.New(cfg, store, limiter, cache, logger, tel))), cfg.ShutdownTimeout())
+	drain(stop, done, waitForwarding, flushSpans)
+	return "run", err
+}
+
+// drain 是退出的顺序：在途请求处理完（run 已经返回，最多 ShutdownTimeout）之后，停下后台循环、等转发停下，再把还没导出的
+// span 发完（最多 telemetry.FlushTimeout，不占在途请求的时间；到点没发完的 span 丢掉，账本在这之前已经收完尾）。
+// 之后 serve 的 defer 关指标的监听（排空期间 Prometheus 仍能抓），最后关 Redis 和账本。
+func drain(stop func(), background <-chan struct{}, waitForwarding func(), flushSpans func() error) {
 	stop()
-	<-done
+	<-background
 	waitForwarding()
-	if ferr := flushSpans(); ferr != nil {
-		slog.Warn("telemetry", "error", ferr.Error())
-	}
-	if err != nil {
-		slog.Error("run", "err", err)
-		os.Exit(1)
+	if err := flushSpans(); err != nil {
+		slog.Warn("telemetry", "error", err.Error())
 	}
 }
 

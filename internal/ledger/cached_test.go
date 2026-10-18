@@ -128,6 +128,18 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 		{"different usage", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET usage_prompt_tokens = 8, usage_total_tokens = 8 WHERE id = '" + cached + "'"}
 		}, []string{"cached", "outbox"}},
+		{"origin on another upstream", func(_ *testing.T, _ *fixture, _, from string) []string {
+			return []string{"UPDATE calls SET upstream = 'u2' WHERE id = '" + from + "'"}
+		}, []string{"cached", "outbox"}},
+		{"origin with another upstream model", func(_ *testing.T, _ *fixture, _, from string) []string {
+			return []string{"UPDATE calls SET upstream_model = 'um2' WHERE id = '" + from + "'"}
+		}, []string{"cached", "outbox"}},
+		{"origin is a chat call", func(_ *testing.T, _ *fixture, _, from string) []string {
+			return []string{"UPDATE calls SET purpose = 'chat' WHERE id = '" + from + "'"}
+		}, []string{"cached", "outbox"}},
+		{"a chat cache hit", func(_ *testing.T, _ *fixture, cached, from string) []string { // 用量对 chat 也合法，原来那次也是 chat
+			return []string{"UPDATE calls SET purpose = 'chat', usage_completion_tokens = 0 WHERE id IN ('" + cached + "', '" + from + "')"}
+		}, []string{"cached", "outbox"}},
 		{"cached_from on a settled call", func(_ *testing.T, _ *fixture, _, from string) []string {
 			return []string{"UPDATE calls SET cached_from = '" + from + "' WHERE id = '" + from + "'"}
 		}, []string{"cached", "outbox"}},
@@ -135,6 +147,7 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, 1000)
+			t.Cleanup(func() { deleteAccount(t, f) }) // 改坏的账户不留给后面跑 Verify 的测试（失败时也删）
 			from := f.settledEmbedding(t)
 			c := f.recordCached(t, from.CallID)
 			if got := rules(t, f); len(got) != 0 {
@@ -144,7 +157,6 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 			if got := rules(t, f); !slices.Equal(got, tc.want) {
 				t.Errorf("rules = %v, want %v", got, tc.want)
 			}
-			deleteAccount(t, f) // 改坏的账户不留给后面跑 Verify 的测试
 		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	mathrand "math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -28,7 +29,7 @@ type requestIDKey struct{}
 func WithRequestID(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := "qf-" + rand.Text()
-		w.Header().Set("x-request-id", id)
+		w.Header().Set(headerRequestID, id)
 		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
 	})
 }
@@ -112,16 +113,16 @@ func (g *gateway) endpoint(p config.Purpose, route string) http.HandlerFunc {
 			id:              r.Context().Value(requestIDKey{}).(string),
 			start:           time.Now(),
 			purpose:         p,
-			clientRequestID: r.Header.Get("X-Client-Request-Id"),
-			runID:           r.Header.Get("X-Run-Id"),
-			idempotencyKey:  r.Header.Get("Idempotency-Key"),
+			clientRequestID: r.Header.Get(headerClientRequestID),
+			runID:           r.Header.Get(headerRunID),
+			idempotencyKey:  r.Header.Get(headerIdempotencyKey),
 		}
 		defer g.record(c, string(p), g.logCall)
 		e := g.authenticate(r, c)
 		ctx := g.startTrace(r, c, route, e)
 		defer g.adjust(ctx, c) // 先于 record 执行：日志里要有修正的错误，根 span 要包住修正
 		defer g.router.release(c)
-		defer g.leaveFlight(c) // 只兜住出错和 panic 的出口：正常的路径在写回之前就已经离开了合并的表
+		defer g.leaveFlight(c) // 只兜住 panic 的出口：每条路径在写回之前就已经离开了合并的表
 		if e != nil {
 			writeError(w, c, e)
 			return
@@ -141,7 +142,7 @@ func (g *gateway) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		hit, e = g.lookupCache(ctx, c, rq)
 	}
 	if s := cacheStatus[c.cache]; s != "" {
-		w.Header().Set("Cache-Status", s)
+		w.Header().Set(headerCacheStatus, s)
 	}
 	var replay *ledger.Replay
 	if e == nil && hit == nil {
@@ -149,13 +150,14 @@ func (g *gateway) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	}
 	switch {
 	case e != nil:
+		g.leaveFlight(c) // 查完缓存之后出错的领头的（例如预留 429）：写错误之前离开，跟随的不等它的客户端
 		writeError(w, c, e)
 	case hit != nil:
 		g.serveCached(ctx, w, c, hit)
 	case replay != nil:
 		c.replayOf = replay.CallID
-		w.Header().Set("x-request-id", replay.CallID)
-		w.Header().Set("Idempotent-Replayed", "true")
+		w.Header().Set(headerRequestID, replay.CallID)
+		w.Header().Set(headerIdempotentReplayed, "true")
 		writeResponse(w, c, &replay.Response)
 	default:
 		g.deliver(ctx, w, c, rq)
@@ -163,7 +165,8 @@ func (g *gateway) serve(ctx context.Context, w http.ResponseWriter, r *http.Requ
 }
 
 // deliver 是预留成功之后的部分：发给上游、判定结局、收尾、写嵌入缓存、写回。客户端已经断开就不写回，状态码留 0。
-// 流式已经写了响应头的，在 send 里写完了，这里只记错误码。
+// 流式已经写了响应头的，在 send 里写完了，这里只记错误码，再给 handler 返回之后 net/http 写的分块编码的结尾设写的期限：
+// 最后几个事件的期限可能早就过了（收尾在它们之后），留着它，结尾写不出去，客户端收到了 [DONE]，流却没有正常结束。
 // 合并只包住大家共享的几步（读缓存、回源、收尾、写缓存）：领头的在写回自己的客户端之前就离开合并的表，
 // 它的客户端读得慢（服务器没有全局的写期限），也不会让跟随的一直等。
 func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, rq request) {
@@ -177,6 +180,7 @@ func (g *gateway) deliver(ctx context.Context, w http.ResponseWriter, c *call, r
 	g.leaveFlight(c)
 	switch {
 	case c.streamed:
+		limitWrite(w)
 		if e != nil {
 			c.errorCode = e.code
 		}
@@ -224,10 +228,33 @@ func (g *gateway) send(ctx context.Context, w http.ResponseWriter, c *call, rq r
 // writeResponse 写回上游的 2xx 或它的快照：状态码、Content-Type 和正文，不转发上游的其它响应头。
 // 上游没给 Content-Type 时，这里放一个空值，防止 net/http 自己嗅探补上。
 func writeResponse(w http.ResponseWriter, c *call, resp *ledger.Response) {
+	limitWrite(w)
 	w.Header()["Content-Type"] = resp.ContentType
 	c.status = resp.Status
 	w.WriteHeader(resp.Status)
-	_, _ = w.Write(resp.Body)
+	_, err := w.Write(resp.Body)
+	c.wrote(err)
+}
+
+// writeTimeout 是写给客户端的每一次写的期限，从开始写算起：非流式的响应（含重放、缓存命中）、错误响应、调用状态查询的响应、
+// 流式的每个事件（同时不越过写的上限，见 stream.send），以及流结束后 net/http 写的分块编码的结尾。比上游超时短得多：
+// 内核的发送缓冲区装得下一个普通的回答，只有客户端不读、响应又很大时写才会阻塞，超了就当客户端走了。
+// 服务器不设全局的 WriteTimeout：它从读完请求头算起，会掐断长的流。
+// 退出的上限（config.ShutdownTimeout）不算写回：除了流式的事件（有写的上限管着），写回都在账本收尾之后，被截断的写回不影响账本。
+const writeTimeout = 5 * time.Second
+
+// limitWrite 把写的期限设成现在 + writeTimeout。handler 返回之后 net/http 写完缓冲里剩下的部分（和分块编码的结尾）也在这个期限里；
+// 请求结束时 net/http 自己清掉它，不会带到同一条连接的下一个请求。
+func limitWrite(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(writeTimeout))
+}
+
+// wrote 记下一次写回的结果：写不出去就是客户端走了，超过期限的另外记下（日志的 client_disconnected、write_timeout）。
+// 写进缓冲、handler 返回之后才写到连接上的部分（放得进缓冲的小正文、分块编码的结尾）出错时，日志已经写完，记不到。
+func (c *call) wrote(err error) {
+	if err != nil {
+		c.clientDisconnected, c.writeTimeout = true, errors.Is(err, os.ErrDeadlineExceeded)
+	}
 }
 
 // request 是客户端的原始请求体和它的解析结果。发给哪个目标，就按那个目标的上游模型名从原始请求体改写一次（upstreamBody）：

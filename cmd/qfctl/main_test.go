@@ -109,6 +109,38 @@ func TestDSNSource(t *testing.T) {
 	}
 }
 
+// 库的版本和这个程序要求的不一致时，除了 migrate，每个命令都拒绝（退出 1，报错和 QF 启动时一样），什么都不改；
+// migrate 不经过这个检查，按它自己的规则报（库比程序新）。
+func TestCommandsCheckTheSchema(t *testing.T) {
+	admin := dbtest.Admin(t)
+	if _, err := admin.Exec("INSERT INTO schema_migrations (version, applied_at) VALUES (?, UTC_TIMESTAMP(6))", ledger.SchemaVersion+1); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec("DELETE FROM schema_migrations WHERE version = ?", ledger.SchemaVersion+1); err != nil {
+			t.Error(err)
+		}
+	})
+	env := map[string]string{"QFCTL_MYSQL_DSN": dbtest.AppDSN(t)}
+	name := "schema-" + strings.ToLower(rand.Text()[:8])
+	for _, args := range [][]string{{"account", "create", "-name", name, "-limit", "5"}, {"usage"}, {"verify"}, {"idempotency", "purge"}} {
+		if code, _, stderr := qfctl(env, args...); code != 1 || !strings.Contains(stderr, "this build needs") {
+			t.Errorf("%q on a newer schema: exit %d, stderr %q", args, code, stderr)
+		}
+	}
+	var n int
+	if err := admin.QueryRow("SELECT COUNT(*) FROM accounts WHERE name = ?", name).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("account rows %d, %v: the rejected command changed the database", n, err)
+	}
+	code, _, stderr := qfctl(map[string]string{"QFCTL_MYSQL_DSN": dbtest.MigrateDSN(t)}, "migrate")
+	if code != 1 || !strings.Contains(stderr, "is newer than this build") {
+		t.Fatalf("migrate on a newer schema: exit %d, stderr %q", code, stderr)
+	}
+}
+
+// issuedKey 是 key issue 的输出：id、前缀、Key 本身三行。
+var issuedKey = regexp.MustCompile(`(?m)^id: (\d+)\nprefix: (qfk_\S{8})\nkey: (qfk_\S{43})\n$`)
+
 // 每个子命令都用一遍：迁移、建账户、改上限、发 Key、列 Key、查用量、吊销、校验、清理幂等记录。
 func TestCommands(t *testing.T) {
 	env := map[string]string{"QFCTL_MYSQL_DSN": dbtest.MigrateDSN(t)}
@@ -120,6 +152,12 @@ func TestCommands(t *testing.T) {
 		}
 		return stdout
 	}
+	mustFail := func(want string, args ...string) { // 以 1 退出，stderr 里有 want
+		t.Helper()
+		if code, _, stderr := qfctl(env, args...); code != 1 || !strings.Contains(stderr, want) {
+			t.Fatalf("%q: exit %d, stderr %q; want exit 1 with %q", args, code, stderr, want)
+		}
+	}
 	if out := must("migrate"); !strings.Contains(out, "up to date") {
 		t.Fatalf("migrate: %q", out)
 	}
@@ -127,13 +165,11 @@ func TestCommands(t *testing.T) {
 	name := dbtest.Account(t, store, 1) // 拿一个没用过的名字
 	name += "-q"
 	must("account", "create", "-name", name, "-limit", "1000")
-	if code, _, stderr := qfctl(env, "account", "create", "-name", name, "-limit", "1"); code != 1 || !strings.Contains(stderr, "already exists") {
-		t.Fatalf("duplicate account: exit %d, %q", code, stderr)
-	}
+	mustFail("already exists", "account", "create", "-name", name, "-limit", "1")
 	must("account", "set-limit", "-name", name, "-limit", "2000")
 
 	out := must("key", "issue", "-account", name, "-models", "a,b")
-	m := regexp.MustCompile(`(?m)^id: (\d+)\nprefix: (qfk_\S{8})\nkey: (qfk_\S{43})\n$`).FindStringSubmatch(out)
+	m := issuedKey.FindStringSubmatch(out)
 	if m == nil || !strings.HasPrefix(m[3], m[2]) {
 		t.Fatal("key issue output has the wrong shape")
 	}
@@ -160,7 +196,7 @@ func TestCommands(t *testing.T) {
 		t.Fatalf("usage after set-rate = %q", u)
 	}
 	rated := must("key", "issue", "-account", name, "-models", "a", "-rpm", "5", "-tpm", "700")
-	rm := regexp.MustCompile(`(?m)^id: (\d+)\nprefix: (qfk_\S{8})\nkey: (qfk_\S{43})\n$`).FindStringSubmatch(rated)
+	rm := issuedKey.FindStringSubmatch(rated)
 	if rm == nil {
 		t.Fatal("key issue -rpm -tpm output has the wrong shape")
 	}
@@ -172,25 +208,19 @@ func TestCommands(t *testing.T) {
 	if err != nil || k == nil || k.Rate != (ledger.Rate{TPM: 9}) || k.AccountRate != (ledger.Rate{RPM: 60, TPM: 1_000_000_000_000}) {
 		t.Fatalf("KeyByHash after set-rate = %+v, %v", k, err)
 	}
-	if code, _, stderr := qfctl(env, "account", "set-rate", "-name", name+"-none", "-rpm", "1", "-tpm", "1"); code != 1 || !strings.Contains(stderr, "account not found") {
-		t.Fatalf("set-rate on a missing account: exit %d, %q", code, stderr)
-	}
+	mustFail("account not found", "account", "set-rate", "-name", name+"-none", "-rpm", "1", "-tpm", "1")
 	created := name + "-r"
 	must("account", "create", "-name", created, "-limit", "5", "-rpm", "7", "-tpm", "8")
 	if u := must("usage", "-account", created); !strings.HasSuffix(u, "\t7\t8\n") {
 		t.Fatalf("usage of an account created with limits = %q", u)
 	}
 	must("key", "revoke", "-id", rm[1])
-	if code, _, stderr := qfctl(env, "key", "set-rate", "-id", rm[1], "-rpm", "1", "-tpm", "1"); code != 1 || !strings.Contains(stderr, "already revoked") {
-		t.Fatalf("set-rate on a revoked key: exit %d, %q", code, stderr)
-	}
+	mustFail("already revoked", "key", "set-rate", "-id", rm[1], "-rpm", "1", "-tpm", "1")
 	if all := must("usage"); !strings.Contains(all, name+"\t2000\t") {
 		t.Fatalf("usage for all accounts misses %s", name)
 	}
 	must("key", "revoke", "-id", m[1])
-	if code, _, stderr := qfctl(env, "key", "revoke", "-id", m[1]); code != 1 || !strings.Contains(stderr, "already revoked") {
-		t.Fatalf("revoke twice: exit %d, %q", code, stderr)
-	}
+	mustFail("already revoked", "key", "revoke", "-id", m[1])
 	if k, _ := store.KeyByHash(context.Background(), apikey.Hash(m[3])); k != nil {
 		t.Fatal("revoked key still authenticates")
 	}
@@ -225,14 +255,7 @@ func TestIdempotencyPurgePartial(t *testing.T) {
 	env := map[string]string{"QFCTL_MYSQL_DSN": dbtest.MigrateDSN(t)}
 	expiredKey := func(limit int64) int64 { // 返回账户号；账户里有一个已过期的键
 		t.Helper()
-		issued, err := store.IssueKey(context.Background(), dbtest.Account(t, store, limit), []string{"m"}, ledger.Rate{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		k, err := store.KeyByHash(context.Background(), apikey.Hash(issued.Secret))
-		if err != nil || k == nil {
-			t.Fatalf("KeyByHash = %v, %v", k, err)
-		}
+		k := dbtest.Key(t, store, dbtest.Account(t, store, limit))
 		r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: k.AccountID, KeyID: k.ID, Purpose: "chat", Alias: "m",
 			Upstream: "u", UpstreamModel: "um", EstInput: 1, EstOutput: 1, IdempotencyKey: "k", Fingerprint: make([]byte, 32)}
 		if _, err := store.Reserve(context.Background(), r); err != nil {
@@ -289,14 +312,7 @@ func TestReconcileCommand(t *testing.T) {
 	ctx := context.Background()
 	store := dbtest.Store(t)
 	name := dbtest.Account(t, store, 1_000_000)
-	issued, err := store.IssueKey(ctx, name, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := dbtest.Key(t, store, name)
 	newCall := func(status ledger.Status) string {
 		t.Helper()
 		r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
@@ -401,14 +417,7 @@ func TestUsageReconcileCommand(t *testing.T) {
 	ctx := context.Background()
 	store := dbtest.Store(t)
 	name := dbtest.Account(t, store, 1_000_000)
-	issued, err := store.IssueKey(ctx, name, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := dbtest.Key(t, store, name)
 	r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
 		Alias: "m", Upstream: "up", UpstreamModel: "um", EstInput: 10, EstOutput: 10}
 	if _, err := store.Reserve(ctx, r); err != nil {

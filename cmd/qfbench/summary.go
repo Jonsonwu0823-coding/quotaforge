@@ -68,35 +68,14 @@ func writeRaw(w io.Writer, m meta, rows []result) error {
 
 // readRaw 读 writeRaw 写的原始数据；格式不对就报错，不猜。
 func readRaw(r io.Reader) (meta, []result, error) {
-	var m meta
 	br := bufio.NewReader(r)
 	first, err := br.ReadString('\n')
 	if err != nil || !strings.HasPrefix(first, "# qfbench ") {
-		return m, nil, errors.New("raw data: the first line must be '# qfbench mode=...'")
+		return meta{}, nil, errors.New("raw data: the first line must be '# qfbench mode=...'")
 	}
-	for _, kv := range strings.Fields(strings.TrimPrefix(first, "# qfbench ")) {
-		k, v, _ := strings.Cut(kv, "=")
-		var n int64
-		if k != "mode" {
-			if n, err = strconv.ParseInt(v, 10, 64); err != nil {
-				return m, nil, fmt.Errorf("raw data: %s in the first line", kv)
-			}
-		}
-		switch k {
-		case "mode":
-			m.Mode = v
-		case "c":
-			m.C = int(n)
-		case "n":
-			m.N = int(n)
-		case "warmup_ms":
-			m.WarmupMS = n
-		case "duration_ms":
-			m.DurationMS = n
-		}
-	}
-	if m.Mode != "sustain" && m.Mode != "burst" || m.Mode == "sustain" && m.DurationMS <= 0 {
-		return m, nil, errors.New("raw data: the first line has no valid mode and duration")
+	m, err := parseMeta(strings.TrimPrefix(first, "# qfbench "))
+	if err != nil {
+		return m, nil, err
 	}
 	cr := csv.NewReader(br)
 	cr.FieldsPerRecord = len(header)
@@ -109,21 +88,60 @@ func readRaw(r io.Reader) (meta, []result, error) {
 	}
 	rows := make([]result, 0, len(recs)-1)
 	for i, rec := range recs[1:] {
-		var r result
-		var e [4]error
-		r.Seq, e[0] = strconv.Atoi(rec[0])
-		r.StartUS, e[1] = strconv.ParseInt(rec[1], 10, 64)
-		r.Target, e[2] = strconv.Atoi(rec[2])
-		r.Status, e[3] = strconv.Atoi(rec[3])
-		lat, err := strconv.ParseInt(rec[5], 10, 64)
-		if err := errors.Join(e[0], e[1], e[2], e[3], err); err != nil {
+		r, err := parseRow(rec)
+		if err != nil {
 			return m, nil, fmt.Errorf("raw data line %d: %w", i+3, err)
 		}
-		r.Code, r.LatencyUS, r.Warmup, r.RequestID = rec[4], lat, rec[6] == "1", rec[7]
-		r.Replayed, r.RetryAfter, r.ClientError = rec[8] == "1", rec[9], rec[10]
 		rows = append(rows, r)
 	}
 	return m, rows, nil
+}
+
+// parseMeta 读第一行 # qfbench 之后的 键=值：mode 是 sustain 或 burst，其余是整数；sustain 要有正的测量时长。
+func parseMeta(fields string) (meta, error) {
+	var m meta
+	for _, kv := range strings.Fields(fields) {
+		k, v, _ := strings.Cut(kv, "=")
+		if k == "mode" {
+			m.Mode = v
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return m, fmt.Errorf("raw data: %s in the first line", kv)
+		}
+		switch k {
+		case "c":
+			m.C = int(n)
+		case "n":
+			m.N = int(n)
+		case "warmup_ms":
+			m.WarmupMS = n
+		case "duration_ms":
+			m.DurationMS = n
+		}
+	}
+	if m.Mode != "sustain" && m.Mode != "burst" || m.Mode == "sustain" && m.DurationMS <= 0 {
+		return m, errors.New("raw data: the first line has no valid mode and duration")
+	}
+	return m, nil
+}
+
+// parseRow 读 CSV 的一行（列见 header）。
+func parseRow(rec []string) (result, error) {
+	var r result
+	var e [5]error
+	r.Seq, e[0] = strconv.Atoi(rec[0])
+	r.StartUS, e[1] = strconv.ParseInt(rec[1], 10, 64)
+	r.Target, e[2] = strconv.Atoi(rec[2])
+	r.Status, e[3] = strconv.Atoi(rec[3])
+	r.LatencyUS, e[4] = strconv.ParseInt(rec[5], 10, 64)
+	if err := errors.Join(e[:]...); err != nil {
+		return r, err
+	}
+	r.Code, r.Warmup, r.RequestID = rec[4], rec[6] == "1", rec[7]
+	r.Replayed, r.RetryAfter, r.ClientError = rec[8] == "1", rec[9], rec[10]
+	return r, nil
 }
 
 // 汇总的分类，按这个顺序报，个数为 0 的也报（分母都写出来）。

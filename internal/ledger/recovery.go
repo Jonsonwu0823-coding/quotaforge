@@ -94,6 +94,15 @@ func scanUsage(prompt, completion, total sql.NullInt64) *Usage {
 	return &Usage{Prompt: prompt.Int64, Completion: completion.Int64, Total: total.Int64, HasCompletion: completion.Valid}
 }
 
+// usageColumns 是写进 calls 的三列用量，scanUsage 反过来：没有用量时都是 NULL，嵌入没有 completion_tokens 时那一列是 NULL。
+func usageColumns(u *Usage) (prompt, completion, total sql.NullInt64) {
+	if u == nil {
+		return
+	}
+	return sql.NullInt64{Int64: u.Prompt, Valid: true}, sql.NullInt64{Int64: u.Completion, Valid: u.HasCompletion},
+		sql.NullInt64{Int64: u.Total, Valid: true}
+}
+
 // checkTransition 按转换表判断 by 能不能把调用从现在的状态改成 to。
 func checkTransition(by Actor, c *lockedCall, to Status) error {
 	if !slices.Contains(transitions[by][c.status], to) {
@@ -156,6 +165,36 @@ const reclaimBatch = 100
 // ReclaimStats 是一次回收的结果：释放的 RESERVED 数、标成未知的 IN_FLIGHT 数。
 type ReclaimStats struct{ Released, Unknown int }
 
+// count 记下一个回收了的调用转到的状态（空的是锁住之后已经不用回收的）。
+func (s *ReclaimStats) count(to Status) {
+	switch to {
+	case Cancelled:
+		s.Released++
+	case UsageUnknown:
+		s.Unknown++
+	}
+}
+
+// failures 数一轮回收或清理里出错的事务：个数和第一个错误。一个事务出错只算它自己，接着处理下一个，整轮结束时一起报。
+type failures struct {
+	n     int
+	first error
+}
+
+func (f *failures) add(err error) {
+	if f.n++; f.first == nil {
+		f.first = err
+	}
+}
+
+// err 是整轮的错误：没有出错时是 nil，否则是 "<op>: <个数> <what> failed, first: <第一个错误>"。
+func (f *failures) err(op, what string) error {
+	if f.n == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %d %s failed, first: %w", op, f.n, what, f.first)
+}
+
 // Reclaim 回收从预留（created_at）算起超过 after 还没结束的调用：RESERVED 是确定没发出，释放；IN_FLIGHT 标成未知。
 // after 由调用方按超时算出（见 config.ReclaimAfter），比一次活着的调用停在这两个状态的最长时间还长。时间都用数据库的。
 //
@@ -172,8 +211,7 @@ type ReclaimStats struct{ Released, Unknown int }
 // 一个账户的额度行一直被锁住时，一轮在它的每个候选上各等 opTimeout；不在出错之后跳过这个账户剩下的候选。
 func (s *Store) Reclaim(ctx context.Context, after, opTimeout time.Duration) (ReclaimStats, error) {
 	var stats ReclaimStats
-	var failed int
-	var first error
+	var failed failures
 	cursor := candidate{createdAt: minDatetime}
 	for {
 		batch, err := s.reclaimCandidates(ctx, after, opTimeout, cursor)
@@ -184,16 +222,10 @@ func (s *Store) Reclaim(ctx context.Context, after, opTimeout time.Duration) (Re
 			if ctx.Err() != nil {
 				return stats, ctx.Err()
 			}
-			to, err := s.reclaimOne(ctx, c.account, c.id, opTimeout)
-			switch {
-			case err != nil:
-				if failed++; first == nil {
-					first = err
-				}
-			case to == Cancelled:
-				stats.Released++
-			case to == UsageUnknown:
-				stats.Unknown++
+			if to, err := s.reclaimOne(ctx, c.account, c.id, opTimeout); err != nil {
+				failed.add(err)
+			} else {
+				stats.count(to)
 			}
 		}
 		if len(batch) < reclaimBatch {
@@ -201,10 +233,7 @@ func (s *Store) Reclaim(ctx context.Context, after, opTimeout time.Duration) (Re
 		}
 		cursor = batch[len(batch)-1]
 	}
-	if failed > 0 {
-		return stats, fmt.Errorf("reclaim: %d calls failed, first: %w", failed, first)
-	}
-	return stats, nil
+	return stats, failed.err("reclaim", "calls")
 }
 
 // minDatetime 比任何 created_at 都早（DATETIME 的最小值），是第一批的游标。

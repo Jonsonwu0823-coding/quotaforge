@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
 )
 
@@ -162,6 +164,22 @@ func Account(t testing.TB, s *ledger.Store, limit int64) string {
 	return name
 }
 
+// Key 给账户发一把只允许别名 m、不限流的 Key，返回按哈希查到的它（鉴权时网关拿到的那个）。
+func Key(t testing.TB, s *ledger.Store, account string) *ledger.Key {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	issued, err := s.IssueKey(ctx, account, []string{"m"}, ledger.Rate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := s.KeyByHash(ctx, apikey.Hash(issued.Secret))
+	if err != nil || k == nil {
+		t.Fatalf("KeyByHash = %v, %v", k, err)
+	}
+	return k
+}
+
 // Budget 读账户的额度行：上限、已预留、已消费。
 func Budget(t testing.TB, db *sql.DB, account string) (limit, reserved, consumed int64) {
 	t.Helper()
@@ -210,20 +228,28 @@ func Now(t testing.TB, db *sql.DB) time.Time {
 	return now
 }
 
-// LockBudget 在另一个事务里锁住账户的额度行，返回放锁的函数（测试结束时也会放）。
-func LockBudget(t testing.TB, db *sql.DB, accountID int64) (release func()) {
+// Hold 在另一个事务里执行 query（例如 SELECT … FOR UPDATE）、拿着它的锁，返回放锁的函数：回滚这个事务，只回滚一次，
+// 测试结束时也会放。
+func Hold(t testing.TB, db *sql.DB, query string, args ...any) (release func()) {
 	t.Helper()
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec("SELECT 1 FROM budgets WHERE account_id = ? FOR UPDATE", accountID); err != nil {
+	if _, err := tx.Exec(query, args...); err != nil {
 		_ = tx.Rollback()
 		t.Fatal(err)
 	}
-	release = func() { _ = tx.Rollback() }
+	var once sync.Once
+	release = func() { once.Do(func() { _ = tx.Rollback() }) }
 	t.Cleanup(release)
 	return release
+}
+
+// LockBudget 在另一个事务里锁住账户的额度行，返回放锁的函数（测试结束时也会放）。
+func LockBudget(t testing.TB, db *sql.DB, accountID int64) (release func()) {
+	t.Helper()
+	return Hold(t, db, "SELECT 1 FROM budgets WHERE account_id = ? FOR UPDATE", accountID)
 }
 
 // BudgetWaiters 是 app（App 的连接）这个账号在本库里正在执行、语句以 UPDATE budgets 开头的线程数。

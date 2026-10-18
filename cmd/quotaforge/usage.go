@@ -15,7 +15,8 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/usageevents"
 )
 
-// enableTimeout 是启动时打开用量事件开关的上限：打开要等正在结清、已经读过开关的事务提交，每个最多一次账本操作。
+// enableTimeout 是启动时打开用量事件开关的上限：打开要等正在结清、已经读过开关的事务提交，每个最多一次账本操作；
+// 等锁超过会话的上限（1205）时在这个期限里重试，都不行才退出。
 const enableTimeout = 10 * time.Second
 
 // startForwarding 在配置里有 usage_events 时打开用量事件的开关（只开不关），并起转发循环；返回等它停下的函数。

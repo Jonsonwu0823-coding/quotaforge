@@ -502,6 +502,18 @@ func TestEmbeddingCacheStuckLeader(t *testing.T) {
 	})
 }
 
+// 查完缓存、预留出错（429）的领头的：在写错误之前就离开合并的表，它的客户端不读时，之后来的相同请求不等它。
+func TestEmbeddingCacheFailedLeaderLeavesBeforeWriting(t *testing.T) {
+	h := newCacheHarness(t, &faulty{Ledger: newAllowAll(), reserveErr: ledger.ErrQuotaExhausted}, &stubLimiter{}, newMemCache())
+	h.stuckLeader(t, embBody).waitWriting(t)
+	if h.flightCount() != 0 {
+		t.Fatalf("%d flights left while the failed leader is stuck", h.flightCount())
+	}
+	if r := collect(t, h.embAsync(h.clientCtx, clientKey, embBody, 1), 1, 3*time.Second)[0]; r.status != 429 || r.header.Get("Cache-Status") != statusMiss {
+		t.Fatalf("a later request: %d %q", r.status, r.header.Get("Cache-Status"))
+	}
+}
+
 // 写缓存不随客户端取消：请求发出之后客户端断开，领头的照样结算（有界结算）、照样写缓存，下一个相同请求命中。
 func TestEmbeddingCacheWriteOutlivesTheClient(t *testing.T) {
 	mc := newMemCache()

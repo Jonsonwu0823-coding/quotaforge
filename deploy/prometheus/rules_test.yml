@@ -243,6 +243,109 @@ tests:
           - exp_labels: {severity: warning, instance: a}
             exp_annotations: {summary: "实例 a 的后台循环约 10 轮没有成功"}
 
+  # 用量事件的消费者进程也导出后台循环的两个数，都是 0（它没有后台循环）：不触发。
+  - interval: 15s
+    input_series:
+      - series: qf_background_last_success_timestamp_seconds{instance="consumer"}
+        values: 0x20
+      - series: qf_background_interval_seconds{instance="consumer"}
+        values: 0x20
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: QFBackgroundStalled
+
+  # 消费者停了：QF 一直在发事件，消费者的序列从来没有（没被抓或者挂了）。条件 1 分钟时成立，再满 5 分钟触发。
+  - interval: 1m
+    input_series:
+      - series: qf_usage_events_forwarded_total{instance="a"}
+        values: 0+10x30
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: QFUsageConsumerStalled
+      - eval_time: 7m
+        alertname: QFUsageConsumerStalled
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "用量事件在发，消费者 10 分钟里一条都没取到（停了、没被抓，或者卡住了）"}
+
+  # 消费者在 10 分钟时停下（计数不再涨）：10 分钟的窗口在 20 分钟时只剩不涨的部分，再满 5 分钟触发。消费者跟得上、
+  # 或者没有流量的时候不报（下面两个用例）。
+  - interval: 1m
+    input_series:
+      - series: qf_usage_events_forwarded_total{instance="a"}
+        values: 0+10x40
+      - series: qf_usage_events_consumed_total{instance="consumer",result="applied"}
+        values: 0+10x10 100x30
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: QFUsageConsumerStalled
+      - eval_time: 27m
+        alertname: QFUsageConsumerStalled
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "用量事件在发，消费者 10 分钟里一条都没取到（停了、没被抓，或者卡住了）"}
+  - interval: 1m
+    input_series:
+      - series: qf_usage_events_forwarded_total{instance="a"}
+        values: 0+10x30
+      - series: qf_usage_events_consumed_total{instance="consumer",result="applied"}
+        values: 0+9x30
+      - series: qf_usage_events_consumed_total{instance="consumer",result="duplicate"}
+        values: 0+1x30
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: QFUsageConsumerStalled
+  - interval: 1m
+    input_series:
+      - series: qf_usage_events_forwarded_total{instance="a"}
+        values: 50x30
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: QFUsageConsumerStalled
+
+  # 消费者被一条事件卡住，每秒重试一次：错误率 1 个每秒，条件 1 分钟时成立，再满 10 分钟触发。
+  - interval: 1m
+    input_series:
+      - series: qf_background_errors_total{instance="consumer",task="usage_consume"}
+        values: 0+60x30
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QFUsageConsumerFailing
+      - eval_time: 12m
+        alertname: QFUsageConsumerFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "用量事件的消费者持续出错超过 10 分钟（写库、取消息或提交位点；可能有一条事件卡住了它的分区）"}
+
+  # 卡住时最慢的重试：每次都等满一次账本操作（2 秒）再加 RetryDelay（1 秒），每 3 秒一个错误（每分钟 20 个），也要报。
+  - interval: 1m
+    input_series:
+      - series: qf_background_errors_total{instance="consumer",task="usage_consume"}
+        values: 0+20x30
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QFUsageConsumerFailing
+      - eval_time: 12m
+        alertname: QFUsageConsumerFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "用量事件的消费者持续出错超过 10 分钟（写库、取消息或提交位点；可能有一条事件卡住了它的分区）"}
+
+  # 零星的错误（0.05 个每秒）、只出错 3 分钟的抖动、转发出错（usage_forward 不归这条管）：都不报。
+  - interval: 1m
+    input_series:
+      - series: qf_background_errors_total{instance="consumer",task="usage_consume"}
+        values: 0+3x30
+      - series: qf_background_errors_total{instance="consumer2",task="usage_consume"}
+        values: 0+60x3 180x27
+      - series: qf_background_errors_total{instance="a",task="usage_forward"}
+        values: 0+60x30
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: QFUsageConsumerFailing
+      - eval_time: 25m
+        alertname: QFUsageConsumerFailing
+
   # 未知用量：最早的一条在 6 分 40 秒时超过一天，再满 10 分钟才触发。
   - interval: 1m
     input_series:

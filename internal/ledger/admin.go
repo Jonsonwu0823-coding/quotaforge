@@ -9,8 +9,6 @@ import (
 	"regexp"
 	"unicode/utf8"
 
-	"github.com/go-sql-driver/mysql"
-
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 )
 
@@ -56,8 +54,7 @@ func (s *Store) CreateAccount(ctx context.Context, name string, limit int64, rat
 	return s.inTx(ctx, nil, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO accounts (name, rpm_limit, tpm_limit, created_at)
 			VALUES (?, ?, ?, UTC_TIMESTAMP(6))`, name, rate.RPM, rate.TPM)
-		var me *mysql.MySQLError
-		if errors.As(err, &me) && me.Number == 1062 { // ER_DUP_ENTRY
+		if isMySQLError(err, 1062) { // ER_DUP_ENTRY
 			return ErrAccountExists
 		}
 		if err != nil {
@@ -79,25 +76,13 @@ func (s *Store) SetLimit(ctx context.Context, name string, limit int64) error {
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE budgets b JOIN accounts a ON a.id = b.account_id
 		SET b.limit_tokens = ?, b.updated_at = UTC_TIMESTAMP(6) WHERE a.name = ?`, limit, name)
-	if err != nil {
-		return fmt.Errorf("set limit: %w", err)
-	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return ErrAccountNotFound
-	}
-	return nil
+	return oneRow(res, err, "set limit", ErrAccountNotFound)
 }
 
 // SetAccountRate 改账户的限流限额，下一个请求就按新值。
 func (s *Store) SetAccountRate(ctx context.Context, name string, rate Rate) error {
 	res, err := s.db.ExecContext(ctx, "UPDATE accounts SET rpm_limit = ?, tpm_limit = ? WHERE name = ?", rate.RPM, rate.TPM, name)
-	if err != nil {
-		return fmt.Errorf("set account rate: %w", err)
-	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return ErrAccountNotFound
-	}
-	return nil
+	return oneRow(res, err, "set account rate", ErrAccountNotFound)
 }
 
 // IssuedKey 是刚发出的 Key。Secret 只在这里出现一次，库里只存哈希和前缀。
@@ -128,11 +113,8 @@ func (s *Store) IssueKey(ctx context.Context, account string, models []string, r
 	res, err := s.db.ExecContext(ctx, `INSERT INTO api_keys (account_id, sha256, prefix, models, status, rpm_limit, tpm_limit, created_at)
 		SELECT id, ?, ?, ?, 'active', ?, ?, UTC_TIMESTAMP(6) FROM accounts WHERE name = ?`,
 		apikey.Hash(key), key[:keyPrefixLen], list, rate.RPM, rate.TPM, account)
-	if err != nil {
-		return nil, fmt.Errorf("insert key: %w", err)
-	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return nil, ErrAccountNotFound
+	if err := oneRow(res, err, "insert key", ErrAccountNotFound); err != nil {
+		return nil, err
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
@@ -145,26 +127,23 @@ func (s *Store) IssueKey(ctx context.Context, account string, models []string, r
 func (s *Store) RevokeKey(ctx context.Context, id int64) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET status = 'revoked', revoked_at = UTC_TIMESTAMP(6)
 		WHERE id = ? AND status = 'active'`, id)
-	if err != nil {
-		return fmt.Errorf("revoke key: %w", err)
-	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return ErrKeyNotFound
-	}
-	return nil
+	return oneRow(res, err, "revoke key", ErrKeyNotFound)
 }
 
 // SetKeyRate 改一把可用的 Key 的限流限额，下一个请求就按新值。不存在或已吊销返回 ErrKeyNotFound。
 func (s *Store) SetKeyRate(ctx context.Context, id int64, rate Rate) error {
 	res, err := s.db.ExecContext(ctx, "UPDATE api_keys SET rpm_limit = ?, tpm_limit = ? WHERE id = ? AND status = 'active'",
 		rate.RPM, rate.TPM, id)
-	if err != nil {
-		return fmt.Errorf("set key rate: %w", err)
+	return oneRow(res, err, "set key rate", ErrKeyNotFound)
+}
+
+// decodeModels 解出 api_keys.models 列：Key 允许的别名，JSON 数组。
+func decodeModels(keyID int64, raw []byte) ([]string, error) {
+	var models []string
+	if err := json.Unmarshal(raw, &models); err != nil {
+		return nil, fmt.Errorf("key %d: models column: %w", keyID, err)
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
-		return ErrKeyNotFound
-	}
-	return nil
+	return models, nil
 }
 
 // KeyInfo 是 Key 的公开信息，不含 Key 本身。
@@ -191,8 +170,8 @@ func (s *Store) ListKeys(ctx context.Context, account string) ([]KeyInfo, error)
 		if err := rows.Scan(&k.ID, &k.Prefix, &k.Status, &models, &k.Rate.RPM, &k.Rate.TPM); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(models, &k.Models); err != nil {
-			return nil, fmt.Errorf("key %d: models column: %w", k.ID, err)
+		if k.Models, err = decodeModels(k.ID, models); err != nil {
+			return nil, err
 		}
 		out = append(out, k)
 	}

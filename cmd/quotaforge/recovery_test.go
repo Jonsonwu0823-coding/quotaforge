@@ -14,13 +14,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/fakeupstream"
@@ -90,13 +88,10 @@ func TestKillWhileUpstreamHasTheRequest(t *testing.T) {
 	fake := fakeupstream.New()
 	up := httptest.NewServer(fake)
 	t.Cleanup(up.Close)
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	cfgJSON := fmt.Sprintf(`{"upstreams":[{"name":"fake","base_url":%q,"api_key_env":"QF_KILL_UPSTREAM_KEY"}],
 		"models":[{"alias":"billed","purpose":"chat","targets":[{"upstream":"fake","upstream_model":"fake-billed-hang","weight":1}],"default_max_tokens":16}],
 		"database":{"dsn_env":"QF_KILL_DSN"},"redis":{"url_env":"QF_KILL_REDIS"}}`, up.URL+"/v1")
-	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cfgPath := writeConfig(t, cfgJSON)
 	t.Setenv("QF_KILL_UPSTREAM_KEY", "test-only-upstream-key")
 	cfg, err := config.Load(cfgPath, func(k string) string {
 		return map[string]string{"QF_KILL_UPSTREAM_KEY": "x", "QF_KILL_DSN": "x", "QF_KILL_REDIS": "x"}[k]
@@ -178,15 +173,7 @@ func TestKillWhileUpstreamHasTheRequest(t *testing.T) {
 func TestBackgroundLoop(t *testing.T) {
 	ctx := context.Background()
 	store, admin := dbtest.Store(t), dbtest.Admin(t)
-	account := dbtest.Account(t, store, 1_000_000)
-	issued, err := store.IssueKey(ctx, account, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := dbtest.Key(t, store, dbtest.Account(t, store, 1_000_000))
 	reserve := func(idemKey string) ledger.Reservation {
 		r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
 			Alias: "m", Upstream: "u", UpstreamModel: "um", EstInput: 5, EstOutput: 5}
@@ -215,23 +202,13 @@ func TestBackgroundLoop(t *testing.T) {
 		}
 	}
 	var logs syncLog
-	loopCtx, stop := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		background(loopCtx, store, after, time.Hour, false, slog.New(slog.NewJSONHandler(&logs, nil)), telemetry.NewMetrics(store.Stats))
-		close(done)
-	}()
+	stop := startBackground(t, store, after, time.Hour, &logs)
 	waitUntil(t, 10*time.Second, func() bool {
 		var records int
 		_ = admin.QueryRow("SELECT COUNT(*) FROM idempotency_keys WHERE call_id = ?", keyed.CallID).Scan(&records)
 		return callStatus(t, admin, stale.CallID) == "CANCELLED" && callStatus(t, admin, inFlight.CallID) == "USAGE_UNKNOWN" && records == 0
 	})
 	stop()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the background loop did not stop")
-	}
 	// 这个测试里没有请求等过连接，所以没有 db_pool 这一行
 	if !strings.Contains(logs.String(), `"msg":"background"`) || strings.Contains(logs.String(), "_error") || strings.Contains(logs.String(), "db_pool") {
 		t.Fatalf("background log: %s", logs.String())
@@ -244,15 +221,7 @@ func TestBackgroundLoop(t *testing.T) {
 func TestBackgroundPurgeDeadlineIsNotAnError(t *testing.T) {
 	ctx := context.Background()
 	store, admin := dbtest.Store(t), dbtest.Admin(t)
-	account := dbtest.Account(t, store, 1_000_000)
-	issued, err := store.IssueKey(ctx, account, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := dbtest.Key(t, store, dbtest.Account(t, store, 1_000_000))
 	const backlog = 5
 	for i := range backlog {
 		r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
@@ -287,24 +256,12 @@ func TestBackgroundPurgeDeadlineIsNotAnError(t *testing.T) {
 	}
 
 	var next syncLog
-	loopCtx, stop := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		background(loopCtx, store, time.Hour, time.Hour, false, slog.New(slog.NewJSONHandler(&next, nil)), telemetry.NewMetrics(store.Stats))
-		close(done)
-	}()
+	stop := startBackground(t, store, time.Hour, time.Hour, &next)
 	waitUntil(t, 10*time.Second, func() bool { return left() == 0 })
 	stop()
-	<-done
 	var purged int64 // 共用库里别的账户也可能有刚过期的键，所以只要求不少于这 5 个
-	for _, l := range strings.Split(strings.TrimSpace(next.String()), "\n") {
-		var line struct {
-			Msg    string
-			Purged int64
-		}
-		if err := json.Unmarshal([]byte(l), &line); err == nil && line.Msg == "background" {
-			purged += line.Purged
-		}
+	for _, l := range logLines[struct{ Purged int64 }](next.String(), "background") {
+		purged += l.Purged
 	}
 	if purged < backlog || strings.Contains(next.String(), "_error") {
 		t.Fatalf("purged %d, want at least %d, no error: %s", purged, backlog, next.String())
@@ -360,15 +317,7 @@ func TestPoolWaits(t *testing.T) {
 func TestBackgroundLogsPoolWaits(t *testing.T) {
 	ctx := context.Background()
 	store, admin := dbtest.Store(t), dbtest.Admin(t)
-	account := dbtest.Account(t, store, 1_000_000)
-	issued, err := store.IssueKey(ctx, account, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
-	if err != nil {
-		t.Fatal(err)
-	}
+	key := dbtest.Key(t, store, dbtest.Account(t, store, 1_000_000))
 	release := dbtest.LockBudget(t, admin, key.AccountID)
 	n := store.Stats().MaxOpenConnections + 1
 	errs := make(chan error, n)
@@ -391,19 +340,45 @@ func TestBackgroundLogsPoolWaits(t *testing.T) {
 	defer cancel()
 	background(rounds, store, time.Hour, 50*time.Millisecond, false, slog.New(slog.NewJSONHandler(&logs, nil)), telemetry.NewMetrics(store.Stats))
 	var pool []int64 // 每一行 db_pool 的等待次数
-	for _, l := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		var line struct {
-			Msg   string
-			Waits int64
-		}
-		if err := json.Unmarshal([]byte(l), &line); err == nil && line.Msg == "db_pool" {
-			pool = append(pool, line.Waits)
-		}
+	for _, l := range logLines[struct{ Waits int64 }](logs.String(), "db_pool") {
+		pool = append(pool, l.Waits)
 	}
 	if len(pool) != 1 || pool[0] < 1 {
 		t.Fatalf("db_pool lines with waits %v, want exactly one line with at least 1: %s", pool, logs.String())
 	}
 	dbtest.Verify(t, store)
+}
+
+// startBackground 在另一个 goroutine 里跑后台循环（不开用量事件，日志写进 logs），返回让它停下并等它返回的函数（最多等 10 秒）。
+func startBackground(t *testing.T, store *ledger.Store, after, interval time.Duration, logs *syncLog) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		background(ctx, store, after, interval, false, slog.New(slog.NewJSONHandler(logs, nil)), telemetry.NewMetrics(store.Stats))
+	}()
+	return func() {
+		t.Helper()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the background loop did not stop")
+		}
+	}
+}
+
+// logLines 是 JSON 日志里 msg 为 msg 的那些行，解码进 T。
+func logLines[T any](logs, msg string) []T {
+	var out []T
+	for _, l := range strings.Split(strings.TrimSpace(logs), "\n") {
+		var head struct{ Msg string }
+		var line T
+		if json.Unmarshal([]byte(l), &head) == nil && head.Msg == msg && json.Unmarshal([]byte(l), &line) == nil {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func callStatus(t *testing.T, admin *sql.DB, id string) string {

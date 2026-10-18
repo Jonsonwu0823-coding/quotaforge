@@ -124,7 +124,7 @@ stream gone "$(chat_body fake-stream-slow-300)" --max-time 1.5
 gid=$(request_id gone)
 say "events before the client left: $(data_lines gone)"
 check "disconnect: the client got some events but not [DONE]" \
-  [ "$(data_lines gone)" -ge 1 ] && [ "$(data_lines gone)" -lt "$CLIENT_EVENTS" ] && [ "$(last_data gone)" != "data: [DONE]" ]
+  [ "$(($(data_lines gone) >= 1 && $(data_lines gone) < CLIENT_EVENTS))/$(grep -c 'data: \[DONE\]' "$work/gone.events" || true)" = "1/0" ]
 wait_for 15 call_is "$gid" SETTLED
 check "disconnect: QF read the rest of the stream: SETTLED, the log has client_disconnected and status 200" \
   [ "$(log_line "$gid" | jq -r '[.outcome, .client_disconnected, .status] | join("/")')" = "SETTLED/true/200" ]
@@ -143,11 +143,12 @@ check "cut: the call's usage is unknown (null, not 0) and it keeps its reservati
 say "== 5. a stream slower than the chat timeout (25 s)"
 start=$(date +%s)
 stream slow "$(chat_body fake-stream-slow-2500)"
+took=$(($(date +%s) - start))
 sid=$(request_id slow)
-say "the stream ended after $(($(date +%s) - start)) s with $(data_lines slow) events"
+say "the stream ended after $took s with $(data_lines slow) events"
 check "timeout: cut at the chat timeout with QF's error event (upstream_timeout), no [DONE]" \
   [ "$(last_data slow | cut -c7- | jq -r .error.code)/$(grep -c 'data: \[DONE\]' "$work/slow.events" || true)" = "upstream_timeout/0" ]
-check "timeout: it took about the chat timeout (24-30 s)" [ $(($(date +%s) - start)) -ge 24 ] && [ $(($(date +%s) - start)) -le 30 ]
+check "timeout: it took about the chat timeout (24-30 s)" [ "$((took >= 24 && took <= 30))" = 1 ]
 wait_for 10 call_is "$sid" USAGE_UNKNOWN
 check "timeout: the call's usage is unknown" [ "$(call "$sid" '[.status, .error_code] | join("/")')" = "USAGE_UNKNOWN/upstream_timeout" ]
 

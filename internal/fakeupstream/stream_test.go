@@ -187,6 +187,45 @@ func TestStreamBytewiseCountsBeforeLastByte(t *testing.T) {
 	}
 }
 
+// writeLog 是写事件时的替身：记下每次写的长度、写时的事件计数，fail 为 true 时每次写都失败。
+type writeLog struct {
+	s      *Server
+	fail   bool
+	writes [][2]int64 // 长度、写的时候的 StreamEvents
+}
+
+func (w *writeLog) Header() http.Header { return http.Header{} }
+func (w *writeLog) WriteHeader(int)     {}
+func (w *writeLog) Flush()              {}
+func (w *writeLog) Write(b []byte) (int, error) {
+	if w.fail {
+		return 0, io.ErrClosedPipe
+	}
+	w.writes = append(w.writes, [2]int64{int64(len(b)), w.s.Stats().StreamEvents})
+	return len(b), nil
+}
+
+// 计数在写成功之后、事件的最后一个字节之前：不论事件多大，最后一个字节单独写、写的时候已经计上；前面的部分写的时候还没计。
+// 写失败的事件不计数。
+func TestStreamEventCountedAfterTheWrite(t *testing.T) {
+	for _, size := range []int{10, 1 << 20} {
+		s := New()
+		w := &writeLog{s: s}
+		st := &streamer{s: s, w: w, ctx: context.Background(), model: "fake-chat"}
+		if !st.event(strings.Repeat("x", size)) || s.Stats().StreamEvents != 1 {
+			t.Fatalf("size %d: counted %d", size, s.Stats().StreamEvents)
+		}
+		if len(w.writes) != 2 || w.writes[0] != [2]int64{int64(size) + 7, 0} || w.writes[1] != [2]int64{1, 1} {
+			t.Fatalf("size %d: writes (length, count) = %v", size, w.writes)
+		}
+	}
+	s := New()
+	st := &streamer{s: s, w: &writeLog{s: s, fail: true}, ctx: context.Background(), model: "fake-chat"}
+	if st.event("x") || s.Stats().StreamEvents != 0 {
+		t.Fatalf("a failed write was counted: %d", s.Stats().StreamEvents)
+	}
+}
+
 // readEvent 读一个完整的事件（一行 data 加一个空行），返回 data。
 func readEvent(t *testing.T, r *bufio.Reader) string {
 	t.Helper()

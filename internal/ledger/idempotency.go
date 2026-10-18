@@ -210,8 +210,7 @@ func (s *Store) PurgeIdempotency(ctx context.Context, opTimeout time.Duration) (
 		return 0, err
 	}
 	var total int64
-	var failed int
-	var first error
+	var failed failures
 	stopped := false
 	cursor := expiredKey{expires: minDatetime} // 比任何记录都早：第一批从头取
 	for !stopped {
@@ -219,32 +218,35 @@ func (s *Store) PurgeIdempotency(ctx context.Context, opTimeout time.Duration) (
 		if err != nil {
 			return total, err
 		}
-		for _, g := range byAccount(batch) {
-			if ctx.Err() != nil {
-				stopped = true
-				break
-			}
-			n, err := s.purgeAccount(ctx, g, opTimeout)
-			if err != nil {
-				if failed++; first == nil {
-					first = err
-				}
-				continue
-			}
-			total += n
-		}
+		var n int64
+		n, stopped = s.purgeAccounts(ctx, byAccount(batch), opTimeout, &failed)
+		total += n
 		if len(batch) < purgeBatch {
 			break
 		}
 		cursor = batch[len(batch)-1]
 	}
-	switch {
-	case failed > 0:
-		return total, fmt.Errorf("purge idempotency: %d transactions failed, first: %w", failed, first)
-	case stopped:
-		return total, fmt.Errorf("%w: %w", ErrPurgeStopped, ctx.Err())
+	if err := failed.err("purge idempotency", "transactions"); err != nil || !stopped {
+		return total, err
 	}
-	return total, nil
+	return total, fmt.Errorf("%w: %w", ErrPurgeStopped, ctx.Err())
+}
+
+// purgeAccounts 一个账户一个事务地删掉一批过期记录，返回删掉的条数（出错的事务记进 failed，不计条数）。
+// ctx 取消或到期时在两个事务之间停下，stopped 为 true。
+func (s *Store) purgeAccounts(ctx context.Context, groups []expiredKeys, opTimeout time.Duration, failed *failures) (n int64, stopped bool) {
+	for _, g := range groups {
+		if ctx.Err() != nil {
+			return n, true
+		}
+		m, err := s.purgeAccount(ctx, g, opTimeout)
+		if err != nil {
+			failed.add(err)
+			continue
+		}
+		n += m
+	}
+	return n, false
 }
 
 // now 是数据库的当前时间，DATETIME(6) 的文本，原样传回数据库比较。过期按数据库的时间判断，不用 QF 的时钟。

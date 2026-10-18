@@ -211,7 +211,7 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 	if c.firstEvent != 0 {
 		attrs = append(attrs, attrFirstEventMS.Int64(c.firstEvent.Milliseconds()))
 	}
-	if c.writeTimeout {
+	if c.stream && c.writeTimeout { // 属性名带 stream：非流式的写超时只在日志里
 		attrs = append(attrs, attrWriteTimeout.Bool(true))
 	}
 	return attrs

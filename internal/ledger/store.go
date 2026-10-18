@@ -12,7 +12,6 @@ package ledger
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -96,7 +95,7 @@ type Usage struct {
 // Valid 报告用量对这个接口是否可信：三个数都不为负；chat 必须有 completion_tokens，嵌入可以没有。
 // 上游的响应和对账的证据都按这一条判断，不合格的当作未知，不补 0。
 func (u Usage) Valid(purpose string) bool {
-	return u.Prompt >= 0 && u.Total >= 0 && u.Completion >= 0 && (u.HasCompletion || purpose != "chat")
+	return u.Prompt >= 0 && u.Total >= 0 && u.Completion >= 0 && (u.HasCompletion || purpose != string(config.Chat))
 }
 
 // Result 是网关对一次调用的收尾。Status 是 Settled 时 Usage 必须有，结算按 Usage.Total。字符串为空、HTTPStatus 为 0 的存 NULL。
@@ -177,9 +176,8 @@ func (s *Store) Stats() sql.DBStats { return s.db.Stats() }
 func (s *Store) CheckSchema(ctx context.Context) error {
 	var v int
 	err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&v)
-	var me *mysql.MySQLError
 	switch {
-	case errors.As(err, &me) && me.Number == 1146: // ER_NO_SUCH_TABLE
+	case isMySQLError(err, 1146): // ER_NO_SUCH_TABLE
 		return errors.New("database is not migrated; run qfctl migrate")
 	case err != nil:
 		return fmt.Errorf("read schema version: %w", err)
@@ -203,8 +201,8 @@ func (s *Store) KeyByHash(ctx context.Context, hash string) (*Key, error) {
 	case err != nil:
 		return nil, fmt.Errorf("look up key: %w", err)
 	}
-	if err := json.Unmarshal(models, &k.Models); err != nil {
-		return nil, fmt.Errorf("key %d: models column: %w", k.ID, err)
+	if k.Models, err = decodeModels(k.ID, models); err != nil {
+		return nil, err
 	}
 	return &k, nil
 }
@@ -231,15 +229,8 @@ func reserveIn(ctx context.Context, tx *sql.Tx, r Reservation) error {
 		SET reserved_tokens = reserved_tokens + ?, updated_at = UTC_TIMESTAMP(6)
 		WHERE account_id = ? AND limit_tokens - reserved_tokens - consumed_tokens >= ?`,
 		r.Amount(), r.AccountID, r.Amount())
-	if err != nil {
-		return fmt.Errorf("reserve: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("reserve: %w", err)
-	}
-	if n == 0 {
-		return ErrQuotaExhausted
+	if err := oneRow(res, err, "reserve", ErrQuotaExhausted); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO calls (id, account_id, key_id, status, purpose, model_alias,
 		upstream, upstream_model, est_input_tokens, est_output_tokens, reserved_tokens,
@@ -257,6 +248,7 @@ func reserveIn(ctx context.Context, tx *sql.Tx, r Reservation) error {
 // 收尾、回收和对账都没有从它出发的转换。和用量事件的 outbox 行在同一个事务里写（writeEvent）：两样要么都在，要么都没有。
 // 外键检查只对账户和 Key 加共享锁，之后只有开关行上的共享锁，持锁时不等额度行和调用行，和预留、收尾构不成等待环。
 func (s *Store) RecordCached(ctx context.Context, c CachedCall) error {
+	prompt, completion, total := usageColumns(&c.Usage)
 	return s.inTx(ctx, nil, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO calls (id, account_id, key_id, status, purpose, model_alias,
 			upstream, upstream_model, est_input_tokens, est_output_tokens, reserved_tokens,
@@ -266,7 +258,7 @@ func (s *Store) RecordCached(ctx context.Context, c CachedCall) error {
 			VALUES (?, ?, ?, 'CACHED', ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 200, ?, ?, ?,
 				UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`,
 			c.CallID, c.AccountID, c.KeyID, c.Purpose, c.Alias, c.Upstream, c.UpstreamModel,
-			c.Usage.Prompt, sql.NullInt64{Int64: c.Usage.Completion, Valid: c.Usage.HasCompletion}, c.Usage.Total,
+			prompt, completion, total,
 			nullString(c.ClientRequestID), nullString(c.RunID), nullString(c.ResponseID), nullString(c.ResponseModel),
 			c.CachedFrom, Gateway, Cache); err != nil {
 			return fmt.Errorf("record cached call: %w", err)
@@ -283,17 +275,7 @@ var ErrNotReserved = errors.New("call is no longer RESERVED: it was reclaimed be
 func (s *Store) MarkSent(ctx context.Context, r Reservation) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE calls SET status = 'IN_FLIGHT', sent_at = UTC_TIMESTAMP(6)
 		WHERE id = ? AND status = 'RESERVED'`, r.CallID)
-	if err != nil {
-		return fmt.Errorf("mark sent: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("mark sent: %w", err)
-	}
-	if n == 0 {
-		return ErrNotReserved
-	}
-	return nil
+	return oneRow(res, err, "mark sent", ErrNotReserved)
 }
 
 // ErrNotInFlight 是改道没改成：调用已经不是 IN_FLIGHT（超过上界，被回收标成了未知），或者上游已经不是 r 里的那个。
@@ -308,17 +290,7 @@ func (s *Store) Reroute(ctx context.Context, r Reservation, upstream, upstreamMo
 	res, err := s.db.ExecContext(ctx, `UPDATE calls SET upstream = ?, upstream_model = ?
 		WHERE id = ? AND status = 'IN_FLIGHT' AND upstream = ? AND upstream_model = ?`,
 		upstream, upstreamModel, r.CallID, r.Upstream, r.UpstreamModel)
-	if err != nil {
-		return fmt.Errorf("reroute: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("reroute: %w", err)
-	}
-	if n == 0 {
-		return ErrNotInFlight
-	}
-	return nil
+	return oneRow(res, err, "reroute", ErrNotInFlight)
 }
 
 // Finish 是网关的收尾，一个事务：按转换表从当前状态转到 res.Status，写这次的全部结果，结算、释放或者额度不动（未知）。
@@ -337,12 +309,7 @@ func (s *Store) Finish(ctx context.Context, r Reservation, res Result) error {
 		if c.status == UsageUnknown {
 			evidence = LateResponse
 		}
-		var prompt, completion, total sql.NullInt64
-		if u := res.Usage; u != nil {
-			prompt = sql.NullInt64{Int64: u.Prompt, Valid: true}
-			completion = sql.NullInt64{Int64: u.Completion, Valid: u.HasCompletion}
-			total = sql.NullInt64{Int64: u.Total, Valid: true}
-		}
+		prompt, completion, total := usageColumns(res.Usage)
 		httpStatus := sql.NullInt64{Int64: int64(res.HTTPStatus), Valid: res.HTTPStatus != 0}
 		if err := setStatus(ctx, tx, r.CallID, c.status, res.Status, Gateway, evidence, `usage_prompt_tokens = ?, usage_completion_tokens = ?,
 			usage_total_tokens = ?, http_status = ?, error_code = ?, upstream_x_request_id = ?, upstream_response_id = ?,
@@ -406,3 +373,24 @@ func (s *Store) inTx(ctx context.Context, opts *sql.TxOptions, fn func(*sql.Tx) 
 }
 
 func nullString(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
+
+// oneRow 是按条件改一行的语句的结果：出错时带上 op；没改到行（条件不成立：不存在、已吊销、状态已经变了）时返回 none。
+func oneRow(res sql.Result, err error, op string, none error) error {
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	n, err := res.RowsAffected()
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w", op, err)
+	case n == 0:
+		return none
+	}
+	return nil
+}
+
+// isMySQLError 报告 err（可以是包装过的）是不是编号为 number 的 MySQL 错误。
+func isMySQLError(err error, number uint16) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == number
+}

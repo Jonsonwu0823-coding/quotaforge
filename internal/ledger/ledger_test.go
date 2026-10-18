@@ -215,13 +215,7 @@ func newFixture(t *testing.T, limit int64) *fixture {
 	t.Helper()
 	f := &fixture{s: dbtest.Store(t), admin: dbtest.Admin(t)}
 	f.account = dbtest.Account(t, f.s, limit)
-	issued, err := f.s.IssueKey(ctx, f.account, []string{"m"}, ledger.Rate{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.key, err = f.s.KeyByHash(ctx, apikey.Hash(issued.Secret)); err != nil || f.key == nil {
-		t.Fatalf("KeyByHash = %v, %v", f.key, err)
-	}
+	f.key = dbtest.Key(t, f.s, f.account)
 	return f
 }
 
@@ -230,6 +224,17 @@ func (f *fixture) reservation(amount int64) ledger.Reservation {
 	return ledger.Reservation{
 		CallID: "qf-" + rand.Text(), AccountID: f.key.AccountID, KeyID: f.key.ID,
 		Purpose: "chat", Alias: "m", Upstream: "u", UpstreamModel: "um", EstInput: amount - 1, EstOutput: 1,
+	}
+}
+
+// timedOut 让这几个调用落了发送意图之后等上游超时：收尾成 USAGE_UNKNOWN、504 upstream_timeout。
+func (f *fixture) timedOut(t *testing.T, rs ...ledger.Reservation) {
+	t.Helper()
+	for _, r := range rs {
+		f.sent(t, r)
+		if err := f.s.Finish(ctx, r, ledger.Result{Status: ledger.UsageUnknown, HTTPStatus: 504, ErrorCode: "upstream_timeout"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -410,6 +415,23 @@ func TestKeys(t *testing.T) {
 	}
 }
 
+// models 列解不出别名数组（库里是合法的 JSON，但不是数组）时，按哈希查 Key 和列出 Key 都报错，不当成没有别名。
+func TestKeyWithBadModels(t *testing.T) {
+	s := dbtest.Store(t)
+	name := dbtest.Account(t, s, 5)
+	k, err := s.IssueKey(ctx, name, []string{"a"}, ledger.Rate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, dbtest.Admin(t), fmt.Sprintf(`UPDATE api_keys SET models = '{"a": 1}' WHERE id = %d`, k.ID))
+	if got, err := s.KeyByHash(ctx, apikey.Hash(k.Secret)); got != nil || err == nil || !strings.Contains(err.Error(), "models column") {
+		t.Fatalf("KeyByHash = %+v, %v", got, err)
+	}
+	if list, err := s.ListKeys(ctx, name); list != nil || err == nil || !strings.Contains(err.Error(), "models column") {
+		t.Fatalf("ListKeys = %+v, %v", list, err)
+	}
+}
+
 // 改坏额度行或账本行，Verify 都能报出对应的规则；改坏的账户在测试结束时整个删掉。
 func TestVerifyFindsTampering(t *testing.T) {
 	cases := []struct {
@@ -483,6 +505,26 @@ func TestVerifyFindsTampering(t *testing.T) {
 }
 
 // rules 返回这个账户上不成立的规则名（去重、排序）。
+// tamperRules 先确认账本干净，再执行改坏数据的语句（每条用 ? 带上这个账户的编号、正好改一行），最后核对 Verify 报出的规则。
+func (f *fixture) tamperRules(t *testing.T, tamper, want []string) {
+	t.Helper()
+	if got := rules(t, f); len(got) != 0 {
+		t.Fatalf("before tampering: %v", got)
+	}
+	for _, q := range tamper {
+		res, err := f.admin.Exec(q, f.key.AccountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			t.Fatalf("tampering changed %d rows: %s", n, q)
+		}
+	}
+	if got := rules(t, f); !slices.Equal(got, want) {
+		t.Errorf("rules = %v, want %v", got, want)
+	}
+}
+
 func rules(t *testing.T, f *fixture) []string {
 	t.Helper()
 	v, err := f.s.Verify(ctx)

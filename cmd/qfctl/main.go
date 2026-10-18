@@ -135,13 +135,17 @@ var commands = map[string]command{
 	"usage-reconcile":   usageReconcileCmd,
 }
 
-// withStore 打开账本执行 fn，结束时关闭。
+// withStore 打开账本，确认库的版本就是这个程序要求的（和 QF 启动时同一个检查），再执行 fn，结束时关闭。
+// 版本不一致时什么都不做就退出 1：旧版本的命令不认识新的状态和列，新版本的命令在旧库上缺列。migrate 不经过这里。
 func withStore(ctx context.Context, dsn string, fn func(*ledger.Store) error) error {
 	s, err := ledger.Open(dsn)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	if err := s.CheckSchema(ctx); err != nil {
+		return err
+	}
 	return fn(s)
 }
 

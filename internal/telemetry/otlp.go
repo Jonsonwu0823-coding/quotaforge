@@ -173,7 +173,7 @@ func keyValues(attrs []attribute.KeyValue) []otlpKeyValue {
 		case attribute.FLOAT64:
 			f := a.Value.AsFloat64()
 			v.DoubleValue = &f
-		default: // 字符串；QF 不用切片类型的属性
+		default: // 字符串；切片（QF 只有 qf.failover_from）也按 Value.String() 写成一个字符串，形如 ["a","b"]
 			s := a.Value.String()
 			v.StringValue = &s
 		}

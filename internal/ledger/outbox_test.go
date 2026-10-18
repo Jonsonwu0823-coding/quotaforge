@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -35,18 +36,7 @@ func (f *fixture) sameAsCall(t *testing.T, id string) bool {
 // hold 在管理连接的一个事务里执行 query（加锁的读或写），一直不提交；返回放开（回滚）它的函数，测试结束时也会放。
 func (f *fixture) hold(t *testing.T, query string, args ...any) func() {
 	t.Helper()
-	tx, err := f.admin.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(query, args...); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	var once sync.Once
-	release := func() { once.Do(func() { _ = tx.Rollback() }) }
-	t.Cleanup(release)
-	return release
+	return dbtest.Hold(t, f.admin, query, args...)
 }
 
 // 四处结清都写一行、只写一行，内容和调用行相同：收尾的结算和取消（从 RESERVED、IN_FLIGHT 出发）、回收的释放、
@@ -75,12 +65,7 @@ func TestEventPerResolution(t *testing.T) {
 	}
 
 	toSettle, toRelease, stillUnknown := f.reserve(t, 100), f.reserve(t, 100), f.reserve(t, 100)
-	for _, r := range []ledger.Reservation{toSettle, toRelease, stillUnknown} {
-		f.sent(t, r)
-		if err := f.s.Finish(ctx, r, ledger.Result{Status: ledger.UsageUnknown, HTTPStatus: 504, ErrorCode: "upstream_timeout"}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	f.timedOut(t, toSettle, toRelease, stillUnknown)
 	proofs := []ledger.Proof{
 		{CallID: toSettle.CallID, Status: ledger.Settled, Usage: chatUsage(30, 7), Line: 2, Source: ledger.Bill},
 		{CallID: toRelease.CallID, Status: ledger.Cancelled, Line: 3, Source: ledger.Bill},
@@ -242,6 +227,68 @@ func TestEnableWaitsForSettlingTransactions(t *testing.T) {
 	racingEnables(t, f)
 	if got := rules(t, f); len(got) != 0 {
 		t.Fatalf("Verify: %v", got)
+	}
+}
+
+// 打开时开关行被一个结清事务拿着共享锁超过等锁的上限（2 秒，1205）：在 ctx 的期限里重试，放锁之后照常打开。
+// 锁一直不放的话，到 ctx 的期限返回错误，开关还是关的。
+func TestEnableRetriesLockWaitTimeouts(t *testing.T) {
+	f := newFixture(t, 1000)
+	switchOff(t, f)
+	release := f.hold(t, "SELECT 1 FROM usage_events WHERE id = 1 FOR SHARE")
+	time.AfterFunc(3*time.Second, release)
+	ctx10, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := f.s.EnableUsageEvents(ctx10); err != nil {
+		t.Fatalf("enable while the switch row was held for 3s: %v", err)
+	}
+	if f.count(t, "SELECT COUNT(*) FROM usage_events WHERE id = 1 AND enabled_at IS NOT NULL") != 1 {
+		t.Fatal("the switch is still off")
+	}
+
+	exec(t, f.admin, "UPDATE usage_events SET enabled_at = NULL WHERE id = 1")
+	f.hold(t, "SELECT 1 FROM usage_events WHERE id = 1 FOR SHARE")
+	ctx5, cancel5 := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel5()
+	if err := f.s.EnableUsageEvents(ctx5); err == nil {
+		t.Fatal("enable succeeded while the switch row stayed locked")
+	}
+	if f.count(t, "SELECT COUNT(*) FROM usage_events WHERE id = 1 AND enabled_at IS NULL") != 1 {
+		t.Fatal("the switch was turned on")
+	}
+}
+
+// 别的错误（这里是连接池已经关掉）不重试：立即返回，不等到 ctx 的期限。
+func TestEnableReturnsOtherErrorsAtOnce(t *testing.T) {
+	s, err := ledger.Open(dbtest.AppDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	ctx5, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := s.EnableUsageEvents(ctx5); err == nil || ctx5.Err() != nil || time.Since(start) > time.Second {
+		t.Fatalf("enable on a closed pool = %v after %v", err, time.Since(start))
+	}
+}
+
+// isMySQLError 只认编号相同的 MySQL 错误（包装过的也认）：打开开关只重试 1205，CreateAccount 只把 1062 当成重名。
+func TestIsMySQLError(t *testing.T) {
+	lockWait := &mysql.MySQLError{Number: 1205}
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{lockWait, true},
+		{fmt.Errorf("lock usage events switch: %w", lockWait), true},
+		{&mysql.MySQLError{Number: 1062}, false},
+		{errors.New("Error 1205: lock wait timeout"), false},
+		{nil, false},
+	} {
+		if got := ledger.IsMySQLError(tc.err, 1205); got != tc.want {
+			t.Errorf("IsMySQLError(%v, 1205) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 

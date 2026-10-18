@@ -22,7 +22,7 @@ const maxIdempotencyKeyLen = 128
 // idempotencyKey 校验 Idempotency-Key 头。没带返回空串；带了但不是恰好一个合法的值，返回 400。
 // 不合法的键不能悄悄忽略：客户端会以为有幂等，重试却会重复扣费。
 func idempotencyKey(h http.Header) (string, *apiError) {
-	values, ok := h["Idempotency-Key"]
+	values, ok := h[headerIdempotencyKey]
 	switch {
 	case !ok:
 		return "", nil
@@ -105,23 +105,8 @@ func (c *canonicalizer) value(objects *[]*object) error {
 	}
 	switch v := tok.(type) {
 	case json.Delim: // [ 或 {；Token 已经保证配对
-		if v == '[' {
-			c.buf = append(c.buf, '[')
-			for i := 0; c.dec.More(); i++ {
-				if i > 0 {
-					c.buf = append(c.buf, ',')
-				}
-				if err := c.value(objects); err != nil {
-					return err
-				}
-			}
-			c.buf = append(c.buf, ']')
-		} else {
-			o, err := c.object()
-			if err != nil {
-				return err
-			}
-			*objects = append(*objects, o)
+		if err := c.container(v, objects); err != nil {
+			return err
 		}
 		_, err := c.dec.Token() // 结尾的 ] 或 }
 		return err
@@ -134,6 +119,29 @@ func (c *canonicalizer) value(objects *[]*object) error {
 	case nil:
 		c.buf = append(c.buf, "null"...)
 	}
+	return nil
+}
+
+// container 读一个数组或对象的内容（开头的 [ 或 { 已经读过，结尾的不读）：数组按原来的顺序写进 buf，对象记进 objects。
+func (c *canonicalizer) container(open json.Delim, objects *[]*object) error {
+	if open == '{' {
+		o, err := c.object()
+		if err != nil {
+			return err
+		}
+		*objects = append(*objects, o)
+		return nil
+	}
+	c.buf = append(c.buf, '[')
+	for i := 0; c.dec.More(); i++ {
+		if i > 0 {
+			c.buf = append(c.buf, ',')
+		}
+		if err := c.value(objects); err != nil {
+			return err
+		}
+	}
+	c.buf = append(c.buf, ']')
 	return nil
 }
 

@@ -52,7 +52,7 @@ func (g *gateway) upstreamRequest(c *call, t *config.Target, rq request) (*http.
 	if c.stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	req.Header.Set("X-Client-Request-Id", c.id)
+	req.Header.Set(headerClientRequestID, c.id)
 	return req, nil
 }
 
@@ -92,9 +92,9 @@ func (g *gateway) exchange(ctx, upCtx context.Context, w http.ResponseWriter, c 
 	}
 	defer resp.Body.Close()
 	c.upstreamStatus = resp.StatusCode
-	c.upstreamXRequestID = resp.Header.Get("x-request-id")
+	c.upstreamXRequestID = resp.Header.Get(headerRequestID)
 	if e := fromUpstreamStatus(resp.StatusCode); e != nil {
-		return nil, e.withRetryAfter(resp.Header.Get("Retry-After"))
+		return nil, e.withRetryAfter(resp.Header.Get(headerRetryAfter))
 	}
 	if c.stream {
 		return g.relay(ctx, upCtx, w, c, resp)

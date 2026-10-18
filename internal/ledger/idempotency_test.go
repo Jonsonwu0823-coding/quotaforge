@@ -579,21 +579,7 @@ func TestVerifyFindsIdempotencyTampering(t *testing.T) {
 			if err := f.s.Finish(ctx, unknown, ledger.Result{Status: ledger.UsageUnknown, HTTPStatus: 502}); err != nil {
 				t.Fatal(err)
 			}
-			if got := rules(t, f); len(got) != 0 {
-				t.Fatalf("before tampering: %v", got)
-			}
-			for _, q := range tc.tamper {
-				res, err := f.admin.Exec(q, f.key.AccountID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if n, _ := res.RowsAffected(); n != 1 {
-					t.Fatalf("tampering changed %d rows: %s", n, q)
-				}
-			}
-			if got := rules(t, f); !slices.Equal(got, tc.want) {
-				t.Errorf("rules = %v, want %v", got, tc.want)
-			}
+			f.tamperRules(t, tc.tamper, tc.want)
 		})
 	}
 }

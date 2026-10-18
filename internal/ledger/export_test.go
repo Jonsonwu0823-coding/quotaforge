@@ -62,6 +62,18 @@ func names(batch []expiredKey) []string {
 	return out
 }
 
+// FailuresErr 给外部测试看 failures：依次记下 errs，返回整轮的错误。
+func FailuresErr(op, what string, errs ...error) error {
+	var f failures
+	for _, err := range errs {
+		f.add(err)
+	}
+	return f.err(op, what)
+}
+
+// IsMySQLError 给外部测试用 isMySQLError。
+var IsMySQLError = isMySQLError
+
 // OneConnection 把连接池缩成 1 个连接：一条语句失败之后，下一条语句只能复用出错的那个连接。
 func OneConnection(s *Store) {
 	s.db.SetMaxOpenConns(1)

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"slices"
+
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 )
 
 // Violation 是一条不成立的不变量：哪一条规则、哪个账户、哪个调用（账户级的规则没有调用）。
@@ -36,8 +38,9 @@ func (v Violation) String() string {
 //   - settled：有 settle、没有 release，预留变动合计 0，消费变动合计 = usage 的 total；
 //   - cancelled：有 release、没有 settle，预留和消费变动合计都是 0；
 //   - open：RESERVED、IN_FLIGHT、USAGE_UNKNOWN 只有 reserve，继续占着自己的预留；
-//   - cached：CACHED（缓存命中）没有任何账本行、预留量 0、用量合法、HTTP 200、没有幂等键，cached_from 指向同一账户里
-//     一个 SETTLED 的调用，用量和它相同；别的状态没有 cached_from。CACHED 不检查 reserve_entry；
+//   - cached：CACHED（缓存命中）是嵌入，没有任何账本行、预留量 0、用量合法、HTTP 200、没有幂等键，cached_from 指向同一账户里
+//     一个 SETTLED 的调用，用途、上游、上游模型名和用量都和它相同（缓存的键里有上游名和上游模型名）；别的状态没有 cached_from。
+//     CACHED 不检查 reserve_entry；
 //   - sent：发送意图的时间。RESERVED、CACHED 和回收释放的（确定没发出）没有 sent_at；IN_FLIGHT、USAGE_UNKNOWN、SETTLED，
 //     以及凭 response、late_response 或由 reconcile 结清的，都有 sent_at。迁移前的调用（created_at 早于版本 3 的迁移时间）
 //     推不出发送的时间，迁移时没有补，不要求有；
@@ -121,7 +124,7 @@ type callEntries struct {
 	usagePrompt, usageCompl     sql.NullInt64
 	usageTotal                  sql.NullInt64
 	httpStatus                  sql.NullInt64
-	keyed, cached, cachedFromOK bool // 带幂等键；有 cached_from；它指向同一账户里用量相同的 SETTLED 调用
+	keyed, cached, cachedFromOK bool // 带幂等键；有 cached_from；它指向同一账户里用途、上游、上游模型名和用量都相同的 SETTLED 调用
 	reserves, settles, releases int64
 	reserveReserved             int64 // reserve 行的变动
 	reserveConsumed             int64
@@ -136,6 +139,7 @@ func verifyCalls(ctx context.Context, tx *sql.Tx) ([]Violation, error) {
 			c.usage_prompt_tokens, c.usage_completion_tokens, c.usage_total_tokens, c.http_status,
 			c.idempotency_key IS NOT NULL, c.cached_from IS NOT NULL,
 			EXISTS (SELECT 1 FROM calls o WHERE o.id = c.cached_from AND o.account_id = c.account_id AND o.status = 'SETTLED'
+				AND o.purpose = c.purpose AND o.upstream = c.upstream AND o.upstream_model = c.upstream_model
 				AND o.usage_prompt_tokens <=> c.usage_prompt_tokens AND o.usage_completion_tokens <=> c.usage_completion_tokens
 				AND o.usage_total_tokens <=> c.usage_total_tokens),
 			COALESCE(SUM(l.kind = 'reserve'), 0), COALESCE(SUM(l.kind = 'settle'), 0), COALESCE(SUM(l.kind = 'release'), 0),
@@ -180,8 +184,8 @@ func (e callEntries) checkEntries(add func(rule, format string, args ...any)) {
 		add("reserve_entry", "%d reserve entries with deltas %d/%d, reserved amount %d", e.reserves, e.reserveReserved, e.reserveConsumed, e.amount)
 	}
 	if !e.cachedOK() {
-		add("cached", "%s call: ledger entries %d, reserved amount %d, usage valid %v, http %s, idempotency key %v, cached_from %v (a SETTLED call of the account with the same usage %v)",
-			e.status, e.reserves+e.settles+e.releases, e.amount, e.usageValid(), nullInt(e.httpStatus), e.keyed, e.cached, e.cachedFromOK)
+		add("cached", "%s %s call: ledger entries %d, reserved amount %d, usage valid %v, http %s, idempotency key %v, cached_from %v (a SETTLED call of the account with the same purpose, upstream, upstream model and usage %v)",
+			e.status, e.purpose, e.reserves+e.settles+e.releases, e.amount, e.usageValid(), nullInt(e.httpStatus), e.keyed, e.cached, e.cachedFromOK)
 	}
 	switch e.status {
 	case Settled:
@@ -225,8 +229,8 @@ func (e callEntries) cachedOK() bool {
 	if e.status != Cached {
 		return !e.cached
 	}
-	return e.reserves+e.settles+e.releases == 0 && e.amount == 0 && e.usageValid() && e.httpStatus.Int64 == 200 &&
-		!e.keyed && e.cached && e.cachedFromOK
+	return e.purpose == string(config.Embeddings) && e.reserves+e.settles+e.releases == 0 && e.amount == 0 && e.usageValid() &&
+		e.httpStatus.Int64 == 200 && !e.keyed && e.cached && e.cachedFromOK
 }
 
 func (e callEntries) usageValid() bool {

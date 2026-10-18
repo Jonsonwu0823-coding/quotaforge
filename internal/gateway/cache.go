@@ -164,8 +164,8 @@ func (g *gateway) readCache(ctx context.Context, c *call, key string) (*cacheEnt
 	return decodeEntry(b, c.purpose)
 }
 
-// leaveFlight 是领头的离开合并的表：放开跟随的、把键删掉，只离开一次。正常的路径在写回之前调（命中时在交出条目之后，
-// 没命中时在写缓存之后）；endpoint 的 defer 里再调一次，兜住出错和 panic 的出口。
+// leaveFlight 是领头的离开合并的表：放开跟随的、把键删掉，只离开一次。每条路径都在写回之前调（命中时在交出条目之后，
+// 没命中时在写缓存之后，查完缓存之后出错时在写错误之前）；endpoint 的 defer 里再调一次，兜住 panic 的出口。
 func (g *gateway) leaveFlight(c *call) {
 	if c.lookup != nil && c.lookup.fl != nil {
 		g.flights.leave(c.lookup.key, c.lookup.fl)
@@ -189,7 +189,7 @@ func (g *gateway) serveCached(ctx context.Context, w http.ResponseWriter, c *cal
 	if err != nil {
 		g.ledgerFailed(c, "record_cached", err)
 		endStep(span, errLedgerUnavailable)
-		w.Header().Del("Cache-Status") // 这个 503 不是来自缓存的响应
+		w.Header().Del(headerCacheStatus) // 这个 503 不是来自缓存的响应
 		writeError(w, c, errLedgerUnavailable)
 		return
 	}

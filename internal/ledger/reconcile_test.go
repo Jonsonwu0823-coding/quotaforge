@@ -56,12 +56,7 @@ func (f *fixture) snapshot(t *testing.T) string {
 func TestReconcile(t *testing.T) {
 	f := newFixture(t, 1<<40)
 	settleMe, releaseMe, answered, badUsage := f.reserve(t, 100), f.reserve(t, 100), f.reserve(t, 100), f.reserve(t, 100)
-	for _, r := range []ledger.Reservation{settleMe, releaseMe, badUsage} {
-		f.sent(t, r)
-		if err := f.s.Finish(ctx, r, ledger.Result{Status: ledger.UsageUnknown, HTTPStatus: 504, ErrorCode: "upstream_timeout"}); err != nil {
-			t.Fatal(err)
-		}
-	}
+	f.timedOut(t, settleMe, releaseMe, badUsage)
 	f.finish(t, answered, ledger.UsageUnknown, 0) // QF 写回过 200（2xx 缺 usage）
 	settled, cancelled, inFlight := f.reserve(t, 100), f.reserve(t, 100), f.reserve(t, 100)
 	f.finish(t, settled, ledger.Settled, 42)

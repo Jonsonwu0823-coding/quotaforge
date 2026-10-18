@@ -61,8 +61,9 @@ groups:
           summary: QF 自身耗时超过 250 毫秒的请求在持续消耗延迟的错误预算（6 小时烧掉 5%）
 
       # 后台循环（回收、清理、数未知用量）连续约 10 轮没有一轮成功；间隔随上游超时变，按实例上报的间隔算。
+      # 用量事件的消费者进程也导出这两个数，但它没有后台循环，两个都是 0：只看间隔大于 0 的。
       - alert: QFBackgroundStalled
-        expr: time() - qf_background_last_success_timestamp_seconds > 10 * qf_background_interval_seconds
+        expr: time() - qf_background_last_success_timestamp_seconds > 10 * qf_background_interval_seconds and qf_background_interval_seconds > 0
         for: 1m
         labels:
           severity: warning
@@ -85,6 +86,26 @@ groups:
           severity: warning
         annotations:
           summary: 用量事件积压：outbox 里最老的一条超过 5 分钟没有发到消息队列
+      # 按症状判断消费者停了：10 分钟里 QF 发出去了事件，消费者一条也没取到（没涨，或者根本没有这条序列）。消费者挂了、
+      # 没被抓、卡住了都会响；没有流量时不响，这时也没有积压。正常时消费者在一秒内取到，10 分钟的窗口远长于重启和再均衡；
+      # 再满 5 分钟才报，偶尔一次抓取失败不报。要求 Prometheus 抓消费者进程的指标端口。
+      - alert: QFUsageConsumerStalled
+        expr: sum(increase(qf_usage_events_forwarded_total[10m])) > 0 unless sum(increase(qf_usage_events_consumed_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 用量事件在发，消费者 10 分钟里一条都没取到（停了、没被抓，或者卡住了）
+      # 消费者持续出错：写库、取消息或提交位点。被一条事件卡住时，它每隔 RetryDelay（1 秒）加最多一次账本操作（2 秒）
+      # 重试一次，每秒至少 1/3 个错误；0.1 个每秒放过零星的错误。持续 10 分钟才报，几秒的数据库或 Kafka 抖动不报。
+      # 几个消费者进程里只有一个被卡住时，别的照常取，上一条不响，这一条响。
+      - alert: QFUsageConsumerFailing
+        expr: sum(rate(qf_background_errors_total{task="usage_consume"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 用量事件的消费者持续出错超过 10 分钟（写库、取消息或提交位点；可能有一条事件卡住了它的分区）
       # 账本或限流的 Redis 持续不可用（没有请求时不会出错，也就不告警：没有用户受影响）。
       - alert: QFDependencyUnavailable
         expr: sum by (dependency) (rate(qf_dependency_errors_total[2m])) > 0

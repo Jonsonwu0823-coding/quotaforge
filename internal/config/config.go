@@ -252,10 +252,28 @@ func parse(data []byte, getenv func(string) string) (*Config, error) {
 	if c.cache, err = embeddingCache(f.EmbeddingCache, getenv); err != nil {
 		return nil, fmt.Errorf("embedding_cache: %w", err)
 	}
+	// 缓存的 Redis 要有内存上限、满了淘汰；限流的不能这样，淘汰会删掉限流的桶（桶不在就当满桶，多放请求）。
+	// 只拦得住同一种写法的同一个服务器：localhost 和 127.0.0.1 这类别名拦不住。报错不带地址（里面可能有密码）。
+	if c.cache != nil && redisServer(c.cache.URL) != "" && redisServer(c.cache.URL) == redisServer(c.redisURL) {
+		return nil, errors.New("embedding_cache: must not use the same Redis server (host:port) as redis")
+	}
 	if c.events, err = usageEvents(f.UsageEvents); err != nil {
 		return nil, fmt.Errorf("usage_events: %w", err)
 	}
 	return c, nil
+}
+
+// redisServer 是 Redis 地址里的“主机:端口”：主机名小写，没写端口时是 6379。解析不了时为空（地址本身由 Redis 客户端校验）。
+func redisServer(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "6379"
+	}
+	return net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // usageEvents 取用量事件的设置：没写这一段是 nil；写了就要有至少一个 broker，每个都是“主机:端口”。

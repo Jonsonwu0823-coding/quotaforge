@@ -23,10 +23,6 @@ import (
 // 超了就是上游的响应不能用。每个流最多在内存里攒一个事件，慢客户端不会让它变大。
 const maxStreamEvent = 1 << 20
 
-// streamWriteTimeout 是写给客户端的一个事件的期限，比上游超时短得多。内核的发送缓冲区装得下一个普通回答的整个流，
-// 只有客户端不读、流又很大时写才会阻塞；超了就当客户端走了，接着读完上游、照常结算，不让上游因为 QF 不读而停下。
-const streamWriteTimeout = 5 * time.Second
-
 // writeGrace 是写客户端的上限比上游超时的到期时间多出的部分：读在到期时间截断，写最多再给这么久。到点时 bufio 里
 // 已经读到的事件、刚读到的事件和补的错误事件都要在那之后写，写的上限要是就停在到期时间，它们写不出去，响应也不能正常结束。
 // 一次流式调用最多比非流式多活这么久，回收上界的余量（5 秒）和退出上限都盖得住（TestStreamWorstCaseWithinBounds）。
@@ -45,7 +41,6 @@ func (g *gateway) relay(ctx, upCtx context.Context, w http.ResponseWriter, c *ca
 	}
 	deadline, _ := upCtx.Deadline()
 	s := &stream{ctx: ctx, w: w, rc: http.NewResponseController(w), c: c, writeLimit: deadline.Add(writeGrace)}
-	defer s.close()
 	s.open(resp.StatusCode, contentType)
 
 	usage, e := s.pump(upCtx, resp.Body)
@@ -119,9 +114,9 @@ func (s *stream) pump(upCtx context.Context, body io.Reader) (*ledger.Usage, *ap
 	}
 }
 
-// send 写一段字节并刷新。每次写的期限只有一条规则：min(现在 + streamWriteTimeout, 写的上限)，普通事件和补的错误事件都一样。
+// send 写一段字节并刷新。每次写的期限只有一条规则：min(现在 + writeTimeout, 写的上限)，普通事件和补的错误事件都一样。
 // 写不出去就不再写：到了写的上限还写不完，是上游超时之后的事（读早已截断），不算客户端的；
-// 否则客户端走了，写超时另外记下。
+// 否则按 call.wrote 记：客户端走了，写超时另外记下。客户端不读时接着读完上游、照常结算，不让上游因为 QF 不读而停下。
 func (s *stream) send(b []byte) {
 	if !s.writing {
 		return
@@ -130,7 +125,7 @@ func (s *stream) send(b []byte) {
 		s.writing, s.c.clientDisconnected = false, true
 		return
 	}
-	until := time.Now().Add(streamWriteTimeout)
+	until := time.Now().Add(writeTimeout)
 	if s.writeLimit.Before(until) {
 		until = s.writeLimit
 	}
@@ -143,15 +138,10 @@ func (s *stream) send(b []byte) {
 		return
 	}
 	s.writing = false
-	timedOut := errors.Is(err, os.ErrDeadlineExceeded)
-	if !(timedOut && until.Equal(s.writeLimit)) {
-		s.c.clientDisconnected, s.c.writeTimeout = true, timedOut
+	if !(errors.Is(err, os.ErrDeadlineExceeded) && until.Equal(s.writeLimit)) {
+		s.c.wrote(err)
 	}
 }
-
-// close 清掉写的期限。net/http 要等 handler 返回、写完分块编码的结尾才清它；收尾慢、过了期限才返回的话，
-// 结尾写不出去，客户端收到了 [DONE]，流却没有正常结束。
-func (s *stream) close() { _ = s.rc.SetWriteDeadline(time.Time{}) }
 
 // streamReadError 把读事件的错误映射成错误码：上游超时、事件超大，其余（中途断开、没有 [DONE] 就结束）是上游出错。
 func streamReadError(upCtx context.Context, err error) *apiError {

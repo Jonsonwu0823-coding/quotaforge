@@ -58,8 +58,8 @@ type call struct {
 	lookup     *cacheLookup // 查过缓存（没绕过）的请求才有
 
 	status             int  // 写回客户端的 HTTP 状态；什么都没写回（客户端已断开）时是 0
-	clientDisconnected bool // 写回之前（流式：流结束之前）客户端已经断开
-	writeTimeout       bool // 流式：客户端不读，写一个事件超过了期限（也算断开）
+	clientDisconnected bool // 写回之前或写回时（流式：流结束之前）客户端已经断开
+	writeTimeout       bool // 客户端不读，写超过了期限（也算断开；见 writeTimeout）
 
 	stream     bool          // chat 带 stream: true
 	wantsUsage bool          // 流式：客户端自己写了 include_usage: true，usage 那个事件照转发
@@ -193,10 +193,7 @@ func (g *gateway) logCall(c *call, d time.Duration) {
 		attrs = append(attrs, slog.Int64("reserved_tokens", c.reservation.Amount()))
 	}
 	attrs = cacheLogAttrs(attrs, c)
-	if c.clientDisconnected {
-		attrs = append(attrs, slog.Bool("client_disconnected", true))
-	}
-	attrs = streamLogAttrs(attrs, c)
+	attrs = clientLogAttrs(attrs, c)
 	if c.ledgerError != "" {
 		attrs = append(attrs, slog.String("ledger_error", c.ledgerError))
 	}
@@ -239,12 +236,15 @@ func cacheLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
 	return attrs
 }
 
-// streamLogAttrs 是流式的调用行多的字段：stream、first_event_ms（收到了事件才有）、write_timeout（写超时才有）。
-func streamLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
-	if !c.stream {
-		return attrs
+// clientLogAttrs 是调用行里写回客户端的字段：client_disconnected（客户端走了才有），流式的 stream、first_event_ms
+// （收到了事件才有），write_timeout（写超过期限才有）。
+func clientLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
+	if c.clientDisconnected {
+		attrs = append(attrs, slog.Bool("client_disconnected", true))
 	}
-	attrs = append(attrs, slog.Bool("stream", true))
+	if c.stream {
+		attrs = append(attrs, slog.Bool("stream", true))
+	}
 	if c.firstEvent != 0 {
 		attrs = append(attrs, slog.Int64("first_event_ms", c.firstEvent.Milliseconds()))
 	}

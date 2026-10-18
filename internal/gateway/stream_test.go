@@ -9,7 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httptrace"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -312,10 +314,15 @@ func TestStreamSlowClientUpstreamTimesOutFirst(t *testing.T) {
 	}
 }
 
-// unreadStream 用一个接收缓冲很小、读完请求就不再读的原始 TCP 客户端发一个流式请求，等到这次调用的日志行出现。
+// unreadStream 用一个读完请求就不再读的客户端发一个流式请求（见 unread）。
 func (h *harness) unreadStream(t *testing.T, model string) map[string]any {
 	t.Helper()
-	body := streamOf(model)
+	return h.unread(t, chatRoute, streamOf(model))
+}
+
+// unread 用一个接收缓冲很小、发完请求就不再读的原始 TCP 客户端发请求，等到这次调用的日志行出现（测试里只有这一个请求）。
+func (h *harness) unread(t *testing.T, route, body string) map[string]any {
+	t.Helper()
 	conn, err := net.Dial("tcp", h.qf.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -323,16 +330,111 @@ func (h *harness) unreadStream(t *testing.T, model string) map[string]any {
 	t.Cleanup(func() { conn.Close() })
 	_ = conn.(*net.TCPConn).SetReadBuffer(4096)
 	fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: qf\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
-		chatRoute, clientKey, len(body), body)
-	for start := time.Now(); time.Since(start) < streamWriteTimeout+10*time.Second; time.Sleep(20 * time.Millisecond) {
-		for _, l := range h.logs.lines(t) {
-			if l["stream"] == true {
-				return l
-			}
+		route, clientKey, len(body), body)
+	for start := time.Now(); time.Since(start) < writeTimeout+10*time.Second; time.Sleep(20 * time.Millisecond) {
+		if lines := h.logs.lines(t); len(lines) > 0 {
+			return lines[0]
 		}
 	}
 	t.Fatalf("no log line; upstream stats %+v", h.fake.Stats())
 	return nil
+}
+
+// 非流式的客户端不读：整个响应（32 MiB）超过写的期限还没写完时 QF 不再写，handler 返回，日志记 client_disconnected 和
+// write_timeout；收尾在写回之前，账本照常结算。没有写的期限时 handler 一直挂在写上，日志行不会出现。
+// 不在 Windows 上跑：回环的缓冲装得下整个响应，写不会阻塞，测不到写的期限（期限设没设由 TestNonStreamWritesHaveADeadline 守着）。
+func TestUnreadResponseTimesOut(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows loopback buffers the whole response, so the write never blocks")
+	}
+	h := newHarness(t)
+	line := h.unread(t, embeddingsRoute, `{"model":"size-33554432"}`)
+	if line["outcome"] != "SETTLED" || line["status"] != float64(200) || line["client_disconnected"] != true || line["write_timeout"] != true {
+		t.Fatalf("log %v", line)
+	}
+}
+
+// writeDeadlines 记下处理函数每次设的写期限，和第一次写（写头或者正文）的时候已经设了几次、是什么时候。
+type writeDeadlines struct {
+	*httptest.ResponseRecorder
+	deadlines   []time.Time
+	wrote       bool
+	beforeWrite int
+	firstWrite  time.Time
+}
+
+func (w *writeDeadlines) SetWriteDeadline(d time.Time) error {
+	w.deadlines = append(w.deadlines, d)
+	return nil
+}
+
+func (w *writeDeadlines) WriteHeader(code int) {
+	w.noteWrite()
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+func (w *writeDeadlines) Write(b []byte) (int, error) {
+	w.noteWrite()
+	return w.ResponseRecorder.Write(b)
+}
+
+func (w *writeDeadlines) noteWrite() {
+	if !w.wrote {
+		w.wrote, w.beforeWrite, w.firstWrite = true, len(w.deadlines), time.Now()
+	}
+}
+
+// knownCall 的调用状态查询总能查到这次调用（allowAll 不存调用，查询是 404）。
+type knownCall struct{ Ledger }
+
+func (knownCall) Call(_ context.Context, _ int64, id string) (*ledger.CallInfo, error) {
+	return &ledger.CallInfo{ID: id, Purpose: "chat", Alias: "shared", Status: ledger.Settled, CreatedAt: "2026-10-18T00:00:00.000000Z"}, nil
+}
+
+// 非流式的三种写回（上游的响应、错误响应、调用状态查询）都在第一次写之前设了写期限，期限在“第一次写 + writeTimeout”以内。
+// 和平台无关；客户端真的不读时期限起作用，由 TestUnreadResponseTimesOut 在 Linux 上守着。
+func TestNonStreamWritesHaveADeadline(t *testing.T) {
+	h := newHarnessWith(t, knownCall{Ledger: newAllowAll()})
+	asked := requestID(t, h.chat(t, `{"model":"shared"}`))
+	for _, tc := range []struct {
+		name, method, path, body, key string
+		status                        int
+	}{
+		{"upstream response", http.MethodPost, chatRoute, `{"model":"shared"}`, clientKey, http.StatusOK},
+		{"error response", http.MethodPost, chatRoute, `{"model":"shared"}`, "", http.StatusUnauthorized},
+		{"call lookup", http.MethodGet, "/v1/calls/" + asked, "", clientKey, http.StatusOK},
+	} {
+		w := &writeDeadlines{ResponseRecorder: httptest.NewRecorder()}
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		if tc.key != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.key)
+		}
+		h.qf.Config.Handler.ServeHTTP(w, req)
+		if w.Code != tc.status || !w.wrote || w.beforeWrite == 0 {
+			t.Fatalf("%s: status %d, %d write deadlines before the first write", tc.name, w.Code, w.beforeWrite)
+		}
+		if d := w.deadlines[w.beforeWrite-1]; !d.After(w.firstWrite) || d.After(w.firstWrite.Add(writeTimeout)) {
+			t.Fatalf("%s: write deadline %v, first write at %v", tc.name, d, w.firstWrite)
+		}
+	}
+}
+
+// 流式的结尾有写的期限：收尾之后、handler 返回之前设成现在 + writeTimeout，net/http 在 handler 返回之后写分块编码的结尾时
+// 还在期限里。收尾慢到过了写的上限（上游超时的到期时间加 writeGrace）：留着最后一个事件的期限，结尾写不出去；
+// 清掉的话，客户端不读时这次写没有上限。
+func TestStreamTailHasAWriteDeadline(t *testing.T) {
+	h := newHarnessWith(t, slowFinish{Ledger: newAllowAll(), d: chatTimeout + writeGrace})
+	w := &writeDeadlines{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodPost, chatRoute, strings.NewReader(streamOf("shared")))
+	req.Header.Set("Authorization", "Bearer "+clientKey)
+	h.qf.Config.Handler.ServeHTTP(w, req)
+	returned := time.Now()
+	if w.Code != http.StatusOK || len(w.deadlines) == 0 {
+		t.Fatalf("status %d, %d write deadlines", w.Code, len(w.deadlines))
+	}
+	if last := w.deadlines[len(w.deadlines)-1]; !last.After(returned) || last.After(returned.Add(writeTimeout)) {
+		t.Fatalf("the last write deadline is %v, the handler returned at %v", last, returned)
+	}
 }
 
 // 整个流受 chat 的上游超时管（从发出上游请求算起）：事件之间慢的流在超时时截断，客户端收到 QF 补的错误事件、没有 [DONE]，
@@ -371,7 +473,7 @@ func TestStreamWorstCaseWithinBounds(t *testing.T) {
 			t.Errorf("chat timeout %v: a stream stays open %v, the reclaim bound is %v", chat, alive, cfg.ReclaimAfter())
 		}
 	}
-	if streamWriteTimeout >= testConfig(t, 0, 0).Timeout(config.Chat) {
+	if writeTimeout >= testConfig(t, 0, 0).Timeout(config.Chat) {
 		t.Error("the write deadline must be shorter than the stream's limit")
 	}
 }
@@ -657,7 +759,7 @@ func TestStreamFinishFailure(t *testing.T) {
 	}
 }
 
-// 流结束后清掉写的期限：同一条 keep-alive 连接上，等上游超时的到期时间过了再发一个普通请求，照常成功。
+// 写的期限不带到下一个请求（net/http 在请求结束时清掉它）：同一条 keep-alive 连接上，等上游超时的到期时间过了再发一个普通请求，照常成功。
 func TestStreamClearsTheWriteDeadline(t *testing.T) {
 	h := newHarness(t)
 	client := &http.Client{Transport: &http.Transport{MaxConnsPerHost: 1}}
@@ -687,8 +789,8 @@ func TestStreamClearsTheWriteDeadline(t *testing.T) {
 	}
 }
 
-// 流结束后清掉写的期限：最后几个事件的写期限就是上游超时的到期时间；收尾慢、handler 过了那个时刻才返回时，
-// net/http 还要在这条连接上写分块编码的结尾，期限留着就写不出去，客户端收到了 [DONE]，流却没有正常结束。
+// 收尾之后重新设写的期限：最后几个事件的写期限就是上游超时的到期时间；收尾慢、handler 过了那个时刻才返回时，
+// net/http 还要在这条连接上写分块编码的结尾，旧的期限留着就写不出去，客户端收到了 [DONE]，流却没有正常结束。
 func TestStreamEndsCleanlyAfterASlowFinish(t *testing.T) {
 	h := newHarnessWith(t, slowFinish{Ledger: newAllowAll(), d: chatTimeout})
 	s := h.openStream(t, clientKey, streamOf("stream-quick"))
