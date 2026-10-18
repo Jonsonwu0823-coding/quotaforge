@@ -104,11 +104,16 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_embedding_cache_waiting` | gauge | — | 这个实例里正在等同时在进行的相同请求的嵌入请求数 |
 | `qf_background_reclaimed_total` | counter | `result`（released、marked_unknown） | 后台回收 |
 | `qf_background_purged_total` | counter | — | 清理掉的过期幂等记录 |
-| `qf_background_errors_total` | counter | `task`（reclaim、purge、unknown_scan） | 后台出错（清理到点停下不算） |
+| `qf_background_errors_total` | counter | `task`（reclaim、purge、unknown_scan、outbox_purge、usage_forward；消费者进程里是 usage_consume） | 后台出错（清理到点停下不算） |
 | `qf_background_last_success_timestamp_seconds` | gauge | — | 最近一次三件都没出错的一轮结束的时间 |
 | `qf_background_interval_seconds` | gauge | — | 后台一轮的间隔（回收上界的四分之一，默认 9 秒） |
 | `qf_unknown_usage_calls` | gauge | — | 还占着预留的未知用量调用，全部账户 |
 | `qf_unknown_usage_oldest_age_seconds` | gauge | — | 其中最早一条从预留到现在的秒数，没有时为 0 |
+| `qf_usage_outbox_unsent` | gauge | — | [用量事件](ledger.md#用量事件)的 outbox 里还没发出的条数（全部实例共用一张表）。配了用量事件的实例转发每轮更新；没配的实例也导出，值一直是 0 |
+| `qf_usage_outbox_oldest_age_seconds` | gauge | — | 其中最早写入的一条到现在的秒数，没有时为 0 |
+| `qf_usage_events_forwarded_total` | counter | — | 这个实例发到消息队列、标成已发出的事件数 |
+| `qf_usage_events_consumed_total` | counter | `result`（applied、duplicate、malformed） | 消费者进程：写进汇总的、按调用号去重跳过的、格式不对跳过的 |
+| `qf_usage_event_delay_seconds` | histogram | — | 消费者进程：从调用结清到写进汇总 |
 | `qf_trace_export_errors_total` | counter | — | 追踪 SDK 报的错误，主要是导出失败 |
 | `qf_db_*` | gauge、counter | — | 账本连接池：`open`、`in_use`、`idle`、`max_open` 的连接数，等连接的次数和总时长 |
 | `go_*`、`process_*` | — | — | Go 运行时和进程 |
@@ -153,6 +158,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `QFBackgroundStalled` | 某个实例的后台循环约 10 轮没有成功：`time() − 最近一次成功 > 10 × 间隔`（默认约 90 秒） | 1 分钟 | warning |
 | `QFUnknownUsageUnreconciled` | 有未知用量的调用超过一天没对账（对账要人按上游的账单做：`qfctl unknown`、`qfctl reconcile`） | 10 分钟 | warning |
 | `QFDependencyUnavailable` | 账本或 Redis 持续出错（没有请求时不会出错，也就不告警：没有用户受影响） | 5 分钟 | critical |
+| `QFUsageOutboxBacklog` | 用量事件的 outbox 里最老的一条超过 5 分钟没有发出：`max(qf_usage_outbox_oldest_age_seconds) > 300`（消息队列不可用或转发停了；请求不受影响，只是下游的汇总落后，恢复后自动补发） | 2 分钟 | warning |
 | `QFUpstreamCircuitOpen` | 某个实例里某个上游的熔断 5 分钟里一直没关上：`min_over_time(qf_upstream_circuit_state[5m]) >= 1`（一直开着，或者开和半开交替、探测一直失败） | — | warning |
 
 - `QFUpstreamCircuitOpen` 用 `min_over_time` 而不是 `for`：半开的探测会让状态短暂离开“开”，`for` 会被它打断、重新计时。**没有请求时熔断不会去探测**：上游已经恢复、却没有流量的话，熔断一直开着、告警也一直在；发一个请求就会触发探测，探测成功就关上，5 分钟后告警解除。
@@ -181,6 +187,15 @@ MSYS_NO_PATHCONV=1 docker run --rm -v ./deploy/prometheus:/etc/prometheus:ro --e
 - **span**：`cache_lookup`、`record_cached`、`cache_store`（见上面的树），读、写出错时标成 Error，`error.type` 是 `cache_unavailable`；根 span 有 `qf.cache`、`qf.cached_from`。
 - **错误率**：缓存坏了请求照常回源，不是 QF 的失败，所以不计进 `qf_dependency_errors_total`，也不触发 `QFDependencyUnavailable`；它只让回源变多（花钱）。看 `sum(rate(qf_embedding_cache_lookups_total{result="error"}[5m])) / sum(rate(qf_embedding_cache_lookups_total{result!="bypass"}[5m]))` 和 `qf_embedding_cache_writes_total{result="error"}`，命中率是 `result` 为 `hit`、`coalesced` 的比例。
 - **合并**：`qf_embedding_cache_waiting` 是现在正在等的请求数；`coalesced` 的多少说明并发的相同请求有多少被合并掉。
+
+## 用量事件
+
+配了[用量事件](ledger.md#用量事件)时：
+
+- **日志**：转发出错时记一行 `msg: "usage_forward"`（`forwarded` 是这一轮已经标记的条数，`error`）；消费者进程的日志行是 `msg: "usage_consumer"`：取消息、写库、提交位点出错（`step`、`error`），或者跳过格式不对的消息（`partition`、`offset`、`error`，不记消息的内容）。都不是 `call`，用量导出和对账读日志时不会把它们当成调用。
+- **指标**：积压看 `qf_usage_outbox_unsent`、`qf_usage_outbox_oldest_age_seconds`（消息队列停了也照样每轮更新）；转发看 `qf_usage_events_forwarded_total` 和 `qf_background_errors_total{task="usage_forward"}`；消费者看 `qf_usage_events_consumed_total`（重复多说明发生过重发或位点回退，汇总不受影响）和 `qf_usage_event_delay_seconds`。消费者进程照 `QUOTAFORGE_METRICS_ADDR` 开自己的指标端口。
+- **告警**：`QFUsageOutboxBacklog`（见上面的运行告警）。
+- 转发和消费不在请求路径上，没有 span。
 
 ## 演示环境
 

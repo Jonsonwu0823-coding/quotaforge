@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -93,6 +95,11 @@ type EmbeddingCache struct {
 	TTL time.Duration
 }
 
+// UsageEvents 是用量事件的设置：消息队列（Kafka）的 broker 地址（主机:端口）。
+type UsageEvents struct {
+	Brokers []string
+}
+
 type Config struct {
 	timeouts  map[Purpose]time.Duration
 	upstreams []*Upstream
@@ -101,6 +108,7 @@ type Config struct {
 	dsn       string
 	redisURL  string
 	cache     *EmbeddingCache
+	events    *UsageEvents
 }
 
 type modelKey struct {
@@ -125,6 +133,9 @@ func (c *Config) RedisURL() string { return c.redisURL }
 
 // EmbeddingCache 是嵌入缓存的设置；配置里没有 embedding_cache 这一段时是 nil，不查缓存。
 func (c *Config) EmbeddingCache() *EmbeddingCache { return c.cache }
+
+// UsageEvents 是用量事件的设置；配置里没有 usage_events 这一段时是 nil：这个实例不打开开关、不转发、不清理 outbox。
+func (c *Config) UsageEvents() *UsageEvents { return c.events }
 
 // Timeout 是某个用途下调上游的超时。
 func (c *Config) Timeout(p Purpose) time.Duration { return c.timeouts[p] }
@@ -157,11 +168,16 @@ type fileConfig struct {
 	} `json:"database"`
 	Redis          fileRedis           `json:"redis"`
 	EmbeddingCache *fileEmbeddingCache `json:"embedding_cache"` // 指针：分清“没写”（不开缓存）和“写了 {}”（报错）
+	UsageEvents    *fileUsageEvents    `json:"usage_events"`
 }
 
 type fileRedis struct {
 	URLEnv  string `json:"url_env"`
 	URLFile string `json:"url_file"`
+}
+
+type fileUsageEvents struct {
+	Brokers []string `json:"brokers"`
 }
 
 type fileEmbeddingCache struct {
@@ -236,7 +252,32 @@ func parse(data []byte, getenv func(string) string) (*Config, error) {
 	if c.cache, err = embeddingCache(f.EmbeddingCache, getenv); err != nil {
 		return nil, fmt.Errorf("embedding_cache: %w", err)
 	}
+	if c.events, err = usageEvents(f.UsageEvents); err != nil {
+		return nil, fmt.Errorf("usage_events: %w", err)
+	}
 	return c, nil
+}
+
+// usageEvents 取用量事件的设置：没写这一段是 nil；写了就要有至少一个 broker，每个都是“主机:端口”。
+func usageEvents(f *fileUsageEvents) (*UsageEvents, error) {
+	if f == nil {
+		return nil, nil
+	}
+	if len(f.Brokers) == 0 {
+		return nil, errors.New("brokers must list at least one host:port")
+	}
+	for _, b := range f.Brokers {
+		host, port, err := net.SplitHostPort(b)
+		if err != nil || host == "" || !validPort(port) {
+			return nil, fmt.Errorf("broker %q is not host:port", b)
+		}
+	}
+	return &UsageEvents{Brokers: slices.Clone(f.Brokers)}, nil
+}
+
+func validPort(s string) bool {
+	n, err := strconv.Atoi(s)
+	return err == nil && n > 0 && n <= 65535 && strconv.Itoa(n) == s
 }
 
 // embeddingCache 取嵌入缓存的设置：没写这一段是 nil；写了就要有地址（url_env、url_file 二选一），

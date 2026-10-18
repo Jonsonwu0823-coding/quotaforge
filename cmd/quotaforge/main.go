@@ -110,6 +110,8 @@ func command(name string) int {
 			fmt.Fprintln(os.Stderr, "healthcheck:", err)
 			return 1
 		}
+	case "usage-consumer":
+		return usageConsumer()
 	case "usage-export":
 		invalid, err := gateway.ExportUsage(os.Stdin, os.Stdout)
 		if err != nil {
@@ -121,7 +123,7 @@ func command(name string) int {
 			return 1
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q; commands: healthcheck, usage-export\n", name)
+		fmt.Fprintf(os.Stderr, "unknown command %q; commands: healthcheck, usage-consumer, usage-export\n", name)
 		return 2
 	}
 	return 0
@@ -135,17 +137,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	path := os.Getenv("QUOTAFORGE_CONFIG")
-	if path == "" {
-		slog.Error("config", "err", "QUOTAFORGE_CONFIG is not set")
-		os.Exit(1)
-	}
-	cfg, err := config.Load(path, os.Getenv)
-	if err != nil {
-		slog.Error("config", "err", err)
-		os.Exit(1)
-	}
-	telCfg, err := config.LoadTelemetry(os.Getenv)
+	cfg, telCfg, err := loadConfig()
 	if err != nil {
 		slog.Error("config", "err", err)
 		os.Exit(1)
@@ -178,32 +170,35 @@ func main() {
 		os.Exit(1)
 	}
 	metrics := telemetry.NewMetrics(store.Stats)
-	if telCfg.MetricsAddr != "" {
-		mln, err := net.Listen("tcp", telCfg.MetricsAddr)
-		if err != nil {
-			slog.Error("listen", "err", err)
-			os.Exit(1)
-		}
-		slog.Info("metrics", "addr", mln.Addr().String())
-		defer serveMetrics(mln, metrics)()
+	stopMetrics, err := listenMetrics(telCfg.MetricsAddr, metrics)
+	if err != nil {
+		slog.Error("listen", "err", err)
+		os.Exit(1)
 	}
+	defer stopMetrics()
 	tel, flushSpans := telemetry.Setup(telCfg, metrics, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	waitForwarding, err := startForwarding(ctx, cfg, store, logger, metrics)
+	if err != nil {
+		slog.Error("usage events", "err", err)
+		os.Exit(1)
+	}
 
-	// 退出的顺序：在途请求处理完（最多 ShutdownTimeout）、后台循环也停下之后，才把还没导出的 span 发完（最多
+	// 退出的顺序：在途请求处理完（最多 ShutdownTimeout）、后台循环和转发也停下之后，才把还没导出的 span 发完（最多
 	// telemetry.FlushTimeout，不占在途请求的时间；到点没发完的 span 丢掉，账本在这之前已经收完尾）；
 	// 然后关指标的监听（排空期间 Prometheus 仍能抓），最后关 Redis 和账本（defer）。
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, logger, metrics)
+		background(ctx, store, cfg.ReclaimAfter(), cfg.ReclaimAfter()/4, cfg.UsageEvents() != nil, logger, metrics)
 	}()
 	slog.Info("listening", "addr", ln.Addr().String())
 	err = run(ctx, ln, newServer(newHandler(gateway.New(cfg, store, limiter, cache, logger, tel))), cfg.ShutdownTimeout())
 	stop()
 	<-done
+	waitForwarding()
 	if ferr := flushSpans(); ferr != nil {
 		slog.Warn("telemetry", "error", ferr.Error())
 	}
@@ -211,6 +206,33 @@ func main() {
 		slog.Error("run", "err", err)
 		os.Exit(1)
 	}
+}
+
+// loadConfig 读配置文件（路径来自 QUOTAFORGE_CONFIG）和追踪、指标的环境变量。
+func loadConfig() (*config.Config, config.Telemetry, error) {
+	path := os.Getenv("QUOTAFORGE_CONFIG")
+	if path == "" {
+		return nil, config.Telemetry{}, errors.New("QUOTAFORGE_CONFIG is not set")
+	}
+	cfg, err := config.Load(path, os.Getenv)
+	if err != nil {
+		return nil, config.Telemetry{}, err
+	}
+	telCfg, err := config.LoadTelemetry(os.Getenv)
+	return cfg, telCfg, err
+}
+
+// listenMetrics 在 addr 上提供指标（addr 为空就不开），返回关掉它的函数。
+func listenMetrics(addr string, m *telemetry.Metrics) (stop func(), err error) {
+	if addr == "" {
+		return func() {}, nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("metrics", "addr", ln.Addr().String())
+	return serveMetrics(ln, m), nil
 }
 
 // serveMetrics 在 ln 上另起一个只有 GET /metrics 的服务，不放在对外的监听地址上。返回的函数关掉它（立即，不等正在进行的抓取）。

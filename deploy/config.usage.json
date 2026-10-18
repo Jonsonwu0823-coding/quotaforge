@@ -1,0 +1,25 @@
+{
+  "upstreams": [
+    {
+      "name": "fake-a",
+      "base_url": "http://qf-fake-upstream:8081/v1",
+      "api_key_env": "QF_FAKE_UPSTREAM_KEY",
+      "rpm": 6000,
+      "tpm": 100000000
+    }
+  ],
+  "models": [
+    {"alias": "usage-chat", "purpose": "chat", "default_max_tokens": 64,
+     "targets": [{"upstream": "fake-a", "upstream_model": "fake-chat", "weight": 1}]},
+    {"alias": "usage-rejected", "purpose": "chat", "default_max_tokens": 64,
+     "targets": [{"upstream": "fake-a", "upstream_model": "fake-401", "weight": 1}]},
+    {"alias": "usage-unknown", "purpose": "chat", "default_max_tokens": 64,
+     "targets": [{"upstream": "fake-a", "upstream_model": "fake-no-usage", "weight": 1}]},
+    {"alias": "usage-emb", "purpose": "embeddings",
+     "targets": [{"upstream": "fake-a", "upstream_model": "fake-embed", "weight": 1}]}
+  ],
+  "database": {"dsn_file": "/run/secrets/app_dsn"},
+  "redis": {"url_env": "QF_REDIS_URL"},
+  "embedding_cache": {"url_env": "QF_REDIS_CACHE_URL"},
+  "usage_events": {"brokers": ["qf-kafka:9092"]}
+}

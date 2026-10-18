@@ -21,7 +21,8 @@ func TestMain(m *testing.M) { dbtest.Main(m) }
 
 var ctx = context.Background()
 
-var tables = []string{"idempotency_keys", "ledger", "calls", "api_keys", "budgets", "accounts", "schema_migrations"}
+var tables = []string{"idempotency_keys", "ledger", "outbox", "calls", "api_keys", "budgets", "accounts", "schema_migrations",
+	"usage_events", "usage_seen", "usage_daily"}
 
 // dropAll 删掉全部表，得到一个空库。测试结束时迁移回最新，别的测试照常用。
 func dropAll(t *testing.T) {
@@ -34,7 +35,7 @@ func dropAll(t *testing.T) {
 	}
 	dsn := dbtest.MigrateDSN(t)
 	t.Cleanup(func() {
-		if _, _, err := ledger.Migrate(ctx, dsn); err != nil {
+		if err := dbtest.Migrate(ctx, dsn); err != nil { // 开关表也是重建的，迁移之后重新打开
 			t.Errorf("re-migrate: %v", err)
 		}
 	})
@@ -504,6 +505,9 @@ func deleteAccount(t *testing.T, f *fixture) {
 	for _, q := range []string{
 		"DELETE FROM idempotency_keys WHERE account_id = ?",
 		"DELETE l FROM ledger l JOIN calls c ON c.id = l.call_id WHERE c.account_id = ?",
+		"DELETE FROM outbox WHERE account_id = ?",
+		"DELETE FROM usage_seen WHERE account_id = ?",
+		"DELETE FROM usage_daily WHERE account_id = ?",
 		"DELETE FROM calls WHERE account_id = ?",
 		"DELETE FROM api_keys WHERE account_id = ?",
 		"DELETE FROM budgets WHERE account_id = ?",

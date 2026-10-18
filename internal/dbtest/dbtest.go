@@ -1,7 +1,11 @@
 // Package dbtest 给要 MySQL、Redis 的测试用：连接串、跳过或强制的规则、包之间的互斥、每个测试独立的账户和 key 前缀。
 //
 // 连接串从 QUOTAFORGE_TEST_MYSQL_MIGRATE_DSN（能建表）和 QUOTAFORGE_TEST_MYSQL_DSN（只能增删改查）读，
-// Redis 的地址从 QUOTAFORGE_TEST_REDIS_ADDR 读。没设时跳过；QUOTAFORGE_TEST_REQUIRE_DB=1（CI）时缺了就判失败。
+// Redis 的地址从 QUOTAFORGE_TEST_REDIS_ADDR 读，Kafka 的地址从 QUOTAFORGE_TEST_KAFKA_ADDR 读。没设时跳过；
+// QUOTAFORGE_TEST_REQUIRE_DB=1（CI）时缺了就判失败。
+//
+// 测试库里用量事件的开关一直开着（Main 迁移之后就打开）：所有包跑在同一种状态上，每个以 Verify 收尾的测试都会查
+// outbox 的完整性。测试里直接写库造出来的终态调用，要么补 outbox 行，要么在测试结束前删掉。
 //
 // 几个测试包同时用同一个 Redis：每个测试只用自己的 key 前缀（RedisPrefix），不清空整个库。
 //
@@ -28,6 +32,7 @@ const (
 	migrateEnv = "QUOTAFORGE_TEST_MYSQL_MIGRATE_DSN"
 	appEnv     = "QUOTAFORGE_TEST_MYSQL_DSN"
 	redisEnv   = "QUOTAFORGE_TEST_REDIS_ADDR"
+	kafkaEnv   = "QUOTAFORGE_TEST_KAFKA_ADDR"
 	requireEnv = "QUOTAFORGE_TEST_REQUIRE_DB"
 	lockName   = "quotaforge_test"
 )
@@ -64,11 +69,24 @@ func run(m *testing.M) int {
 		return 1
 	}
 	defer func() { _, _ = conn.ExecContext(ctx, "DO RELEASE_LOCK(?)", lockName) }()
-	if _, _, err := ledger.Migrate(ctx, migrate); err != nil {
-		fmt.Fprintln(os.Stderr, "dbtest: migrate:", err)
+	if err := Migrate(ctx, migrate); err != nil {
+		fmt.Fprintln(os.Stderr, "dbtest:", err)
 		return 1
 	}
 	return m.Run()
+}
+
+// Migrate 把测试库迁到最新，并打开用量事件的开关（已经开着就不变）。删表重建的测试结束时也用它。
+func Migrate(ctx context.Context, dsn string) error {
+	if _, _, err := ledger.Migrate(ctx, dsn); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	s, err := ledger.Open(dsn)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.EnableUsageEvents(ctx)
 }
 
 func dsn(t testing.TB, env string) string {
@@ -91,6 +109,9 @@ func MigrateDSN(t testing.TB) string { return dsn(t, migrateEnv) }
 
 // RedisURL 是测试用 Redis 的地址（redis://主机:端口/0）。没设就跳过当前测试。
 func RedisURL(t testing.TB) string { return "redis://" + dsn(t, redisEnv) + "/0" }
+
+// KafkaAddr 是测试用 Kafka 的地址（主机:端口）。没设就跳过当前测试。
+func KafkaAddr(t testing.TB) string { return dsn(t, kafkaEnv) }
 
 // RedisPrefix 是只属于当前测试的 key 前缀，带随机串。
 func RedisPrefix() string { return "qf-test:" + strings.ToLower(rand.Text()[:12]) + ":" }

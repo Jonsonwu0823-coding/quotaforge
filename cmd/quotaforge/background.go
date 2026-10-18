@@ -23,13 +23,15 @@ import (
 // 三件都没出错的一轮记下完成的时间（qf_background_last_success_timestamp_seconds），告警按它判断循环是不是卡住了。
 //
 // 每轮末尾顺带看一次连接池：上一轮以来有请求等过连接（池打满了），就记一行 db_pool（见 poolWaits）。
-func background(ctx context.Context, store *ledger.Store, after, interval time.Duration, log *slog.Logger, m *telemetry.Metrics) {
+//
+// 配了用量事件的实例（outbox 为 true）清理完幂等记录之后，在同一个时间上限里接着清理发出很久的 outbox 行。
+func background(ctx context.Context, store *ledger.Store, after, interval time.Duration, outbox bool, log *slog.Logger, m *telemetry.Metrics) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	m.BackgroundInterval.Set(interval.Seconds())
 	var pool sql.DBStats
 	for {
-		if attrs, failed, busy := round(ctx, store, after, interval, m); busy || failed { // 什么都没做、也没出错的轮次不记
+		if attrs, failed, busy := round(ctx, store, after, interval, outbox, m); busy || failed { // 什么都没做、也没出错的轮次不记
 			log.LogAttrs(context.Background(), slog.LevelInfo, "background", attrs...)
 		}
 		now := store.Stats()
@@ -47,10 +49,15 @@ func background(ctx context.Context, store *ledger.Store, after, interval time.D
 
 // round 是后台的一轮：回收、清理、数未知用量，记指标。返回这一轮日志的字段、有没有哪件出错、有没有回收或清理掉什么。
 // 三件都没出错（又不是因为退出才停下）就记下完成的时间。
-func round(ctx context.Context, store *ledger.Store, after, interval time.Duration, m *telemetry.Metrics) (attrs []slog.Attr, failed, busy bool) {
+func round(ctx context.Context, store *ledger.Store, after, interval time.Duration, outbox bool, m *telemetry.Metrics) (attrs []slog.Attr, failed, busy bool) {
 	stats, reclaimErr := store.Reclaim(ctx, after, config.LedgerTimeout)
 	purgeCtx, stopPurge := context.WithTimeout(ctx, interval)
 	purged, purgeErr := store.PurgeIdempotency(purgeCtx, config.LedgerTimeout)
+	var outboxPurged int64
+	var outboxErr error
+	if outbox {
+		outboxPurged, outboxErr = store.PurgeOutbox(purgeCtx, config.LedgerTimeout)
+	}
 	stopPurge()
 	m.Reclaimed.WithLabelValues("released").Add(float64(stats.Released))
 	m.Reclaimed.WithLabelValues("marked_unknown").Add(float64(stats.Unknown))
@@ -67,13 +74,19 @@ func round(ctx context.Context, store *ledger.Store, after, interval time.Durati
 	if purgeErr != nil && ctx.Err() == nil && !errors.Is(purgeErr, ledger.ErrPurgeStopped) {
 		fail("purge", purgeErr)
 	}
+	if outbox {
+		attrs = append(attrs, slog.Int64("outbox_purged", outboxPurged))
+	}
+	if outboxErr != nil && ctx.Err() == nil && !errors.Is(outboxErr, ledger.ErrPurgeStopped) {
+		fail("outbox_purge", outboxErr)
+	}
 	if err := countUnknown(ctx, store, m); err != nil && ctx.Err() == nil {
 		fail("unknown_scan", err)
 	}
 	if !failed && ctx.Err() == nil {
 		m.BackgroundLastSuccess.SetToCurrentTime()
 	}
-	return attrs, failed, stats.Released+stats.Unknown > 0 || purged > 0
+	return attrs, failed, stats.Released+stats.Unknown > 0 || purged > 0 || outboxPurged > 0
 }
 
 // countUnknown 更新未知用量的两个指标；查不到时保留上一轮的值。

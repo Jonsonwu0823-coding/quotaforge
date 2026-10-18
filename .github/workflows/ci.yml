@@ -38,6 +38,27 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      # 用量事件的测试用：单节点 KRaft，主题由测试自动创建（3 个分区）。和 compose.usage.yaml 同一个镜像。
+      kafka:
+        image: apache/kafka-native:4.3.1
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+          KAFKA_NUM_PARTITIONS: "3"
+        ports:
+          - 127.0.0.1:9092:9092
+        options: >-
+          --health-cmd "nc -z 127.0.0.1 9092"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -59,6 +80,7 @@ jobs:
             echo "QUOTAFORGE_TEST_MYSQL_MIGRATE_DSN=qf_migrate:$migrate_pw@tcp(127.0.0.1:3306)/quotaforge_test?parseTime=true"
             echo "QUOTAFORGE_TEST_MYSQL_DSN=qf_app:$app_pw@tcp(127.0.0.1:3306)/quotaforge_test?parseTime=true"
             echo "QUOTAFORGE_TEST_REDIS_ADDR=127.0.0.1:6379"
+            echo "QUOTAFORGE_TEST_KAFKA_ADDR=127.0.0.1:9092"
           } >>"$GITHUB_ENV"
       # vendor/ 要和 go.mod、go.sum 一致：重新生成后没有任何差异，也没有多出的文件。
       - name: vendor/ matches go.mod and go.sum
@@ -115,6 +137,9 @@ jobs:
       # 嵌入缓存：命中、按账户隔离、带键绕过、并发合并只回源一次、缓存停掉时照常回源、过期（单独的缓存 Redis）
       - name: Embedding cache
         run: scripts/compose-cache.sh
+      # 用量事件：结清时同一个事务写 outbox、转发到 Kafka、消费者去重并按天汇总、和账本对账；停 Kafka、停消费者、位点重置到最早
+      - name: Usage events
+        run: scripts/compose-usage.sh
       # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
       # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
       - name: Check out QueryShield at the pinned commit
@@ -140,5 +165,6 @@ jobs:
             evidence/compose-stream-summary.txt
             evidence/compose-failover-summary.txt
             evidence/compose-cache-summary.txt
+            evidence/compose-usage-summary.txt
             evidence/compose-qs-e2e-summary.txt
           if-no-files-found: warn

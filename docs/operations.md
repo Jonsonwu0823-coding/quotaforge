@@ -20,6 +20,7 @@
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
 | `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
 | `compose.failover.yaml` | 叠加在主文件上：第二个假上游 `qf-fake-upstream-b`（同一个镜像），`quotaforge` 换成两个上游的配置 `deploy/config.failover.json`、打开指标（只在 Compose 的网络里），见[多个上游](#多个上游) |
+| `compose.usage.yaml` | 再叠加在 `compose.cache.yaml` 之后：[用量事件](ledger.md#用量事件)的演示。`qf-kafka`（Kafka 单节点）、消费者 `qf-usage-consumer`（同一个镜像的 `usage-consumer` 子命令），`quotaforge` 换成 `deploy/config.usage.json`；命令行工具的容器 `qf-kafka-tools` 在 profile `tools` 里，见[用量事件](#用量事件) |
 | `compose.qs-e2e.yaml` | 只给端到端联调（`scripts/compose-qs-e2e.sh`）用，叠在 `compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml` 之后：`qf-jaeger` 接进 `qs-qf`（QS 的 span 也发到这个 Jaeger），`quotaforge-b` 也接进 `qs-qf`、带网络别名 `quotaforge`，见[接 QueryShield](queryshield.md) |
 
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
@@ -125,6 +126,8 @@ QF 调上游用 Go 默认的 HTTP 客户端，会读 `HTTP_PROXY`、`HTTPS_PROXY
 | `embedding_cache` | 可选。写了就开[嵌入缓存](#嵌入缓存)，对所有嵌入别名生效；不写就完全不查缓存 |
 | `embedding_cache.url_env`、`embedding_cache.url_file` | 缓存用的 Redis 地址，规则和 `redis.url_env`、`redis.url_file` 一样，正好写一个。不要和限流用同一个 Redis（见[嵌入缓存](#嵌入缓存)） |
 | `embedding_cache.ttl_ms` | 缓存条目的过期时长，毫秒；写入时再乘以 0.9 到 1.1 之间的随机数。不写或 0 用默认 86400000（24 小时） |
+| `usage_events` | 可选。写了这个实例就打开[用量事件](ledger.md#用量事件)的开关（只开不关）、起转发循环、清理发出很久的 outbox；不写就不打开、不转发、不清理（给 QS 用的配置都不写）；开关已经被别的实例打开时，这个实例结清的调用照样写 outbox。开关打开之后至少要有一个实例保留这一段，否则没人转发、清理，outbox 静默增长。消费者 `quotaforge usage-consumer` 也读这一段 |
+| `usage_events.brokers` | Kafka 的 broker 地址列表，每个是 `主机:端口`，至少一个。主题（`quotaforge.usage-events.v1`）和消费组（`quotaforge-usage-daily`）是固定的 |
 
 base URL 只接受 http 和 https，必须有主机名，不能带账号密码、查询串和片段。
 
@@ -217,6 +220,25 @@ scripts/compose-cache.sh   # Compose 项目名 qf-cache，叠加 compose.cache.y
 - 停掉 `qf-redis-cache`：请求照样 200，日志记 `cache: error`；起回来之后不重启 QF 就又能写、能命中。演示配置的条目 5 秒过期：读出的剩余时间符合 5 秒 ±10%，过期之后再发会重新回源。
 - 最后核对日志一个调用一行、没有 Key 和正文，缓存的键只有账户号和哈希，`qfctl verify` 通过。
 
+## 用量事件
+
+开关打开之后，结清调用时（同一个事务里）都写 outbox，不论这个实例配没配；配置里写了 `usage_events` 的 QF 实例每秒把它转发到 Kafka（至少要有一个实例保留这一段）；消费者是同一个镜像的子命令 `quotaforge usage-consumer`，单独一个进程，把事件按调用号去重、按账户按天汇总。行为、对账和上线顺序见[用量事件](ledger.md#用量事件)。
+
+```bash
+# 在项目根目录下运行
+docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml up -d --build --wait
+docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml run --rm -T --no-deps qfctl usage-reconcile
+# 看消费组的位点（命令行工具在 JVM 版的镜像里，profile tools）
+docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml run --rm qf-kafka-tools \
+  /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server qf-kafka:9092 --group quotaforge-usage-daily --describe
+```
+
+- **Kafka**：单节点 KRaft（同一个进程既是 broker 也是 controller），镜像 `apache/kafka-native:4.3.1`（GraalVM 编译，起得快、占内存小；Apache 标为实验性的，生产用 JVM 版的 `apache/kafka` 或托管的 Kafka，代码不用改）。主题由 QF 第一次发送时自动创建，分区数和保留期取 broker 的设置：演示的覆盖文件里显式写了 3 个分区（`KAFKA_NUM_PARTITIONS`）、保留 168 小时（`KAFKA_LOG_RETENTION_HOURS`，和 Kafka 的默认值相同）。不做集群、副本和 Schema Registry。
+- **主题的保留期不能短于 outbox 的保留期（7 天）**：短了的话，消费者停了一阵子，还没读到的事件先在 Kafka 里过期，outbox 那一行发出满 7 天之后也被清理，对账就只能把这些调用报成 `LOST`（两边都找不到了）。自己建主题或者用托管的 Kafka 时，主题的 `retention.ms` 至少 7 天。
+- **不依赖它启动**：`quotaforge` 不等 `qf-kafka`。Kafka 没起来、停了，请求照常，事件留在 outbox 里，恢复之后补发。消费者等 `qf-kafka` 健康才起。
+- **消费者**：用和 QF 同一份配置文件（整份配置照样要校验通过），连账本的库用只能增删改查的账号；指标在 `QUOTAFORGE_METRICS_ADDR`（演示里是 9465，只在 Compose 的网络里）。没有 HTTP 接口，Compose 里关掉了镜像自带的健康检查。退出时做完手上的一条、提交位点、离开消费组，Compose 默认的 10 秒宽限期够用。
+- **两个镜像都写死版本**：`apache/kafka-native:4.3.1`（broker）和 `apache/kafka:4.3.1`（只当命令行工具，重置位点、读主题）。
+
 ## qfctl
 
 管理工具，直连数据库，没有 HTTP 管理接口。连接串来自环境变量 `QFCTL_MYSQL_DSN`，或者 `QFCTL_MYSQL_DSN_FILE` 指向的文件，正好设一个。任何输出都不带连接串和密码。
@@ -236,6 +258,7 @@ scripts/compose-cache.sh   # Compose 项目名 qf-cache，叠加 compose.cache.y
 | `qfctl idempotency purge` | 删掉过期的幂等记录和快照，输出删了多少条；可以重复执行 |
 | `qfctl unknown [-account NAME]` | 列出用量未知、还占着预留的调用：调用号、账户、创建时间、接口、别名、上游、上游模型、预留量、错误码。拿这张单去向上游要账单 |
 | `qfctl reconcile (-bill FILE \| -log FILE) [-apply]` | 凭证据结清未知用量，默认只预演（见[调用状态、回收和对账](ledger.md#调用状态回收和对账未知用量)） |
+| `qfctl usage-reconcile [-day YYYY-MM-DD] [-account NAME]` | 拿用量事件的消费者记下的按天汇总和账本对账：每天、每个账户、每种用途一行，再列出还在路上的和对不上的调用；对不上就以 1 退出，在路上的不算（见[用量事件](ledger.md#用量事件)） |
 
 限流限额（`-rpm`、`-tpm`）是每分钟的请求数和 token 数，0 到 10¹² 的整数，和配置文件里上游的限额是同一条规则；不合法就是用法错误。
 

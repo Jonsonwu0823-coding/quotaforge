@@ -123,7 +123,7 @@ func TestBackgroundMetrics(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		background(ctx, store, time.Hour, 20*time.Millisecond, slog.New(slog.NewJSONHandler(io.Discard, nil)), m)
+		background(ctx, store, time.Hour, 20*time.Millisecond, false, slog.New(slog.NewJSONHandler(io.Discard, nil)), m)
 	}()
 	waitUntil(t, 10*time.Second, func() bool { return testutil.ToFloat64(m.BackgroundLastSuccess) > 0 })
 	cancel()
@@ -142,7 +142,7 @@ func TestBackgroundMetrics(t *testing.T) {
 	done = make(chan struct{})
 	go func() {
 		defer close(done)
-		background(ctx, closed, time.Hour, 20*time.Millisecond, slog.New(slog.NewJSONHandler(io.Discard, nil)), broken)
+		background(ctx, closed, time.Hour, 20*time.Millisecond, false, slog.New(slog.NewJSONHandler(io.Discard, nil)), broken)
 	}()
 	waitUntil(t, 10*time.Second, func() bool {
 		return testutil.ToFloat64(broken.BackgroundErrors.WithLabelValues("unknown_scan")) > 0

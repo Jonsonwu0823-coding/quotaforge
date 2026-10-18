@@ -48,6 +48,12 @@ type Metrics struct {
 	UnknownCalls          prometheus.Gauge
 	UnknownOldestAge      prometheus.Gauge
 
+	OutboxUnsent    prometheus.Gauge
+	OutboxOldestAge prometheus.Gauge
+	EventsForwarded prometheus.Counter
+	EventsConsumed  *prometheus.CounterVec // result
+	EventDelay      prometheus.Observer
+
 	TraceErrors prometheus.Counter
 }
 
@@ -56,6 +62,9 @@ var slowBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 15
 
 // QF 自身耗时的桶：没有竞争时约 12 毫秒，OverheadSLOSeconds 是其中一个边界。
 var overheadBuckets = []float64{.001, .0025, .005, .01, .025, .05, .1, OverheadSLOSeconds, .5, 1, 2.5}
+
+// 用量事件延迟的桶：转发每秒一轮，消息队列或消费者停过的话可以是几分钟到几小时。
+var eventBuckets = []float64{.1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600}
 
 // NewMetrics 建好全部指标。dbStats 是账本连接池的统计（ledger.Store.Stats），每次抓取时读。
 func NewMetrics(dbStats func() sql.DBStats) *Metrics {
@@ -98,11 +107,20 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 
 	m.Reclaimed = counter("qf_background_reclaimed_total", "Calls reclaimed by the background loop: released or marked_unknown.", "result")
 	m.Purged = counter("qf_background_purged_total", "Expired idempotency records deleted by the background loop.").WithLabelValues()
-	m.BackgroundErrors = counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge or unknown_scan.", "task")
+	m.BackgroundErrors = counter("qf_background_errors_total", "Background tasks that failed: reclaim, purge, unknown_scan, "+
+		"outbox_purge, usage_forward (QF), or usage_consume (the usage event consumer).", "task")
 	m.BackgroundLastSuccess = gauge("qf_background_last_success_timestamp_seconds", "When the last background round without errors finished.")
 	m.BackgroundInterval = gauge("qf_background_interval_seconds", "Interval between background rounds.")
 	m.UnknownCalls = gauge("qf_unknown_usage_calls", "Calls with unknown usage that still hold their reservation.")
 	m.UnknownOldestAge = gauge("qf_unknown_usage_oldest_age_seconds", "Age of the oldest call with unknown usage; 0 when there is none.")
+
+	m.OutboxUnsent = gauge("qf_usage_outbox_unsent", "Usage events in the outbox not yet sent to the message queue (all instances share the outbox).")
+	m.OutboxOldestAge = gauge("qf_usage_outbox_oldest_age_seconds", "Age of the oldest usage event not yet sent; 0 when there is none.")
+	m.EventsForwarded = counter("qf_usage_events_forwarded_total", "Usage events sent to the message queue and marked sent by this instance.").WithLabelValues()
+	m.EventsConsumed = counter("qf_usage_events_consumed_total", "Usage events taken from the message queue by the consumer: applied to the "+
+		"daily totals, duplicate (the call was counted before), or malformed (skipped).", "result")
+	m.EventDelay = histogram("qf_usage_event_delay_seconds", "Time from resolving a call to adding its event to the daily totals.",
+		eventBuckets).WithLabelValues()
 
 	m.TraceErrors = counter("qf_trace_export_errors_total", "Errors reported by the tracing SDK, mostly failed span exports.").WithLabelValues()
 

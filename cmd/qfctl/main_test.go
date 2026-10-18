@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/apikey"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
@@ -53,6 +54,9 @@ func TestUsageErrors(t *testing.T) {
 		{"reconcile"},
 		{"reconcile", "-apply"},
 		{"reconcile", "-bill", "a.csv", "-log", "b.log"},
+		{"usage-reconcile", "-day", "2026-13-01"},
+		{"usage-reconcile", "-day", "yesterday"},
+		{"usage-reconcile", "extra"},
 		// 限流的限额：0 到 10^12 的整数；set-rate 两个都必填
 		{"account", "create", "-name", "x", "-limit", "5", "-rpm", "-1"},
 		{"account", "create", "-name", "x", "-limit", "5", "-tpm", "1000000000001"},
@@ -389,4 +393,65 @@ func TestReconcileCommand(t *testing.T) {
 		t.Fatalf("log: exit %d, %q", code, out)
 	}
 	dbtest.Verify(t, store)
+}
+
+// usage-reconcile：在路上的照实列出、退出 0；全部消费之后 all equal；消费者的汇总被改了就是 MISMATCH、退出 1。
+func TestUsageReconcileCommand(t *testing.T) {
+	env := map[string]string{"QFCTL_MYSQL_DSN": dbtest.AppDSN(t)}
+	ctx := context.Background()
+	store := dbtest.Store(t)
+	name := dbtest.Account(t, store, 1_000_000)
+	issued, err := store.IssueKey(ctx, name, []string{"m"}, ledger.Rate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.KeyByHash(ctx, apikey.Hash(issued.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
+		Alias: "m", Upstream: "up", UpstreamModel: "um", EstInput: 10, EstOutput: 10}
+	if _, err := store.Reserve(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkSent(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(ctx, r, ledger.Result{Status: ledger.Settled, Evidence: ledger.Answered, HTTPStatus: 200,
+		Usage: &ledger.Usage{Prompt: 7, Completion: 3, Total: 10, HasCompletion: true}}); err != nil {
+		t.Fatal(err)
+	}
+	day := dbtest.Now(t, dbtest.Admin(t)).Format(time.DateOnly)
+	header := "day\taccount\tpurpose\tledger_calls\tconsumer_calls\tledger_tokens\tconsumer_tokens\tunsent\tunconsumed\tresult\n"
+
+	code, out, _ := qfctl(env, "usage-reconcile", "-account", name)
+	if code != 0 || !strings.HasPrefix(out, header+day+"\t"+name+"\tchat\t1\t0\t10\t0\t1\t0\tin-transit\nunsent\t"+r.CallID+"\t") ||
+		!strings.Contains(out, "\nin transit: 1 unsent, 0 not consumed yet") {
+		t.Fatalf("unsent: exit %d, %q", code, out)
+	}
+	var events []ledger.UsageEvent
+	if _, err := store.ForwardOutbox(ctx, func(_ context.Context, batch []ledger.UsageEvent) error {
+		events = append(events, batch...)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if e.AccountID == key.AccountID {
+			if _, err := store.ApplyUsageEvent(ctx, e); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	code, out, _ = qfctl(env, "usage-reconcile", "-account", name, "-day", day)
+	if code != 0 || out != header+day+"\t"+name+"\tchat\t1\t1\t10\t10\t0\t0\tsame\nall equal: 1 rows\n" {
+		t.Fatalf("consumed: exit %d, %q", code, out)
+	}
+	if _, err := dbtest.Admin(t).Exec("UPDATE usage_daily SET total_tokens = total_tokens + 1 WHERE account_id = ?", key.AccountID); err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ = qfctl(env, "usage-reconcile", "-account", name)
+	if code != 1 || !strings.Contains(out, "\t10\t11\t0\t0\tMISMATCH\n") || !strings.HasSuffix(out, "MISMATCH: 1 of 1 rows (0 unsent, 0 not consumed yet)\n") {
+		t.Fatalf("tampered totals: exit %d, %q", code, out)
+	}
 }

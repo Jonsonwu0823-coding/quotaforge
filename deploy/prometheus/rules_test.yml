@@ -259,6 +259,31 @@ tests:
           - exp_labels: {severity: warning}
             exp_annotations: {summary: "有用量未知的调用超过一天没有对账（qfctl unknown、qfctl reconcile）"}
 
+  # 用量事件的积压：最老的一条在 6 分钟时超过 5 分钟（实例 b 报的是同一张表、数小一些），再满 2 分钟才触发。
+  - interval: 1m
+    input_series:
+      - series: qf_usage_outbox_oldest_age_seconds{instance="a"}
+        values: 0+60x15
+      - series: qf_usage_outbox_oldest_age_seconds{instance="b"}
+        values: 0+30x15
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: QFUsageOutboxBacklog
+      - eval_time: 8m
+        alertname: QFUsageOutboxBacklog
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations: {summary: "用量事件积压：outbox 里最老的一条超过 5 分钟没有发到消息队列"}
+
+  # 积压 4 分钟之后发完了（回到 0）：从没超过 5 分钟，不告警。
+  - interval: 1m
+    input_series:
+      - series: qf_usage_outbox_oldest_age_seconds{instance="a"}
+        values: 0+60x4 0x10
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: QFUsageOutboxBacklog
+
   # 依赖：账本持续出错 5 分钟以上才触发；限流没有出错。
   - interval: 1m
     input_series:

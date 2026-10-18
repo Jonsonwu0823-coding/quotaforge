@@ -1,5 +1,5 @@
 // qfctl 是 QuotaForge 的管理工具，直连账本数据库，不开 HTTP 管理接口：迁移、账户和额度、发放和吊销 Key、查用量、
-// 校验账本、清理过期的幂等记录、列出用量未知的调用、凭证据对账。
+// 校验账本、清理过期的幂等记录、列出用量未知的调用、凭证据对账、拿用量事件的按天汇总和账本对账。
 //
 // 连接串来自环境变量 QFCTL_MYSQL_DSN，或者 QFCTL_MYSQL_DSN_FILE 指向的文件（容器里的 secret），正好设一个。
 // 迁移要用能建表的账号；其它子命令用只能增删改查的账号也够。任何输出都不带连接串和密码。
@@ -40,6 +40,11 @@ const usage = `usage: qfctl <command> [flags]
   reconcile (-bill FILE | -log FILE) [-apply]  settle unknown usage on evidence: a QF bill CSV or the QF call log
                                                (FILE - reads stdin); a dry run unless -apply; exit 1 if any call
                                                needs a look (inconsistent, in progress, not found, failed)
+  usage-reconcile [-day YYYY-MM-DD] [-account NAME]
+                                               compare the usage event consumer's daily totals with the ledger
+                                               (default: every day since usage events were enabled, all accounts);
+                                               exit 1 if any call is lost, extra or counted differently (calls still
+                                               in transit are not an error)
 
 Rate limits are requests (-rpm) and tokens (-tpm) per minute, from 0 (no limit) to 1000000000000.
 To stop a key, revoke it: a rate limit of 0 means no limit.
@@ -127,6 +132,7 @@ var commands = map[string]command{
 	"idempotency purge": idempotencyPurge,
 	"unknown":           unknownCmd,
 	"reconcile":         reconcileCmd,
+	"usage-reconcile":   usageReconcileCmd,
 }
 
 // withStore 打开账本执行 fn，结束时关闭。
@@ -472,6 +478,58 @@ func report(out io.Writer, items []ledger.Item, apply bool) error {
 	}
 	if needsLook := len(items) - changes - counts[ledger.Consistent]; needsLook > 0 {
 		return fmt.Errorf("reconcile: %d calls need a look", needsLook)
+	}
+	return nil
+}
+
+// usageReconcileCmd 拿用量事件的消费者记下的按天汇总和账本对账（见 ledger.Store.ReconcileUsage）：按日期、账户、用途
+// 各一行两边的数，再逐个列出对不上的调用，最后一行是汇总。在路上的（还没发、发了还没消费）不算错：退出 0；
+// 丢了的、多出的、数对不上的退出 1。只有调用号、账户名和数字，没有正文和 Key。
+func usageReconcileCmd(fs *flag.FlagSet, _ io.Reader) func(context.Context, string, io.Writer) error {
+	day := fs.String("day", "", "UTC day YYYY-MM-DD (default: every day since usage events were enabled)")
+	account := fs.String("account", "", "account name (default: all accounts)")
+	return func(ctx context.Context, dsn string, out io.Writer) error {
+		if _, err := time.Parse(time.DateOnly, *day); *day != "" && err != nil {
+			return errUsage
+		}
+		return withStore(ctx, dsn, func(s *ledger.Store) error {
+			r, err := s.ReconcileUsage(ctx, *day, *account)
+			if err != nil {
+				return err
+			}
+			return usageReport(out, r)
+		})
+	}
+}
+
+func usageReport(out io.Writer, r *ledger.UsageReport) error {
+	calls := func(t ledger.UsageTotals) int64 { return t.Settled + t.Cached + t.Cancelled }
+	fmt.Fprintln(out, "day\taccount\tpurpose\tledger_calls\tconsumer_calls\tledger_tokens\tconsumer_tokens\tunsent\tunconsumed\tresult")
+	mismatched := 0
+	var unsent, unconsumed int64
+	for _, d := range r.Days {
+		fmt.Fprintf(out, "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n", d.Day, d.Account, d.Purpose, calls(d.Ledger), calls(d.Consumer),
+			d.Ledger.Total, d.Consumer.Total, d.Unsent, d.Unconsumed, d.Result())
+		if d.Result() == "MISMATCH" {
+			mismatched++
+		}
+		unsent, unconsumed = unsent+d.Unsent, unconsumed+d.Unconsumed
+	}
+	var oldest int64
+	for _, g := range r.Gaps {
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\n", g.Kind, g.CallID, g.Day, g.Account, g.Purpose)
+		if g.Kind == ledger.GapUnsent || g.Kind == ledger.GapUnconsumed {
+			oldest = max(oldest, g.AgeSeconds)
+		}
+	}
+	switch {
+	case mismatched > 0:
+		fmt.Fprintf(out, "MISMATCH: %d of %d rows (%d unsent, %d not consumed yet)\n", mismatched, len(r.Days), unsent, unconsumed)
+		return fmt.Errorf("usage-reconcile: %d rows do not match the ledger", mismatched)
+	case unsent+unconsumed > 0:
+		fmt.Fprintf(out, "in transit: %d unsent, %d not consumed yet (the oldest resolved %ds ago); the rest equal\n", unsent, unconsumed, oldest)
+	default:
+		fmt.Fprintf(out, "all equal: %d rows\n", len(r.Days))
 	}
 	return nil
 }

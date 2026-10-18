@@ -244,6 +244,36 @@ func TestParseEmbeddingCache(t *testing.T) {
 	}
 }
 
+// 用量事件：没写这一段就不开；写了要有至少一个“主机:端口”的 broker。
+func TestParseUsageEvents(t *testing.T) {
+	c, err := parseMap(t, base())
+	if err != nil || c.UsageEvents() != nil {
+		t.Fatalf("without usage_events: %+v, %v; want off", c.UsageEvents(), err)
+	}
+	m := base()
+	m["usage_events"] = map[string]any{"brokers": []any{"qf-kafka:9092", "10.0.0.2:19092"}}
+	c, err = parseMap(t, m)
+	if err != nil || c.UsageEvents() == nil || !slices.Equal(c.UsageEvents().Brokers, []string{"qf-kafka:9092", "10.0.0.2:19092"}) {
+		t.Fatalf("usage_events = %+v, %v", c.UsageEvents(), err)
+	}
+	for _, section := range []map[string]any{
+		{},
+		{"brokers": []any{}},
+		{"brokers": []any{"qf-kafka"}},
+		{"brokers": []any{":9092"}},
+		{"brokers": []any{"qf-kafka:0"}},
+		{"brokers": []any{"qf-kafka:65536"}},
+		{"brokers": []any{"qf-kafka:http"}},
+		{"brokers": []any{"qf-kafka:9092"}, "topic": "x"},
+	} {
+		m := base()
+		m["usage_events"] = section
+		if _, err := parseMap(t, m); err == nil {
+			t.Errorf("%v: accepted", section)
+		}
+	}
+}
+
 func TestValidRate(t *testing.T) {
 	for n, want := range map[int64]bool{-1: false, 0: true, 1: true, MaxRate: true, MaxRate + 1: false} {
 		if ValidRate(n) != want {
@@ -561,6 +591,10 @@ func TestDeployConfigs(t *testing.T) {
 		if c.EmbeddingCache() != nil {
 			t.Fatalf("%s: the embedding cache must stay off", tc.file)
 		}
+		// 给 QS 用的部署不打开用量事件：除了结清时一条什么都不写的语句，行为和以前完全一样
+		if c.UsageEvents() != nil {
+			t.Fatalf("%s: usage events must stay off", tc.file)
+		}
 	}
 }
 
@@ -667,5 +701,31 @@ func TestCacheDemoConfig(t *testing.T) {
 	if a.Upstream.Name != "fake-a" || b.Upstream.Name != "fake-b" || a.UpstreamModel != "fake-embed" || b.UpstreamModel != "fake-embed" ||
 		b.Upstream.URL(Embeddings) != "http://qf-fake-upstream-b:8081/v1/embeddings" {
 		t.Fatalf("targets = %+v, %+v", a, b)
+	}
+}
+
+// 用量事件的演示配置：打开用量事件（broker 是 qf-kafka）和嵌入缓存；四个别名分别得到结算、上游 401（取消）、
+// 没有 usage（未知）和嵌入。
+func TestUsageDemoConfig(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "deploy", "config.usage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.ReplaceAll(string(data), "/run/secrets/app_dsn", filepath.ToSlash(writeFile(t, testDSN+"\n")))
+	c, err := parse([]byte(s), env(map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL,
+		"QF_REDIS_CACHE_URL": "redis://qf-redis-cache:6379/0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ue := c.UsageEvents(); ue == nil || !slices.Equal(ue.Brokers, []string{"qf-kafka:9092"}) || c.EmbeddingCache() == nil {
+		t.Fatalf("usage events %+v, embedding cache %+v", ue, c.EmbeddingCache())
+	}
+	for alias, want := range map[string]string{"usage-chat": "fake-chat", "usage-rejected": "fake-401", "usage-unknown": "fake-no-usage"} {
+		if got := only(t, c.Model(Chat, alias)).UpstreamModel; got != want {
+			t.Errorf("%s -> %s, want %s", alias, got, want)
+		}
+	}
+	if got := only(t, c.Model(Embeddings, "usage-emb")).UpstreamModel; got != "fake-embed" {
+		t.Errorf("usage-emb -> %s", got)
 	}
 }

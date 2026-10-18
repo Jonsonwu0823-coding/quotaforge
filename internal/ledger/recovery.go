@@ -102,8 +102,9 @@ func checkTransition(by Actor, c *lockedCall, to Status) error {
 	return nil
 }
 
-// setStatus 按主键、带着锁住时读到的状态做条件更新：status 改成 to，结清（终态）时写审计三列；
-// set 和 args 是这一方自己要写的其它列。改到 0 行说明状态变了（不该发生，调用行已经锁住），返回错误让事务回滚。
+// setStatus 按主键、带着锁住时读到的状态做条件更新：status 改成 to，结清（终态）时写审计三列，并在同一个事务里
+// 写用量事件的 outbox 行（writeEvent，内容抄自刚改好的这一行）。set 和 args 是这一方自己要写的其它列。
+// 改到 0 行说明状态变了（不该发生，调用行已经锁住），返回错误让事务回滚。
 func setStatus(ctx context.Context, tx *sql.Tx, callID string, from, to Status, by Actor, evidence Evidence, set string, args ...any) error {
 	var resolvedBy, resolution any // nil 存 NULL
 	resolvedAt := "NULL"
@@ -124,6 +125,9 @@ func setStatus(ctx context.Context, tx *sql.Tx, callID string, from, to Status, 
 	}
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		return fmt.Errorf("update call %s: status is no longer %s (%v)", callID, from, err)
+	}
+	if terminal(to) {
+		return writeEvent(ctx, tx, callID)
 	}
 	return nil
 }

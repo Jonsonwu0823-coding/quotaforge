@@ -9,6 +9,7 @@ QuotaForge（QF）是给 Agent 用的大模型网关，用 Go 写成。Agent 和
 - **共享限流**：Key、账户、上游三层，每层限每分钟的请求数和 token 数。令牌桶放在 Redis 里，由 Lua 脚本原子地扣，多个实例共享同一组桶。
 - **多个实例**：实例之间不共享内存状态，同时跑也不会超扣、不会重复执行同一个键、不会重复回收。附带跨实例的检查脚本和压测数据。
 - **嵌入缓存**（可选）：同一个账户的相同嵌入请求直接用之前结算过的响应，不调上游、不扣额度，账本里记一条 `CACHED`。缓存放在单独的 Redis 里；同一个实例里并发的相同请求只回源一次，过期时间加随机抖动；缓存坏了只算没命中。
+- **用量事件**（可选）：调用结清时，在同一个数据库事务里写一行 outbox；后台转发到 Kafka（至少一次），消费者按调用号去重、按账户按天汇总，`qfctl usage-reconcile` 拿汇总和账本对账。Kafka 挂了请求照常，事件留在 outbox 里，恢复后补发。
 
 ```mermaid
 flowchart LR
@@ -17,15 +18,17 @@ flowchart LR
         direction TB
         check["鉴权、解析、估算"] --> admit["限流准入"] --> cache["嵌入缓存<br/>（命中就记 CACHED、不预留）"] --> reserve["预留额度<br/>（幂等判断）"] --> intent["发送意图"] --> forward["转发<br/>（只换模型名）"] --> settle["收尾结算"]
         bg["后台：回收卡住的调用、<br/>清理过期的幂等记录"]
+        fwd["转发用量事件<br/>（outbox → Kafka）"]
     end
     client -- "OpenAI 兼容接口<br/>Bearer QF Key" --> check
     forward -- "上游 Key" --> upstream["上游模型<br/>（OpenAI 兼容）"]
     admit --> redis[("Redis<br/>共享令牌桶")]
     cache --> rcache[("Redis（单独的）<br/>嵌入缓存")]
-    reserve --> mysql[("MySQL<br/>额度、账本、调用、幂等记录")]
+    reserve --> mysql[("MySQL<br/>额度、账本、调用、幂等记录、outbox")]
     intent --> mysql
     settle --> mysql
     bg --> mysql
+    mysql -- "outbox" --> fwd --> kafka[("Kafka<br/>用量事件")] --> consumer["消费者<br/>去重、按天汇总"] --> mysql
     qfctl["qfctl<br/>迁移、账户、Key、对账"] --> mysql
 ```
 
@@ -39,7 +42,7 @@ flowchart LR
 | M4 限流和多实例 | Redis 共享令牌桶（Key、账户、上游三层的 RPM、TPM）；两个实例的跨进程检查和压测（[限流](docs/rate-limiting.md)、[两个实例和压测](docs/scaling.md)） |
 | M5 可观测 | OpenTelemetry 追踪（一次调用一棵 span 树，接收 W3C `traceparent`）、Prometheus 指标、SLO 和告警规则、日志按调用号和 `trace_id` 关联；Jaeger 加 Prometheus 的演示环境（[可观测](docs/observability.md)） |
 
-进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。多上游与熔断已经可用：一个别名多个目标、按权重分流（灰度、主备），连不上时换上游，按上游熔断（[多个上游](docs/operations.md#多个上游)）。Embedding 缓存已经可用：按账户隔离的精确缓存、并发的相同请求只回源一次、过期时间加抖动、命中记 `CACHED`（[嵌入缓存](docs/api.md#嵌入缓存)）。计划中：用量事件。
+进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。多上游与熔断已经可用：一个别名多个目标、按权重分流（灰度、主备），连不上时换上游，按上游熔断（[多个上游](docs/operations.md#多个上游)）。Embedding 缓存已经可用：按账户隔离的精确缓存、并发的相同请求只回源一次、过期时间加抖动、命中记 `CACHED`（[嵌入缓存](docs/api.md#嵌入缓存)）。用量事件已经可用：结清时同一个事务写 outbox、转发到 Kafka、消费者去重并按天汇总、和账本对账（[用量事件](docs/ledger.md#用量事件)）。
 
 ## 快速开始
 
@@ -68,13 +71,13 @@ docker compose down -v
 | 文档 | 内容 |
 |---|---|
 | [接口和幂等](docs/api.md) | 接口、错误码、流式、嵌入缓存、用 curl 调用、`Idempotency-Key` |
-| [额度、账本和未知用量](docs/ledger.md) | 估算、预留、结算，锁的顺序，账本的不变量；调用状态、回收、对账、调用状态查询；数据库和迁移；用量导出 |
+| [额度、账本和未知用量](docs/ledger.md) | 估算、预留、结算，锁的顺序，账本的不变量；调用状态、回收、对账、调用状态查询；数据库和迁移；用量事件（outbox、Kafka、按天汇总和对账）；用量导出 |
 | [限流](docs/rate-limiting.md) | 三层令牌桶、Lua 脚本、TPM 的修正、Redis 不可用时的行为 |
-| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、多个上游和熔断、嵌入缓存、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
+| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、多个上游和熔断、嵌入缓存、用量事件、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
 | [两个实例和压测](docs/scaling.md) | 两个实例怎么共享状态、跨实例的检查、压测方法和结果 |
 | [可观测](docs/observability.md) | span 树、日志关联、指标清单、SLO 和告警、Jaeger 加 Prometheus 的演示环境 |
 | [接 QueryShield](docs/queryshield.md) | 网络和配置、端到端联调、经 QS 的真实演示和对账 |
-| [开发和测试](docs/development.md) | Go 版本和依赖、跑测试、测试库 |
+| [开发和测试](docs/development.md) | Go 版本和依赖、跑测试、测试库和测试用的 Redis、Kafka |
 
 ## 许可证
 

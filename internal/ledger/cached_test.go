@@ -82,7 +82,8 @@ func TestRecordCached(t *testing.T) {
 	}
 }
 
-// 改坏 CACHED（或者给别的调用写上 cached_from），Verify 都能报出对应的规则。
+// 改坏 CACHED（或者给别的调用写上 cached_from），Verify 都能报出对应的规则。改了用量或 cached_from 的，
+// 和结清时抄进 outbox 的内容也对不上了，同时报 outbox。
 func TestVerifyFindsCachedTampering(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -100,7 +101,7 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 		}, []string{"sent"}},
 		{"unknown usage", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET usage_prompt_tokens = NULL, usage_total_tokens = NULL WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"not a 200", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET http_status = 500 WHERE id = '" + cached + "'"}
 		}, []string{"cached"}},
@@ -112,24 +113,24 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 		}, []string{"cached"}},
 		{"no origin", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET cached_from = 'qf-NOSUCHCALLAAAAAAAAAAAAAAAA' WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"no cached_from", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET cached_from = NULL WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"origin in another account", func(t *testing.T, _ *fixture, cached, _ string) []string {
 			other := newFixture(t, 1000)
 			return []string{"UPDATE calls SET cached_from = '" + other.settledEmbedding(t).CallID + "' WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"origin not settled", func(t *testing.T, f *fixture, cached, _ string) []string {
 			r := f.reserve(t, 10)
 			return []string{"UPDATE calls SET cached_from = '" + r.CallID + "' WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"different usage", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET usage_prompt_tokens = 8, usage_total_tokens = 8 WHERE id = '" + cached + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 		{"cached_from on a settled call", func(_ *testing.T, _ *fixture, _, from string) []string {
 			return []string{"UPDATE calls SET cached_from = '" + from + "' WHERE id = '" + from + "'"}
-		}, []string{"cached"}},
+		}, []string{"cached", "outbox"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,7 +197,7 @@ var unmigrate5 = []string{
 	`ALTER TABLE calls DROP COLUMN cached_from,
 		MODIFY COLUMN status ENUM('RESERVED', 'SETTLED', 'CANCELLED', 'USAGE_UNKNOWN', 'IN_FLIGHT') NOT NULL,
 		MODIFY COLUMN resolution_evidence ENUM('response', 'not_sent', 'late_response', 'call_log', 'bill') NULL`,
-	"DELETE FROM schema_migrations WHERE version = 5",
+	"DELETE FROM schema_migrations WHERE version >= 5", // 0006 随之重跑：它的表已经在了，跳过
 }
 
 // 迁移 0005：版本 4 的库里已有的调用原样保留，迁移后能写 CACHED、Verify 干净；再迁移一遍什么都不做。
@@ -212,7 +213,7 @@ func TestMigration5Cached(t *testing.T) {
 	before := f.snapshot(t)
 	for range 2 {
 		from5, to, err := ledger.Migrate(ctx, dsn)
-		if err != nil || to != 5 {
+		if err != nil || to != ledger.SchemaVersion {
 			t.Fatalf("Migrate = %d, %d, %v", from5, to, err)
 		}
 	}

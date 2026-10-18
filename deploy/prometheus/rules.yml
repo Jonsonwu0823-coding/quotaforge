@@ -76,6 +76,15 @@ groups:
           severity: warning
         annotations:
           summary: 有用量未知的调用超过一天没有对账（qfctl unknown、qfctl reconcile）
+      # 用量事件的 outbox 最老一条等了 5 分钟还没发出：消息队列不可用，或者转发停了。请求不受影响，只是下游的汇总落后；
+      # 恢复之后自动补发。只有配了用量事件的实例导出这个数，几个实例数的是同一张表，取最大值。
+      - alert: QFUsageOutboxBacklog
+        expr: max(qf_usage_outbox_oldest_age_seconds) > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: 用量事件积压：outbox 里最老的一条超过 5 分钟没有发到消息队列
       # 账本或限流的 Redis 持续不可用（没有请求时不会出错，也就不告警：没有用户受影响）。
       - alert: QFDependencyUnavailable
         expr: sum by (dependency) (rate(qf_dependency_errors_total[2m])) > 0

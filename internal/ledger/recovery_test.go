@@ -215,6 +215,7 @@ func TestLateResult(t *testing.T) {
 
 // waitBlocked 等到 n 个 QF 服务账号的会话停在 INFO 像 pattern 的语句上（在等锁）。测试账号没有 PROCESS 权限，
 // 但能看到同一个账号自己的线程；服务的连接都用这个账号，而拿着锁的管理连接是另一个账号，看不到也不算进来。
+// 查 PROCESSLIST 的这条语句自己也匹配以 % 开头的模式（比如 "%usage_events%"），所以排除自己的连接。
 func waitBlocked(t *testing.T, pattern string, n int) {
 	t.Helper()
 	db, err := sql.Open("mysql", dbtest.AppDSN(t))
@@ -225,7 +226,7 @@ func waitBlocked(t *testing.T, pattern string, n int) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var got int
-		if err := db.QueryRow("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE ?", pattern).Scan(&got); err != nil {
+		if err := db.QueryRow("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND INFO LIKE ?", pattern).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 		if got >= n {
@@ -462,7 +463,8 @@ func TestVerifyFindsRecoveryTampering(t *testing.T) {
 		{"settled without sent_at", func(c calls) []string { return setCall(c.settled, "sent_at = NULL") }, []string{"sent"}},
 		{"reclaim released with sent_at", func(c calls) []string { return setCall(c.reclaimed, "sent_at = UTC_TIMESTAMP(6)") }, []string{"sent"}},
 		{"settled without resolution", func(c calls) []string { return setCall(c.settled, "resolved_by = NULL") }, []string{"resolution"}},
-		{"settled without resolved_at", func(c calls) []string { return setCall(c.settled, "resolved_at = NULL") }, []string{"resolution"}},
+		{"settled without resolved_at", func(c calls) []string { return setCall(c.settled, "resolved_at = NULL") },
+			[]string{"outbox", "resolution"}}, // outbox 里抄的是结清的时间
 		{"unknown with resolution", func(c calls) []string {
 			return setCall(c.unknown, "resolved_by = 'gateway', resolution_evidence = 'response', resolved_at = UTC_TIMESTAMP(6)")
 		}, []string{"resolution"}},

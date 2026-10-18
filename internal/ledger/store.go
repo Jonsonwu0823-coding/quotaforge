@@ -6,6 +6,7 @@
 // 锁的顺序：每个改动额度的事务都先锁这个账户的额度行（budgets），再按主键动 calls 和 ledger。
 // 顺序统一，并发的预留、收尾、回收和对账就不会互相等成死锁；同一账户的事务在额度行上排队。
 // 发送意图（MarkSent）和改道（Reroute）是不锁额度行的两个写：它们只锁调用这一行，持锁时不等别的锁，构不成等待环。
+// 结清的事务最后对用量事件的开关行加共享锁（见 writeEvent）；打开开关的事务只锁这一行，也构不成等待环。
 package ledger
 
 import (
@@ -252,25 +253,26 @@ func reserveIn(ctx context.Context, tx *sql.Tx, r Reservation) error {
 	return insertEntry(ctx, tx, r.CallID, "reserve", r.Amount(), 0)
 }
 
-// RecordCached 记一次缓存命中：一条自动提交的 INSERT，状态 CACHED，预留量 0，没有账本行，不锁额度行、不动额度。
-// 写入时就已结清（网关凭 cache），收尾、回收和对账都没有从它出发的转换。外键检查只对账户和 Key 加共享锁，
-// 单条语句不持有别的锁，和预留、收尾构不成等待环。
+// RecordCached 记一次缓存命中：状态 CACHED，预留量 0，没有账本行，不锁额度行、不动额度。写入时就已结清（网关凭 cache），
+// 收尾、回收和对账都没有从它出发的转换。和用量事件的 outbox 行在同一个事务里写（writeEvent）：两样要么都在，要么都没有。
+// 外键检查只对账户和 Key 加共享锁，之后只有开关行上的共享锁，持锁时不等额度行和调用行，和预留、收尾构不成等待环。
 func (s *Store) RecordCached(ctx context.Context, c CachedCall) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO calls (id, account_id, key_id, status, purpose, model_alias,
-		upstream, upstream_model, est_input_tokens, est_output_tokens, reserved_tokens,
-		usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, client_request_id, run_id,
-		upstream_response_id, response_model, http_status, cached_from,
-		resolved_by, resolution_evidence, created_at, finished_at, resolved_at)
-		VALUES (?, ?, ?, 'CACHED', ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 200, ?, ?, ?,
-			UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`,
-		c.CallID, c.AccountID, c.KeyID, c.Purpose, c.Alias, c.Upstream, c.UpstreamModel,
-		c.Usage.Prompt, sql.NullInt64{Int64: c.Usage.Completion, Valid: c.Usage.HasCompletion}, c.Usage.Total,
-		nullString(c.ClientRequestID), nullString(c.RunID), nullString(c.ResponseID), nullString(c.ResponseModel),
-		c.CachedFrom, Gateway, Cache)
-	if err != nil {
-		return fmt.Errorf("record cached call: %w", err)
-	}
-	return nil
+	return s.inTx(ctx, nil, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO calls (id, account_id, key_id, status, purpose, model_alias,
+			upstream, upstream_model, est_input_tokens, est_output_tokens, reserved_tokens,
+			usage_prompt_tokens, usage_completion_tokens, usage_total_tokens, client_request_id, run_id,
+			upstream_response_id, response_model, http_status, cached_from,
+			resolved_by, resolution_evidence, created_at, finished_at, resolved_at)
+			VALUES (?, ?, ?, 'CACHED', ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 200, ?, ?, ?,
+				UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))`,
+			c.CallID, c.AccountID, c.KeyID, c.Purpose, c.Alias, c.Upstream, c.UpstreamModel,
+			c.Usage.Prompt, sql.NullInt64{Int64: c.Usage.Completion, Valid: c.Usage.HasCompletion}, c.Usage.Total,
+			nullString(c.ClientRequestID), nullString(c.RunID), nullString(c.ResponseID), nullString(c.ResponseModel),
+			c.CachedFrom, Gateway, Cache); err != nil {
+			return fmt.Errorf("record cached call: %w", err)
+		}
+		return writeEvent(ctx, tx, c.CallID)
+	})
 }
 
 // ErrNotReserved 是发送意图没落成：调用已经不是 RESERVED（超过上界，被回收释放了）。这时不能发请求。
@@ -387,7 +389,7 @@ func insertEntry(ctx context.Context, tx *sql.Tx, callID, kind string, reservedD
 // readCommitted 用于带幂等键的预留和清理：不对不存在的行加间隙锁，每条语句读最新提交的数据。
 var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 
-// inTx 在一个事务里执行 fn：fn 返回 nil 才提交，否则回滚。opts 为 nil 时用默认的可重复读。
+// inTx 在一个事务里执行 fn：fn 返回 nil 才提交，否则回滚。opts 为 nil 时用服务器默认的隔离级别。
 func (s *Store) inTx(ctx context.Context, opts *sql.TxOptions, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, opts)
 	if err != nil {

@@ -51,6 +51,12 @@ func (v Violation) String() string {
 //     没有快照的记录，快照的几列都是空的；
 //   - idem_settled_snapshot：指向 SETTLED 调用的记录有快照（或者标明正文超过上限、是流式的标记）；
 //     只有凭证据由 reconcile 结算的调用可以没有（QF 没拿到或没存下响应）。
+//
+// 用量事件级（见 verifyOutbox）：
+//   - outbox：每一行指向一个终态的调用，抄过去的几列和调用逐列相同；一个调用最多一行由唯一键保证；
+//   - outbox_complete：开关打开过时，enabled_at 之后、最近 outboxRetentionDays 天里结清的调用都有一行。
+//     窗口按数据库的时间算；窗口里的行一定还没被清理（清理只删发出超过这么多天的，sent_at 不早于 resolved_at），
+//     打开之前结清的调用不要求有。
 func (s *Store) Verify(ctx context.Context) ([]Violation, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
@@ -69,7 +75,11 @@ func (s *Store) Verify(ctx context.Context) ([]Violation, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(append(out, calls...), records...), nil
+	events, err := verifyOutbox(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(out, calls, records, events), nil
 }
 
 func verifyBudgets(ctx context.Context, tx *sql.Tx) ([]Violation, error) {
@@ -297,4 +307,49 @@ func nullInt(v sql.NullInt64) string {
 		return "NULL"
 	}
 	return fmt.Sprint(v.Int64)
+}
+
+// verifyOutbox 是用量事件的两条规则，只返回不成立的行。
+func verifyOutbox(ctx context.Context, tx *sql.Tx) ([]Violation, error) {
+	out, err := violations(ctx, tx, "outbox", `SELECT account, call_id, CONCAT(call_status, ' call, outbox row ', row_status,
+			IF(same, ', same content', ', content differs from the call'))
+		FROM (SELECT COALESCE(a.name, CONCAT('#', c.account_id)) AS account, o.seq, o.call_id,
+				c.status AS call_status, o.status AS row_status,
+				o.account_id = c.account_id AND o.purpose = c.purpose AND o.model_alias = c.model_alias
+				AND o.upstream = c.upstream AND o.upstream_model = c.upstream_model AND o.status = c.status
+				AND o.usage_prompt_tokens <=> c.usage_prompt_tokens AND o.usage_completion_tokens <=> c.usage_completion_tokens
+				AND o.usage_total_tokens <=> c.usage_total_tokens AND o.resolved_at <=> c.resolved_at
+				AND o.cached_from <=> c.cached_from AS same
+			FROM outbox o JOIN calls c ON c.id = o.call_id LEFT JOIN accounts a ON a.id = c.account_id) r
+		WHERE NOT same OR call_status NOT IN ('SETTLED', 'CANCELLED', 'CACHED')
+		ORDER BY seq`)
+	if err != nil {
+		return nil, err
+	}
+	missing, err := violations(ctx, tx, "outbox_complete", `SELECT a.name, c.id, CONCAT(c.status, ' call resolved at ', c.resolved_at,
+			' has no outbox row (events enabled at ', e.enabled_at, ')')
+		FROM calls c JOIN accounts a ON a.id = c.account_id JOIN usage_events e ON e.id = 1 AND e.enabled_at IS NOT NULL
+		WHERE c.status IN ('SETTLED', 'CANCELLED', 'CACHED') AND c.resolved_at >= e.enabled_at
+			AND c.resolved_at >= UTC_TIMESTAMP(6) - INTERVAL ? DAY
+			AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.call_id = c.id)
+		ORDER BY c.id`, outboxRetentionDays)
+	return append(out, missing...), err
+}
+
+// violations 把查询出的 (账户, 调用, 说明) 每行记成 rule 的一条。
+func violations(ctx context.Context, tx *sql.Tx, rule, query string, args ...any) ([]Violation, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("verify %s: %w", rule, err)
+	}
+	defer rows.Close()
+	var out []Violation
+	for rows.Next() {
+		v := Violation{Rule: rule}
+		if err := rows.Scan(&v.Account, &v.Call, &v.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }

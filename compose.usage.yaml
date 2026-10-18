@@ -1,0 +1,69 @@
+# 用量事件的演示环境，叠加在 compose.yaml 和 compose.cache.yaml 之上（见 docs/ledger.md 的“用量事件”）：
+#   docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml up -d --build --wait
+# QF 换成 deploy/config.usage.json（打开用量事件、嵌入缓存）：结清的调用在同一个事务里写 outbox，QF 的转发循环把它们
+# 发到 qf-kafka；qf-usage-consumer（同一个镜像的 usage-consumer 子命令）按调用号去重、按账户按天汇总进账本的库。
+# 两个镜像都写死版本。qf-kafka 用 native 镜像（GraalVM，起得快、占内存小；Apache 标为实验性的，生产用 JVM 镜像
+# 或托管的 Kafka）。同版本的 JVM 镜像只当命令行工具（重置消费组的位点、读主题），在 profile tools 里，只有演示脚本用：
+#   docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml run --rm qf-kafka-tools /opt/kafka/bin/kafka-consumer-groups.sh …
+# QF 和消费者的指标在 9464、9465 上，只在 Compose 的网络里，不发布到宿主机。
+services:
+  quotaforge:
+    volumes: !override
+      - ./deploy/config.usage.json:/etc/quotaforge/config.json:ro
+    # 不依赖 qf-kafka：转发不在请求路径上，Kafka 没起来、停了，请求照常，事件留在 outbox 里，恢复之后补发。
+
+  # 单节点 KRaft（同一个进程既是 broker 也是 controller）。主题由 QF 第一次发送时自动创建：3 个分区，保留 7 天
+  # （和 outbox 的保留期一样，不能更短，见 docs/operations.md）。数据在容器里，stop、start 之后还在，down -v 时删掉。
+  qf-kafka:
+    image: apache/kafka-native:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://qf-kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+
+  qf-usage-consumer:
+    image: quotaforge:local # quotaforge 服务构建的同一个镜像
+    command: ["usage-consumer"]
+    environment:
+      QUOTAFORGE_CONFIG: /etc/quotaforge/config.json
+      QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9465
+      # 同一份配置文件：消费者只用 database 和 usage_events 两段，但整份配置照样要校验通过
+      QF_FAKE_UPSTREAM_KEY: test-only-upstream-key
+      QF_REDIS_URL: redis://qf-redis:6379/0
+      QF_REDIS_CACHE_URL: redis://qf-redis-cache:6379/0
+    volumes:
+      - ./deploy/config.usage.json:/etc/quotaforge/config.json:ro
+    secrets:
+      - app_dsn
+    depends_on:
+      qfctl:
+        condition: service_completed_successfully
+      qf-kafka:
+        condition: service_healthy
+    healthcheck:
+      disable: true # 镜像的健康检查连的是 QF 的 API，消费者不开 API
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  qf-kafka-tools:
+    image: apache/kafka:4.3.1
+    profiles: [tools]
+    entrypoint: []
