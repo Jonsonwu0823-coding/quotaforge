@@ -1,7 +1,7 @@
 # 用量事件的演示环境，叠加在 compose.yaml 和 compose.cache.yaml 之上（见 docs/ledger.md 的“用量事件”）：
 #   docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml up -d --build --wait
 # QF 换成 deploy/config.usage.json（打开用量事件、嵌入缓存）：结清的调用在同一个事务里写 outbox，QF 的转发循环把它们
-# 发到 qf-kafka；qf-usage-consumer（同一个镜像的 usage-consumer 子命令）按调用号去重、按账户按天汇总进账本的库。
+# 发到 qf-kafka；qf-usage-consumer（单独的镜像目标 usage-consumer）按调用号去重、按账户按天汇总进账本的库。
 # 两个镜像都写死版本。qf-kafka 用 native 镜像（GraalVM，起得快、占内存小；Apache 标为实验性的，生产用 JVM 镜像
 # 或托管的 Kafka）。同版本的 JVM 镜像只当命令行工具（重置消费组的位点、读主题），在 profile tools 里，只有演示脚本用：
 #   docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml run --rm qf-kafka-tools /opt/kafka/bin/kafka-consumer-groups.sh …
@@ -39,8 +39,10 @@ services:
       start_interval: 1s
 
   qf-usage-consumer:
-    image: quotaforge:local # quotaforge 服务构建的同一个镜像
-    command: ["usage-consumer"]
+    build:
+      context: .
+      target: usage-consumer # 不带健康检查的镜像：消费者不开 API
+    image: quotaforge-usage-consumer:local
     environment:
       QUOTAFORGE_CONFIG: /etc/quotaforge/config.json
       QUOTAFORGE_METRICS_ADDR: 0.0.0.0:9465
@@ -57,8 +59,6 @@ services:
         condition: service_completed_successfully
       qf-kafka:
         condition: service_healthy
-    healthcheck:
-      disable: true # 镜像的健康检查连的是 QF 的 API，消费者不开 API
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

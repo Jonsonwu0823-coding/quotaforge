@@ -269,7 +269,7 @@ docker compose run --rm -T --no-deps qfctl reconcile -log - < qf.log
 - 退出：转发只在两批之间停（正在发的一批最多再等 5 秒加一次账本操作），和 HTTP 排空同时进行，退出的上限（默认 36 秒）和 `stop_grace_period` 都不变；排空期间结清的调用照样写 outbox，由下次启动或另一个实例发出。
 - **清理**：后台循环在清理幂等记录之后，删掉**发出**超过 7 天的 outbox 行（和 Kafka 主题的保留期一样）；没发出的永远不删。先不加锁地取候选，再按主键删。只有配了 `usage_events` 的实例做。
 
-**消费者**：`quotaforge usage-consumer` 子命令，同一个镜像、同一份配置（用其中的 `database` 和 `usage_events` 两段），单独一个进程；消费组 `quotaforge-usage-daily`，新的消费组从最早的消息读起。
+**消费者**：`quotaforge usage-consumer` 子命令，同一个程序、单独一个不带健康检查的镜像目标 `usage-consumer`，同一份配置（用其中的 `database` 和 `usage_events` 两段），单独一个进程；消费组 `quotaforge-usage-daily`，新的消费组从最早的消息读起。
 
 - **先写库、再提交位点**：取一批，逐条写库，写成功的才提交。写库之后、提交之前死了，重启之后会再收到这几条，去重跳过。
 - **去重和汇总在同一个事务里**（读已提交）：先插 `usage_seen`（调用号是主键），主键冲突就是处理过的重复，什么都不改；否则把这次调用加到 `usage_daily` 的（账户、日期、用途）那一行上。一个调用只会被算一次。

@@ -2,9 +2,9 @@
 
 ## 用 Docker Compose 运行
 
-`Dockerfile` 有四个目标：`quotaforge`（生产镜像，默认）、`qfctl`（管理工具）、`fakeupstream`（QF 的假上游，只用于测试）和 `qfbench`（压测和齐发工具，只用于测试，见[两个实例](scaling.md#两个实例)、[压测](scaling.md#压测)）。
+`Dockerfile` 有五个目标：`quotaforge`（生产镜像，默认）、`usage-consumer`（[用量事件](ledger.md#用量事件)的消费者，不带健康检查）、`qfctl`（管理工具）、`fakeupstream`（QF 的假上游，只用于测试）和 `qfbench`（压测和齐发工具，只用于测试，见[两个实例](scaling.md#两个实例)、[压测](scaling.md#压测)）。
 
-- 运行镜像都基于 `scratch`：只有一个静态二进制，`quotaforge` 镜像另带 CA 证书（HTTPS 访问百炼要用）。服务镜像里没有 `qfctl`。
+- 运行镜像都基于 `scratch`：只有一个静态二进制，`quotaforge` 和 `usage-consumer` 镜像另带 CA 证书（`quotaforge` 用它 HTTPS 访问百炼）。服务镜像里没有 `qfctl`。
 - 镜像里没有 shell，以 UID 65532 运行。
 - 镜像里设了 `QUOTAFORGE_ADDR=0.0.0.0:8080`，容器里监听所有地址，`docker run -p` 和 Compose 的端口映射都连得上。监听地址只在镜像里设这一处。
 - 健康检查是 `quotaforge healthcheck` 子命令：按 `QUOTAFORGE_ADDR` 请求本机的 `/healthz`。只看进程活着，不查数据库：数据库不可用时每个请求都是 503，这本身就是要的拒绝行为。
@@ -20,7 +20,7 @@
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
 | `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
 | `compose.failover.yaml` | 叠加在主文件上：第二个假上游 `qf-fake-upstream-b`（同一个镜像），`quotaforge` 换成两个上游的配置 `deploy/config.failover.json`、打开指标（只在 Compose 的网络里），见[多个上游](#多个上游) |
-| `compose.usage.yaml` | 再叠加在 `compose.cache.yaml` 之后：[用量事件](ledger.md#用量事件)的演示。`qf-kafka`（Kafka 单节点）、消费者 `qf-usage-consumer`（同一个镜像的 `usage-consumer` 子命令），`quotaforge` 换成 `deploy/config.usage.json`；命令行工具的容器 `qf-kafka-tools` 在 profile `tools` 里，见[用量事件](#用量事件) |
+| `compose.usage.yaml` | 再叠加在 `compose.cache.yaml` 之后：[用量事件](ledger.md#用量事件)的演示。`qf-kafka`（Kafka 单节点）、消费者 `qf-usage-consumer`（镜像目标 `usage-consumer`），`quotaforge` 换成 `deploy/config.usage.json`；命令行工具的容器 `qf-kafka-tools` 在 profile `tools` 里，见[用量事件](#用量事件) |
 | `compose.qs-e2e.yaml` | 只给端到端联调（`scripts/compose-qs-e2e.sh`）用，叠在 `compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml` 之后：`qf-jaeger` 接进 `qs-qf`（QS 的 span 也发到这个 Jaeger），`quotaforge-b` 也接进 `qs-qf`、带网络别名 `quotaforge`，见[接 QueryShield](queryshield.md) |
 
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
@@ -222,7 +222,7 @@ scripts/compose-cache.sh   # Compose 项目名 qf-cache，叠加 compose.cache.y
 
 ## 用量事件
 
-开关打开之后，结清调用时（同一个事务里）都写 outbox，不论这个实例配没配；配置里写了 `usage_events` 的 QF 实例每秒把它转发到 Kafka（至少要有一个实例保留这一段）；消费者是同一个镜像的子命令 `quotaforge usage-consumer`，单独一个进程，把事件按调用号去重、按账户按天汇总。行为、对账和上线顺序见[用量事件](ledger.md#用量事件)。
+开关打开之后，结清调用时（同一个事务里）都写 outbox，不论这个实例配没配；配置里写了 `usage_events` 的 QF 实例每秒把它转发到 Kafka（至少要有一个实例保留这一段）；消费者是同一个程序的子命令 `quotaforge usage-consumer`，用单独的镜像目标 `usage-consumer`（不带健康检查：消费者不开 API）、单独一个进程，把事件按调用号去重、按账户按天汇总。行为、对账和上线顺序见[用量事件](ledger.md#用量事件)。
 
 ```bash
 # 在项目根目录下运行
