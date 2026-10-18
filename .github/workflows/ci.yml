@@ -90,8 +90,10 @@ jobs:
           test -z "$(git status --porcelain -- vendor)"
       - run: go vet ./...
       # 静态检查（含没用到的代码）：版本固定，从模块代理取，不进 go.mod。冷缓存时下载、编译约 25 秒，分析约 40 秒。
+      # 它要读得懂编译器写的导出数据：setup-go 装的是 go.mod 里 go 1.27 的最新补丁版，补丁版升级后它报
+      # “export data version … is greater than maximum supported”时，把它升到支持新格式的版本。
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       # 联调和真实演示对账共用的核对脚本：纯标准库、不需要 Docker，几秒钟；放在 test 任务里，草稿 PR 也会跑。
       - name: check_qs_runs unit tests
         run: python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'
