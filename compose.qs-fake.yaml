@@ -1,11 +1,23 @@
 # 接 QS 的假上游：quotaforge 接入外部网络 qs-qf，上游是 QS 的 fake-upstream（http://fake-upstream:8000/v1）。
-# 只有 quotaforge 接 qs-qf；qf-mysql、qfctl 不接。Key 用 qfctl 发（见 docs/queryshield.md）。
+# 只有 quotaforge 接 qs-qf；qf-mysql、qfctl、qf-redis-cache 不接。Key 用 qfctl 发（见 docs/queryshield.md）。
+# 开着嵌入缓存（只影响不带 Idempotency-Key 的嵌入请求，也就是 QS 建知识索引的那批）：缓存放在单独的 qf-redis-cache，
+# 定义取自 compose.cache.yaml（有内存上限、满了按 LRU 淘汰、不持久化），不和限流共用 qf-redis。
 services:
   quotaforge:
+    environment:
+      QF_REDIS_CACHE_URL: redis://qf-redis-cache:6379/0 # 配置里 embedding_cache.url_env 指向它；只在 Compose 的内部网络上，不设密码
     volumes:
       # 目标路径和 compose.yaml 相同，所以是替换。
       - ./deploy/config.qs-fake.json:/etc/quotaforge/config.json:ro
+    depends_on:
+      qf-redis-cache:
+        condition: service_healthy # 只是起得干净：QF 启动时不连它，它停了只算没命中
     networks: [default, qs-qf]
+
+  qf-redis-cache:
+    extends:
+      file: compose.cache.yaml
+      service: qf-redis-cache
 
 networks:
   qs-qf:

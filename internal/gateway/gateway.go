@@ -236,8 +236,9 @@ func writeResponse(w http.ResponseWriter, c *call, resp *ledger.Response) {
 	c.wrote(err)
 }
 
-// writeTimeout 是写给客户端的每一次写的期限，从开始写算起：非流式的响应（含重放、缓存命中）、错误响应、调用状态查询的响应、
-// 流式的每个事件（同时不越过写的上限，见 stream.send），以及流结束后 net/http 写的分块编码的结尾。比上游超时短得多：
+// writeTimeout 是 API 路由（/v1/ 下的三个）写给客户端的每一次写的期限，从开始写算起：非流式的响应（含重放、缓存命中）、
+// 错误响应、调用状态查询的响应、流式的每个事件（同时不越过写的上限，见 stream.send），以及流结束后 net/http 写的分块编码的结尾。
+// 不经过 limitWrite 的：/healthz 和 ServeMux 自己写的 404、405，回答只有几十个字节，没有设期限。比上游超时短得多：
 // 内核的发送缓冲区装得下一个普通的回答，只有客户端不读、响应又很大时写才会阻塞，超了就当客户端走了。
 // 服务器不设全局的 WriteTimeout：它从读完请求头算起，会掐断长的流。
 // 退出的上限（config.ShutdownTimeout）不算写回：除了流式的事件（有写的上限管着），写回都在账本收尾之后，被截断的写回不影响账本。

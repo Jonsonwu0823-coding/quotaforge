@@ -303,6 +303,24 @@ tests:
       - eval_time: 25m
         alertname: QFUsageConsumerStalled
 
+  # 消费者刚重启、流量很小：15 分钟里只来一个事件，马上被消费。消费者一启动就把 result 的三条序列各计 0，
+  # 这个事件让 applied 从 0 变成 1，increase() 看得到，不报。（序列要是第一次出现就是 1，increase() 看不到增加，会误报。）
+  - interval: 1m
+    input_series:
+      - series: qf_usage_events_forwarded_total{instance="a"}
+        values: 0 1x15
+      - series: qf_usage_events_consumed_total{instance="consumer",result="applied"}
+        values: 0 1x15
+      - series: qf_usage_events_consumed_total{instance="consumer",result="duplicate"}
+        values: 0x16
+      - series: qf_usage_events_consumed_total{instance="consumer",result="malformed"}
+        values: 0x16
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: QFUsageConsumerStalled
+      - eval_time: 15m
+        alertname: QFUsageConsumerStalled
+
   # 消费者被一条事件卡住，每秒重试一次：错误率 1 个每秒，条件 1 分钟时成立，再满 10 分钟触发。
   - interval: 1m
     input_series:

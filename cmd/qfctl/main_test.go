@@ -141,6 +141,37 @@ func TestCommandsCheckTheSchema(t *testing.T) {
 // issuedKey 是 key issue 的输出：id、前缀、Key 本身三行。
 var issuedKey = regexp.MustCompile(`(?m)^id: (\d+)\nprefix: (qfk_\S{8})\nkey: (qfk_\S{43})\n$`)
 
+// usage 的最后一列是 CACHED：一次结算的嵌入加两次指向它的命中，是 SETTLED 1、CACHED 2（个数不同，列对调了看得出来），
+// 已消费只算结算的那次。
+func TestUsageShowsCached(t *testing.T) {
+	ctx := context.Background()
+	store := dbtest.Store(t)
+	name := dbtest.Account(t, store, 1000)
+	key := dbtest.Key(t, store, name)
+	from := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "embeddings",
+		Alias: "m", Upstream: "u", UpstreamModel: "um", EstInput: 20}
+	if _, err := store.Reserve(ctx, from); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkSent(ctx, from); err != nil {
+		t.Fatal(err)
+	}
+	usage := ledger.Usage{Prompt: 7, Total: 7}
+	if err := store.Finish(ctx, from, ledger.Result{Status: ledger.Settled, Evidence: ledger.Answered, HTTPStatus: 200, Usage: &usage}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := store.RecordCached(ctx, ledger.CachedCall{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID,
+			Purpose: "embeddings", Alias: "m", Upstream: "u", UpstreamModel: "um", CachedFrom: from.CallID, Usage: usage}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out, stderr := qfctl(map[string]string{"QFCTL_MYSQL_DSN": dbtest.MigrateDSN(t)}, "usage", "-account", name)
+	if code != 0 || !strings.HasSuffix(out, "\n"+name+"\t1000\t0\t7\t993\t0\t1\t0\t0\t0\t0\t0\t2\n") {
+		t.Fatalf("usage: exit %d, stdout %q, stderr %q", code, out, stderr)
+	}
+}
+
 // 每个子命令都用一遍：迁移、建账户、改上限、发 Key、列 Key、查用量、吊销、校验、清理幂等记录。
 func TestCommands(t *testing.T) {
 	env := map[string]string{"QFCTL_MYSQL_DSN": dbtest.MigrateDSN(t)}
@@ -184,15 +215,15 @@ func TestCommands(t *testing.T) {
 		t.Fatalf("key list = %q", list)
 	}
 	usage := must("usage", "-account", name)
-	// 新列（IN_FLIGHT，之后是账户的限流限额）都在最后，前面各列的位置不变（脚本按列号读）。
-	if !strings.HasPrefix(usage, "account\tlimit\treserved\tconsumed\tremaining\tRESERVED\tSETTLED\tCANCELLED\tUSAGE_UNKNOWN\tIN_FLIGHT\trpm_limit\ttpm_limit\n") ||
-		!strings.Contains(usage, name+"\t2000\t0\t0\t2000\t0\t0\t0\t0\t0\t0\t0\n") {
+	// 新列（IN_FLIGHT，之后是账户的限流限额，再之后是 CACHED）都在最后，前面各列的位置不变（脚本按列号读）。
+	if !strings.HasPrefix(usage, "account\tlimit\treserved\tconsumed\tremaining\tRESERVED\tSETTLED\tCANCELLED\tUSAGE_UNKNOWN\tIN_FLIGHT\trpm_limit\ttpm_limit\tCACHED\n") ||
+		!strings.Contains(usage, name+"\t2000\t0\t0\t2000\t0\t0\t0\t0\t0\t0\t0\t0\n") {
 		t.Fatalf("usage = %q", usage)
 	}
 
-	// 限流的限额：建的时候带上、之后改；key list、usage 的最后两列，KeyByHash 都读到同样的值。
+	// 限流的限额：建的时候带上、之后改；key list 的最后两列、usage 的第 11、12 列，KeyByHash 都读到同样的值。
 	must("account", "set-rate", "-name", name, "-rpm", "60", "-tpm", "1000000000000")
-	if u := must("usage", "-account", name); !strings.Contains(u, name+"\t2000\t0\t0\t2000\t0\t0\t0\t0\t0\t60\t1000000000000\n") {
+	if u := must("usage", "-account", name); !strings.Contains(u, name+"\t2000\t0\t0\t2000\t0\t0\t0\t0\t0\t60\t1000000000000\t0\n") {
 		t.Fatalf("usage after set-rate = %q", u)
 	}
 	rated := must("key", "issue", "-account", name, "-models", "a", "-rpm", "5", "-tpm", "700")
@@ -211,7 +242,7 @@ func TestCommands(t *testing.T) {
 	mustFail("account not found", "account", "set-rate", "-name", name+"-none", "-rpm", "1", "-tpm", "1")
 	created := name + "-r"
 	must("account", "create", "-name", created, "-limit", "5", "-rpm", "7", "-tpm", "8")
-	if u := must("usage", "-account", created); !strings.HasSuffix(u, "\t7\t8\n") {
+	if u := must("usage", "-account", created); !strings.HasSuffix(u, "\t7\t8\t0\n") {
 		t.Fatalf("usage of an account created with limits = %q", u)
 	}
 	must("key", "revoke", "-id", rm[1])

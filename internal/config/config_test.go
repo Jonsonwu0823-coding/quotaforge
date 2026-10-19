@@ -552,6 +552,7 @@ func TestExampleConfig(t *testing.T) {
 }
 
 // deploy/ 下的三份配置（换上 secret 文件的路径后）能加载；联调配置符合 QS 的接法，真实配置的别名是百炼的。
+// 给 QS 用的两份开着嵌入缓存（地址来自 QF_REDIS_CACHE_URL，过期用默认的 24 小时），冒烟的不开。
 func TestDeployConfigs(t *testing.T) {
 	deploy := filepath.Join("..", "..", "deploy")
 	keyFile := filepath.ToSlash(writeFile(t, "real-secret\n"))
@@ -563,13 +564,14 @@ func TestDeployConfigs(t *testing.T) {
 		upstreamModel    string // 空：和别名相同
 		baseURL, apiKey  string
 		rpm, tpm         int64 // 上游的限额：冒烟和联调远高于用量，真实的是保守的示例值
+		cache            bool
 	}{
 		{"config.compose.json", map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL},
-			"qs-fake-upstream-v1", "qs-fake-upstream-v1", "fake-chat", "http://qf-fake-upstream:8081/v1", "k", 6000, 100_000_000},
-		{"config.qs-fake.json", map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL},
-			"qs-fake-upstream-v1", "qs-fake-upstream-v1", "", "http://fake-upstream:8000/v1", "k", 6000, 100_000_000},
-		{"config.real.json", map[string]string{"QF_UPSTREAM_BASE_URL": "https://bailian.test/v1", "QF_REDIS_URL": testRedisURL},
-			"qwen-plus", "text-embedding-v4", "", "https://bailian.test/v1", "real-secret", 600, 2_000_000},
+			"qs-fake-upstream-v1", "qs-fake-upstream-v1", "fake-chat", "http://qf-fake-upstream:8081/v1", "k", 6000, 100_000_000, false},
+		{"config.qs-fake.json", map[string]string{"QF_FAKE_UPSTREAM_KEY": "k", "QF_REDIS_URL": testRedisURL, "QF_REDIS_CACHE_URL": testCacheURL},
+			"qs-fake-upstream-v1", "qs-fake-upstream-v1", "", "http://fake-upstream:8000/v1", "k", 6000, 100_000_000, true},
+		{"config.real.json", map[string]string{"QF_UPSTREAM_BASE_URL": "https://bailian.test/v1", "QF_REDIS_URL": testRedisURL, "QF_REDIS_CACHE_URL": testCacheURL},
+			"qwen-plus", "text-embedding-v4", "", "https://bailian.test/v1", "real-secret", 600, 2_000_000, true},
 	}
 	for _, tc := range cases {
 		data, err := os.ReadFile(filepath.Join(deploy, tc.file))
@@ -603,9 +605,8 @@ func TestDeployConfigs(t *testing.T) {
 		if up := chat.Upstream; up.RPM != tc.rpm || up.TPM != tc.tpm {
 			t.Fatalf("%s: upstream limits = %d, %d; want %d, %d", tc.file, up.RPM, up.TPM, tc.rpm, tc.tpm)
 		}
-		// 开了缓存 QS 看得见变化（CACHED、命中时正文里的 id 是原来那次的），给 QS 用的配置都不开
-		if c.EmbeddingCache() != nil {
-			t.Fatalf("%s: the embedding cache must stay off", tc.file)
+		if got, want := c.EmbeddingCache(), (&EmbeddingCache{URL: testCacheURL, TTL: 24 * time.Hour}); (got != nil) != tc.cache || tc.cache && *got != *want {
+			t.Fatalf("%s: embedding cache = %+v, want it on (%v) as %+v", tc.file, got, tc.cache, want)
 		}
 		// 给 QS 用的部署不打开用量事件：除了结清时一条什么都不写的语句，行为和以前完全一样
 		if c.UsageEvents() != nil {

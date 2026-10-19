@@ -1,19 +1,31 @@
 # 接真实上游（百炼）：quotaforge 接入外部网络 qs-qf。由 scripts/compose-real.ps1 使用。
 # 上游 Key 只放在当前进程的环境变量 QF_UPSTREAM_API_KEY 里，经 secrets 挂成文件，不出现在 docker inspect 里。
 # 数据库密码由脚本每次随机生成，写在 QF_DB_SECRETS_DIR 指向的临时目录里（见 compose.yaml 的 secrets）。
+#
+# 嵌入缓存默认开着（deploy/config.real.json 里有 embedding_cache）：只影响不带 Idempotency-Key 的嵌入请求。
+# 缓存放在单独的 qf-redis-cache（定义取自 compose.cache.yaml：有内存上限、按 LRU 淘汰、不持久化），不是 quotaforge 的依赖，
+# 脚本开着缓存时点名起它。脚本每次启动都是新的账本库，也是新的 qf-redis-cache；停止时一起删掉。
+# 关掉缓存（脚本的 -NoCache）时，脚本把去掉 embedding_cache 那一行的配置写进临时目录，经 QF_REAL_CONFIG 换掉挂载的配置，
+# 也不起 qf-redis-cache。QF_REDIS_CACHE_URL 仍在容器的环境变量里，但没有配置指向它，QF 不读。
 services:
   quotaforge:
     environment:
       QF_UPSTREAM_BASE_URL: ${QF_UPSTREAM_BASE_URL:?set QF_UPSTREAM_BASE_URL to the upstream base URL}
+      QF_REDIS_CACHE_URL: redis://qf-redis-cache:6379/0 # 配置里 embedding_cache.url_env 指向它；只在 Compose 的内部网络上，不设密码
     volumes:
       # 目标路径和 compose.yaml 相同，所以是替换。
-      - ./deploy/config.real.json:/etc/quotaforge/config.json:ro
+      - ${QF_REAL_CONFIG:-./deploy/config.real.json}:/etc/quotaforge/config.json:ro
     secrets:
       - upstream_api_key
     # Compose 把来自环境变量的 secret 复制进容器，只读根文件系统的服务不支持。
     # 这里只放开根文件系统；仍以 UID 65532 运行、去掉全部 capability，镜像里没有 shell。
     read_only: false
     networks: [default, qs-qf]
+
+  qf-redis-cache:
+    extends:
+      file: compose.cache.yaml
+      service: qf-redis-cache
 
 secrets:
   upstream_api_key:

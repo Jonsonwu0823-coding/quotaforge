@@ -182,7 +182,8 @@ type failures struct {
 }
 
 func (f *failures) add(err error) {
-	if f.n++; f.first == nil {
+	f.n++
+	if f.first == nil {
 		f.first = err
 	}
 }

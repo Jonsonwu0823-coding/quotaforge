@@ -82,27 +82,26 @@ func NewMetrics(dbStats func() sql.DBStats) *Metrics {
 
 // requestMetrics 是每次调用的指标：请求、耗时、上游的尝试、结局、用量、重放、限流、依赖出错、流式。
 func (m *Metrics) requestMetrics() {
-	counter, histogram := m.counter, m.histogram
-	m.Requests = counter("qf_requests_total", "Requests by endpoint, HTTP status written (0: the client was gone) and error code.",
+	m.Requests = m.counter("qf_requests_total", "Requests by endpoint, HTTP status written (0: the client was gone) and error code.",
 		"endpoint", "status", "code")
-	m.RequestDuration = histogram("qf_request_duration_seconds", "Total time of a request.", slowBuckets, "endpoint")
-	m.Overhead = histogram("qf_overhead_seconds", "Time of a request spent in QF itself: the total minus the wait for the upstream.",
+	m.RequestDuration = m.histogram("qf_request_duration_seconds", "Total time of a request.", slowBuckets, "endpoint")
+	m.Overhead = m.histogram("qf_overhead_seconds", "Time of a request spent in QF itself: the total minus the wait for the upstream.",
 		overheadBuckets, "endpoint")
-	m.UpstreamRequests = counter("qf_upstream_requests_total", "Upstream attempts by result: ok or the upstream error code; a call that moved to another upstream counts once per attempt.",
+	m.UpstreamRequests = m.counter("qf_upstream_requests_total", "Upstream attempts by result: ok or the upstream error code; a call that moved to another upstream counts once per attempt.",
 		"upstream", "endpoint", "result")
-	m.UpstreamDuration = histogram("qf_upstream_duration_seconds", "Time from sending an upstream request to reading its whole body.",
+	m.UpstreamDuration = m.histogram("qf_upstream_duration_seconds", "Time from sending an upstream request to reading its whole body.",
 		slowBuckets, "upstream", "endpoint")
-	m.Calls = counter("qf_calls_total", "Calls in the ledger by the gateway's outcome: settled, cancelled, usage_unknown, or cached (an embedding cache hit, nothing reserved).",
+	m.Calls = m.counter("qf_calls_total", "Calls in the ledger by the gateway's outcome: settled, cancelled, usage_unknown, or cached (an embedding cache hit, nothing reserved).",
 		"endpoint", "outcome")
-	m.UsageTokens = counter("qf_usage_tokens_total", "Tokens of settled calls; calls with unknown usage are counted in qf_calls_total, not here.",
+	m.UsageTokens = m.counter("qf_usage_tokens_total", "Tokens of settled calls; calls with unknown usage are counted in qf_calls_total, not here.",
 		"endpoint", "upstream", "type")
-	m.Replays = counter("qf_idempotent_replays_total", "Requests answered with the stored response of an earlier call.", "endpoint")
-	m.RateLimited = counter("qf_rate_limited_total", "Requests denied by a rate limit bucket.", "layer", "metric")
-	m.DependencyErrors = counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations; requests fail with them. "+
+	m.Replays = m.counter("qf_idempotent_replays_total", "Requests answered with the stored response of an earlier call.", "endpoint")
+	m.RateLimited = m.counter("qf_rate_limited_total", "Requests denied by a rate limit bucket.", "layer", "metric")
+	m.DependencyErrors = m.counter("qf_dependency_errors_total", "Failed ledger or rate limiter operations; requests fail with them. "+
 		"Embedding cache errors are not counted here: the request goes on to the upstream.", "dependency", "operation")
-	m.Streams = counter("qf_streams_total", "Streams the upstream started, by how they ended (ok or the upstream error code) "+
+	m.Streams = m.counter("qf_streams_total", "Streams the upstream started, by how they ended (ok or the upstream error code) "+
 		"and the client (connected, disconnected, write_timeout).", "result", "client")
-	m.StreamFirstEvent = histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
+	m.StreamFirstEvent = m.histogram("qf_stream_first_event_seconds", "Time from the start of a streaming request to the first upstream event.",
 		slowBuckets, "endpoint")
 }
 

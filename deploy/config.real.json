@@ -13,5 +13,6 @@
     {"alias": "text-embedding-v4", "purpose": "embeddings", "targets": [{"upstream": "bailian", "upstream_model": "text-embedding-v4", "weight": 1}]}
   ],
   "database": {"dsn_file": "/run/secrets/app_dsn"},
-  "redis": {"url_env": "QF_REDIS_URL"}
+  "redis": {"url_env": "QF_REDIS_URL"},
+  "embedding_cache": {"url_env": "QF_REDIS_CACHE_URL"}
 }

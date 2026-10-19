@@ -13,9 +13,13 @@ services:
       - ./deploy/config.cache.json:/etc/quotaforge/config.json:ro
     # 不依赖 qf-redis-cache：QF 启动时不连它，它停了只算没命中。
 
+  # 给 QS 用的几套栈（compose.qs-fake.yaml、compose.real.yaml）用 extends 共用这一份定义。
   qf-redis-cache:
     image: redis:8
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    # 镜像声明了 VOLUME /data 时，每个容器多一个匿名卷；只带 compose.yaml 的 down -v --remove-orphans（compose-real.ps1 停止时）
+    # 删得掉这个孤儿容器、删不掉它的匿名卷（实测）。挂成 tmpfs，镜像声明没声明都不建匿名卷；缓存本来就不往里写。
+    tmpfs: [/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

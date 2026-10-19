@@ -3,11 +3,14 @@
 # - qf-jaeger 接进 qs-qf：QS 的 app 把自己的 span 发到 http://qf-jaeger:4318/v1/traces，两边的 span 在同一个 Jaeger 里；
 # - quotaforge-b 也接进 qs-qf，带网络别名 quotaforge：两个实例都在 QS 的 base_url（http://quotaforge:8080/v1）后面，
 #   QS 每次请求都重新解析这个名字，调用就分到两个实例上。只有两个实例的场景才起它。
-# quotaforge-b 由 extends 从 compose.yaml 带设置，看不到 compose.qs-fake.yaml 给 quotaforge 换的配置，所以挂载在这里再写一次。
+# quotaforge-b 由 extends 从 compose.yaml 带设置，看不到 compose.qs-fake.yaml 给 quotaforge 换的配置和嵌入缓存的地址，
+# 所以这两样在这里再写一次。两个实例共用一个 qf-redis-cache。
 services:
   qf-jaeger:
     networks: [default, qs-qf]
   quotaforge-b:
+    environment:
+      QF_REDIS_CACHE_URL: redis://qf-redis-cache:6379/0
     volumes:
       - ./deploy/config.qs-fake.json:/etc/quotaforge/config.json:ro
     networks:

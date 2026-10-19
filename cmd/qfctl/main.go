@@ -339,12 +339,12 @@ func usageCmd(fs *flag.FlagSet, _ io.Reader) func(context.Context, string, io.Wr
 			if err != nil {
 				return err
 			}
-			// 新列（IN_FLIGHT，之后是账户的限流限额）都加在最后：前面各列的位置不变，按列号读的脚本不受影响。
-			fmt.Fprintln(out, "account\tlimit\treserved\tconsumed\tremaining\tRESERVED\tSETTLED\tCANCELLED\tUSAGE_UNKNOWN\tIN_FLIGHT\trpm_limit\ttpm_limit")
+			// 新列（IN_FLIGHT，之后是账户的限流限额，再之后是 CACHED）都加在最后：前面各列的位置不变，按列号读的脚本不受影响。
+			fmt.Fprintln(out, "account\tlimit\treserved\tconsumed\tremaining\tRESERVED\tSETTLED\tCANCELLED\tUSAGE_UNKNOWN\tIN_FLIGHT\trpm_limit\ttpm_limit\tCACHED")
 			for _, u := range list {
-				fmt.Fprintf(out, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", u.Account, u.Limit, u.Reserved, u.Consumed, u.Remaining,
+				fmt.Fprintf(out, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", u.Account, u.Limit, u.Reserved, u.Consumed, u.Remaining,
 					u.Calls[ledger.Reserved], u.Calls[ledger.Settled], u.Calls[ledger.Cancelled], u.Calls[ledger.UsageUnknown],
-					u.Calls[ledger.InFlight], u.Rate.RPM, u.Rate.TPM)
+					u.Calls[ledger.InFlight], u.Rate.RPM, u.Rate.TPM, u.Calls[ledger.Cached])
 			}
 			return nil
 		})

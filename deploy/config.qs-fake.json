@@ -13,5 +13,6 @@
     {"alias": "qs-fake-upstream-v1", "purpose": "embeddings", "targets": [{"upstream": "qs-fake", "upstream_model": "qs-fake-upstream-v1", "weight": 1}]}
   ],
   "database": {"dsn_file": "/run/secrets/app_dsn"},
-  "redis": {"url_env": "QF_REDIS_URL"}
+  "redis": {"url_env": "QF_REDIS_URL"},
+  "embedding_cache": {"url_env": "QF_REDIS_CACHE_URL"}
 }

@@ -192,7 +192,7 @@ func (s *Store) Usage(ctx context.Context, account string) ([]AccountUsage, erro
 	rows, err := s.db.QueryContext(ctx, `SELECT a.name, b.limit_tokens, b.reserved_tokens, b.consumed_tokens, a.rpm_limit, a.tpm_limit,
 			COALESCE(SUM(c.status = 'RESERVED'), 0), COALESCE(SUM(c.status = 'SETTLED'), 0),
 			COALESCE(SUM(c.status = 'CANCELLED'), 0), COALESCE(SUM(c.status = 'USAGE_UNKNOWN'), 0),
-				COALESCE(SUM(c.status = 'IN_FLIGHT'), 0)
+				COALESCE(SUM(c.status = 'IN_FLIGHT'), 0), COALESCE(SUM(c.status = 'CACHED'), 0)
 		FROM accounts a JOIN budgets b ON b.account_id = a.id LEFT JOIN calls c ON c.account_id = a.id
 		WHERE ? = '' OR a.name = ?
 		GROUP BY a.id, a.name, b.limit_tokens, b.reserved_tokens, b.consumed_tokens, a.rpm_limit, a.tpm_limit ORDER BY a.name`, account, account)
@@ -203,12 +203,12 @@ func (s *Store) Usage(ctx context.Context, account string) ([]AccountUsage, erro
 	var out []AccountUsage
 	for rows.Next() {
 		var u AccountUsage
-		var reserved, settled, cancelled, unknown, inFlight int64
-		if err := rows.Scan(&u.Account, &u.Limit, &u.Reserved, &u.Consumed, &u.Rate.RPM, &u.Rate.TPM, &reserved, &settled, &cancelled, &unknown, &inFlight); err != nil {
+		var reserved, settled, cancelled, unknown, inFlight, cached int64
+		if err := rows.Scan(&u.Account, &u.Limit, &u.Reserved, &u.Consumed, &u.Rate.RPM, &u.Rate.TPM, &reserved, &settled, &cancelled, &unknown, &inFlight, &cached); err != nil {
 			return nil, err
 		}
 		u.Remaining = u.Limit - u.Reserved - u.Consumed
-		u.Calls = map[Status]int64{Reserved: reserved, InFlight: inFlight, Settled: settled, Cancelled: cancelled, UsageUnknown: unknown}
+		u.Calls = map[Status]int64{Reserved: reserved, InFlight: inFlight, Settled: settled, Cancelled: cancelled, UsageUnknown: unknown, Cached: cached}
 		out = append(out, u)
 	}
 	if err := rows.Err(); err != nil {

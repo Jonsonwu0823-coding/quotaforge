@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"crypto/rand"
 	"errors"
+	"maps"
 	"slices"
 	"testing"
 
@@ -38,6 +39,22 @@ func (f *fixture) recordCached(t *testing.T, from string) ledger.CachedCall {
 		t.Fatal(err)
 	}
 	return c
+}
+
+// Usage 按状态数调用，CACHED 单独一类：一次结算的嵌入、两次指向它的命中，就是 SETTLED 1、CACHED 2，已消费只算结算的那次。
+func TestUsageCountsCached(t *testing.T) {
+	f := newFixture(t, 1000)
+	from := f.settledEmbedding(t)
+	f.recordCached(t, from.CallID)
+	f.recordCached(t, from.CallID)
+	u, err := f.s.Usage(ctx, f.account)
+	if err != nil || len(u) != 1 {
+		t.Fatalf("Usage = %+v, %v", u, err)
+	}
+	want := map[ledger.Status]int64{ledger.Reserved: 0, ledger.InFlight: 0, ledger.Settled: 1, ledger.Cancelled: 0, ledger.UsageUnknown: 0, ledger.Cached: 2}
+	if !maps.Equal(u[0].Calls, want) || u[0].Consumed != 7 {
+		t.Fatalf("calls %v, consumed %d; want %v, 7", u[0].Calls, u[0].Consumed, want)
+	}
 }
 
 // 一次命中只写一行 CACHED：预留量 0、没有账本行、不动额度，写入时就已结清（gateway、cache），没有 sent_at。
@@ -125,6 +142,11 @@ func TestVerifyFindsCachedTampering(t *testing.T) {
 			r := f.reserve(t, 10)
 			return []string{"UPDATE calls SET cached_from = '" + r.CallID + "' WHERE id = '" + cached + "'"}
 		}, []string{"cached", "outbox"}},
+		// 原来那次只差状态：用途、上游、上游模型名、用量都和命中相同，cached 只靠 o.status = 'SETTLED' 这一条报出来
+		// （上一个用例的原调用是没有用量的 chat，几条一起挡下）。cancelled、outbox 是原来那次自己被改坏报的。
+		{"origin not settled, all else equal", func(_ *testing.T, _ *fixture, _, from string) []string {
+			return []string{"UPDATE calls SET status = 'CANCELLED' WHERE id = '" + from + "'"}
+		}, []string{"cached", "cancelled", "outbox"}},
 		{"different usage", func(_ *testing.T, _ *fixture, cached, _ string) []string {
 			return []string{"UPDATE calls SET usage_prompt_tokens = 8, usage_total_tokens = 8 WHERE id = '" + cached + "'"}
 		}, []string{"cached", "outbox"}},

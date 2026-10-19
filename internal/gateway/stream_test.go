@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -381,6 +383,38 @@ func (w *writeDeadlines) Write(b []byte) (int, error) {
 func (w *writeDeadlines) noteWrite() {
 	if !w.wrote {
 		w.wrote, w.beforeWrite, w.firstWrite = true, len(w.deadlines), time.Now()
+	}
+}
+
+// failingWrites 的每次写都返回 err：客户端那一侧出了事（对方重置连接、写超过期限）。
+type failingWrites struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (w *failingWrites) Write([]byte) (int, error) { return 0, w.err }
+
+// 非流式的写回失败都记 client_disconnected；只有写超过期限（os.ErrDeadlineExceeded）才另记 write_timeout，
+// 别的写错误（例如对方重置了连接）不记。和平台无关，不靠真的不读的客户端。
+func TestNonStreamWriteFailures(t *testing.T) {
+	h := newHarness(t)
+	for _, tc := range []struct {
+		err     error
+		timeout any
+	}{
+		{syscall.ECONNRESET, nil},
+		{io.ErrClosedPipe, nil},
+		{os.ErrDeadlineExceeded, true},
+	} {
+		w := &failingWrites{ResponseRecorder: httptest.NewRecorder(), err: tc.err}
+		req := httptest.NewRequest(http.MethodPost, chatRoute, strings.NewReader(`{"model":"shared"}`))
+		req.Header.Set("Authorization", "Bearer "+clientKey)
+		h.qf.Config.Handler.ServeHTTP(w, req)
+		l := h.logLine(t, w.Header().Get("x-request-id"))
+		if l["status"] != float64(http.StatusOK) || l["client_disconnected"] != true || l["write_timeout"] != tc.timeout {
+			t.Fatalf("%v: status %v, client_disconnected %v, write_timeout %v; want 200, true, %v",
+				tc.err, l["status"], l["client_disconnected"], l["write_timeout"], tc.timeout)
+		}
 	}
 }
 

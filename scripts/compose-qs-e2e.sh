@@ -27,7 +27,7 @@ native() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
 QS_DIR=$(native "$(cd "${1:-${QS_DIR:?用法：$0 <QS 公开仓库的本地目录>}}" && pwd)")
 cd "$(dirname "$0")/.."
 
-readonly QS_COMMIT=dc1627fa90bb88154fd8f83f45b0e18c59218fc1
+readonly QS_COMMIT=0ec8d76d09d8431f12afdff4083ee2666e6c9515
 readonly QF_PROJECT=qf-e2e-qf QS_PROJECT=qf-e2e-qs
 # 额度 100 万 tokens：整套演示实测消费约 11.1 万（33 次聊天、15 次嵌入），留足余量；且远大于一次预留（请求字节数加 default_max_tokens 1024）。
 readonly LIMIT=1000000
@@ -230,7 +230,41 @@ scenario_normal() {
   verify
   check "log: no request was rate limited or hit an unavailable rate limiter" \
     [ "$(log_sum "$work/normal.log" "e.get('error_code') in ('rate_limited', 'rate_limiter_unavailable')")" = 0 ]
+  index_rebuild_hits
   finish
+}
+
+# 嵌入缓存（联调的配置开着）：QS 的进程第一次检索时才建知识索引（不带键的嵌入），建好按进程留着。同一个账户里重建 QS 的 app、
+# 再提一个问题，重建索引的请求和演示时那次逐个相同，应当都命中：CACHED、指向那次结算的调用、不扣额度；这个 run 照常，
+# 它带键的请求不查缓存。放在核对脚本之后：核对脚本要求账户里全是 SETTLED、不带 X-Run-Id 的嵌入都在 run 的嵌入之前。
+index_rebuild_hits() {
+  local again first hits matched consumed used plain_sql plain
+  qs up -d --no-deps --wait --force-recreate app
+  again=$(ask normal-again)
+  check "QS's app recreated (its index is gone), a question after it: $(outcome "$again")" [ "$(outcome "$again")" = "200 SUCCEEDED None 2 known" ]
+  plain_sql="c.purpose = 'embeddings' AND c.run_id IS NULL"
+  read -r first hits < <(account_sql "COALESCE(SUM(c.status = 'SETTLED'), 0), COALESCE(SUM(c.status = 'CACHED'), 0)" "$plain_sql")
+  matched=$(account_sql "COUNT(DISTINCT c.cached_from)" "$plain_sql AND c.status = 'CACHED' AND c.cached_from IN
+    (SELECT o.id FROM calls o WHERE o.account_id = c.account_id AND o.status = 'SETTLED' AND o.purpose = 'embeddings' AND o.run_id IS NULL)")
+  rebuilt_from_cache() { [ "$first" -gt 0 ] && [ "$hits" = "$first" ] && [ "$matched" = "$first" ] &&
+    [ "$(account_sql 'COUNT(*)' "$plain_sql")" = $((first + hits)) ]; }
+  check "ledger: the index build without X-Run-Id: $first SETTLED by the demo, $hits CACHED by the rebuild, each pointing at a different one of them ($matched)" \
+    rebuilt_from_cache
+  qf logs --no-log-prefix quotaforge >"$work/normal-again.log" 2>/dev/null || die "取不到 QF 的日志（docker compose logs 失败）"
+  plain="e.get('msg') == 'call' and e.get('endpoint') == 'embeddings' and 'run_id' not in e"
+  logged_as_cache() {
+    [ "$(log_sum "$work/normal-again.log" "$plain and e.get('cache') == 'hit' and e.get('call_status') == 'CACHED'")" = "$hits" ] &&
+      [ "$(log_sum "$work/normal-again.log" "$plain and e.get('cache') == 'miss' and e.get('call_status') == 'SETTLED'")" = "$first" ] &&
+      [ "$(log_sum "$work/normal-again.log" "e.get('msg') == 'call' and e.get('endpoint') == 'embeddings' and 'run_id' in e and e.get('cache') != 'bypass'")" = 0 ]
+  }
+  check "log: the rebuild's $hits calls hit the cache (Cache-Status: quotaforge; hit), the demo's $first missed it, every embedding with X-Run-Id bypassed it" \
+    logged_as_cache
+  consumed=$(sql "SELECT b.consumed_tokens FROM budgets b JOIN accounts a ON a.id = b.account_id WHERE a.name = '$account'")
+  used=$(account_sql "COALESCE(SUM(c.usage_total_tokens), 0)" "c.status = 'SETTLED'")
+  cached_column() { qfctl usage -account "$account" | awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "CACHED") c = i } NR == 2 { print $c }'; }
+  costs_nothing() { [ "$consumed" = "$used" ] && [ "$(cached_column)" = "$hits" ]; }
+  check "ledger: consumed $consumed == usage of the SETTLED calls $used (the hits cost nothing); qfctl usage shows CACHED $hits" costs_nothing
+  verify
 }
 
 scenario_trace() {

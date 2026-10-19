@@ -174,6 +174,29 @@ func consume(store *ledger.Store, src Source, m *telemetry.Metrics) (stop func()
 	return func() { cancel(); <-done }
 }
 
+// 消费者一开始就有 result 的三条序列，都是 0：重启之后第一个事件让序列从 0 变成 1，increase() 看得到，告警不误报。
+// 不起消费者的进程（QF 实例）建同样的指标，一条序列都没有。
+func TestConsumeStartsTheResultSeriesAtZero(t *testing.T) {
+	stats := func() sql.DBStats { return sql.DBStats{} }
+	if n := testutil.CollectAndCount(telemetry.NewMetrics(stats).EventsConsumed); n != 0 {
+		t.Fatalf("a QF instance exports %d result series, want none", n)
+	}
+	m := telemetry.NewMetrics(stats)
+	polled := newSignal()
+	stop := consume(nil, &fakeSource{batches: [][]Record{{}}, onPoll: polled.fire}, m)
+	<-polled.ch
+	stop()
+	// 先数序列再读值：WithLabelValues 自己就会建出序列
+	if n := testutil.CollectAndCount(m.EventsConsumed); n != 3 {
+		t.Fatalf("%d result series after the consumer started, want 3", n)
+	}
+	for _, result := range []string{"applied", "duplicate", "malformed"} {
+		if v := testutil.ToFloat64(m.EventsConsumed.WithLabelValues(result)); v != 0 {
+			t.Fatalf("%s = %v, want 0", result, v)
+		}
+	}
+}
+
 // 先写库、再提交：提交的时候，这一批的事件都已经在汇总里了；格式不对的跳过、计数，和这一批一起提交。
 func TestConsumeAppliesBeforeCommitting(t *testing.T) {
 	a := newAccount(t)

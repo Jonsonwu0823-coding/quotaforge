@@ -201,6 +201,9 @@ class RunsOutsideTheSummary(Cases):
             fails = self.fails(summary, calls, budget, e2e)
             self.assertTrue(any("1 ledger chat calls belong to 1 runs not in the summary (run-old)" in t for t in fails), fails)
             self.assertEqual(any("compose-real.ps1" in t for t in fails), not e2e)
+            if not e2e:
+                # 真实模式下只有这一行 FAIL，其余照常核对：同一个 QF 里跑第二遍演示，-Reconcile 的输出就是这样读的
+                self.assertOnlyFail(fails, "1 ledger chat calls belong to 1 runs not in the summary (run-old)")
 
     def test_embeddings_of_other_runs_do_not_count_as_chat(self):
         summary, calls, budget = world()
@@ -235,6 +238,16 @@ class CallsWithoutRun(Cases):
         real = self.results(summary, calls, budget, False)
         self.assertIn(("info", "embeddings without X-Run-Id: 3 (SETTLED 3)"), real)
         self.assertEqual([t for level, t in real if level == "FAIL"], [])
+
+    def test_cached_embeddings_without_run_are_counted_in_real_mode(self):
+        # 嵌入缓存命中（CACHED）的不带 X-Run-Id 的嵌入：QS 重建索引的那批、compose-real.ps1 -Check 的第二次嵌入。
+        # 真实模式只数出来，不判 FAIL；info 行里按状态数得到 CACHED。
+        summary, calls, budget = world()
+        for i, index in enumerate([c for c in calls if c["purpose"] == "embeddings" and not c["run"]]):
+            calls.append(dict(index, id=f"hit-{i}", status="CACHED", created=stamp(900 + i), reserved=0))
+        real = self.results(summary, calls, budget, False)
+        self.assertEqual([t for level, t in real if level == "FAIL"], [])
+        self.assertIn(("info", "embeddings without X-Run-Id: 4 (CACHED 2, SETTLED 2)"), real)
 
     def test_the_embedding_order_uses_the_first_embedding_with_run(self):
         summary, calls, budget = world()

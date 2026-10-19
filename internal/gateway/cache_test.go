@@ -249,10 +249,12 @@ func TestEmbeddingCacheHitLedger(t *testing.T) {
 	dbtest.Verify(t, e.store)
 }
 
-// 命中照样过准入：RPM 照扣；TPM 在修正时全部退回（refund 的“其余”那一支），和重放一样。
+// 命中照样过准入：三层的 RPM 都扣；修正时 TPM 全部退回（refund 的“其余”那一支，和重放一样），
+// 上游那一层的 RPM 退 1（命中不发给上游），Key、账户两层的 RPM 不退。没命中的那次 RPM 一个都不退。
 func TestEmbeddingCacheHitRateLimits(t *testing.T) {
 	lim := &stubLimiter{}
-	h := newCacheHarness(t, &rated{Ledger: newAllowAll(), key: bothRates}, lim, newMemCache())
+	h := newCacheHarness(t, &rated{Ledger: newAllowAll(), key: bothRates, account: ledger.Rate{RPM: 50}}, lim, newMemCache())
+	h.limitUpstream("fake", 30, 0)
 	h.wantCache(t, h.emb(t, clientKey, embBody), 200, statusMiss, cacheMiss)
 	h.wantCache(t, h.emb(t, clientKey, embBody), 200, statusHit, cacheHit) // 日志写完时修正已经做完
 	admits, adjusts := lim.calls()
@@ -268,11 +270,52 @@ func TestEmbeddingCacheHitRateLimits(t *testing.T) {
 			tpm = b.Cost
 		}
 	}
-	if rpm != 1 || tpm <= 0 {
-		t.Fatalf("hit admitted %v", admits[1])
+	if rpm != 3 || tpm <= 0 {
+		t.Fatalf("hit admitted %v, want an RPM token from each of the three layers", admits[1])
 	}
-	if want := []ratelimit.Bucket{{Layer: "key", ID: "1", Metric: "tpm", Limit: bothRates.TPM, Cost: -tpm}}; !slices.Equal(adjusts[1], want) {
-		t.Fatalf("hit adjusted %v, want the whole estimate back %v", adjusts[1], want)
+	for _, b := range adjusts[0] {
+		if b.Metric == "rpm" {
+			t.Fatalf("miss adjusted %v: no RPM comes back for a call that went upstream", adjusts[0])
+		}
+	}
+	want := []ratelimit.Bucket{
+		{Layer: "key", ID: "1", Metric: "tpm", Limit: bothRates.TPM, Cost: -tpm},
+		{Layer: "upstream", ID: "fake", Metric: "rpm", Limit: 30, Cost: -1},
+	}
+	if !slices.Equal(adjusts[1], want) {
+		t.Fatalf("hit adjusted %v, want the whole estimate and the upstream request back %v", adjusts[1], want)
+	}
+}
+
+// 上游那一层每分钟只有 2 个请求：一次回源、三次命中之后，另一个要回源的请求照样放行（命中不占上游的 RPM），
+// 再下一个才在上游那一层被拒（被拒的一个桶都不扣）。Key 那一层放行的五个请求都算。
+func TestEmbeddingCacheHitFreesUpstreamRPM(t *testing.T) {
+	lim, rdb := redisLimiter(t)
+	h := newCacheHarness(t, &rated{Ledger: newAllowAll(), key: ledger.Rate{RPM: 100}}, lim, newMemCache())
+	h.limitUpstream("fake", 2, 0)
+	h.wantCache(t, h.emb(t, clientKey, embBody), 200, statusMiss, cacheMiss)
+	for range 3 {
+		h.wantCache(t, h.emb(t, clientKey, embBody), 200, statusHit, cacheHit)
+	}
+	other := strings.Replace(embBody, "一二三", "四五六", 1)
+	h.wantCache(t, h.emb(t, clientKey, other), 200, statusMiss, cacheMiss)
+	third := strings.Replace(embBody, "一二三", "七八九", 1)
+	r := h.emb(t, clientKey, third)
+	if l := h.logLine(t, requestID(t, r)); r.status != 429 || l["rate_limited_by"] != "upstream/rpm" {
+		t.Fatalf("third miss: %d, rate_limited_by %v; want 429 upstream/rpm", r.status, l["rate_limited_by"])
+	}
+	tokens := func(layer, id string) float64 {
+		v, err := rdb.HGet(context.Background(), lim.Key(ratelimit.Bucket{Layer: layer, ID: id, Metric: "rpm"}), "tokens").Float64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if v := tokens("key", "1"); v < 95 || v >= 95.5 {
+		t.Fatalf("key/rpm holds %v tokens, want about 95: the five admitted requests count, hits included", v)
+	}
+	if v := tokens("upstream", "fake"); v < 0 || v >= 0.5 {
+		t.Fatalf("upstream/rpm holds %v tokens, want about 0: only the two misses count", v)
 	}
 }
 

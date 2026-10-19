@@ -108,30 +108,41 @@ func refund(c *call) int64 {
 	}
 }
 
-// adjust 按结局修正准入时扣过的 TPM 桶，RPM 不退。在 endpoint 的 defer 里、写日志之前执行。
+// adjust 按结局修正准入时扣过的 TPM 桶。在 endpoint 的 defer 里、写日志之前执行。
 // 实际比估算多时再扣，但一个桶一次最多再扣它的容量 L：上游报的用量离谱时，桶最多被压到 −L、一分钟补回，
 // 而不是被压成很大的负数、挡住这一层（上游那层就是所有账户）几个小时。账本不受影响，照旧按实际结算。
 // 换上游时换走的上游（c.released）确定没收到请求，它的 TPM 不论结局都全部加回。
+// RPM 只在嵌入缓存命中（CACHED）时退上游那一层的 1 个：命中不发给上游，不该占着上游的每分钟请求数；
+// Key、账户两层照扣，命中也是客户端的一次请求。别的结局 RPM 都不退。加回之后不超过容量（见 bucket.lua）。
 // 失败只记日志，不影响已经得到的结果，也不重试：桶里多扣着估算，偏保守。
 func (g *gateway) adjust(ctx context.Context, c *call) {
-	var tpm []ratelimit.Bucket
-	add := func(bs []ratelimit.Bucket, n int64) {
-		for _, b := range bs {
-			if b.Metric == "tpm" && n != 0 {
-				b.Cost = min(-n, b.Limit)
-				tpm = append(tpm, b)
-			}
+	var bs []ratelimit.Bucket
+	add := func(b ratelimit.Bucket, n int64) {
+		if n != 0 {
+			b.Cost = min(-n, b.Limit)
+			bs = append(bs, b)
 		}
 	}
-	add(c.admitted, refund(c))
-	add(c.released, c.planned.Amount())
-	if len(tpm) == 0 {
+	for _, b := range c.admitted {
+		switch {
+		case b.Metric == "tpm":
+			add(b, refund(c))
+		case b.Layer == "upstream" && c.outcome == ledger.Cached:
+			add(b, 1)
+		}
+	}
+	for _, b := range c.released {
+		if b.Metric == "tpm" {
+			add(b, c.planned.Amount())
+		}
+	}
+	if len(bs) == 0 {
 		return
 	}
 	span := g.step(ctx, "adjust")
 	lctx, cancel := limiterContext(ctx)
 	defer cancel()
-	if err := g.limiter.Adjust(lctx, tpm); err != nil {
+	if err := g.limiter.Adjust(lctx, bs); err != nil {
 		g.limiterFailed(c, "adjust", err)
 		endStep(span, errRateLimiterUnavailable)
 		return

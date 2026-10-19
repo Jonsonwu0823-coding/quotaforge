@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -187,10 +188,12 @@ func TestStreamBytewiseCountsBeforeLastByte(t *testing.T) {
 	}
 }
 
-// writeLog 是写事件时的替身：记下每次写的长度、写时的事件计数，fail 为 true 时每次写都失败。
+// writeLog 是写事件时的替身：记下每次写的长度、写时的事件计数，fail 为 true 时每次写都失败，
+// failAt 大于 0 时第 failAt 次写失败（之前的照常）。
 type writeLog struct {
 	s      *Server
 	fail   bool
+	failAt int
 	writes [][2]int64 // 长度、写的时候的 StreamEvents
 }
 
@@ -198,7 +201,7 @@ func (w *writeLog) Header() http.Header { return http.Header{} }
 func (w *writeLog) WriteHeader(int)     {}
 func (w *writeLog) Flush()              {}
 func (w *writeLog) Write(b []byte) (int, error) {
-	if w.fail {
+	if w.fail || len(w.writes)+1 == w.failAt {
 		return 0, io.ErrClosedPipe
 	}
 	w.writes = append(w.writes, [2]int64{int64(len(b)), w.s.Stats().StreamEvents})
@@ -223,6 +226,32 @@ func TestStreamEventCountedAfterTheWrite(t *testing.T) {
 	st := &streamer{s: s, w: &writeLog{s: s, fail: true}, ctx: context.Background(), model: "fake-chat"}
 	if st.event("x") || s.Stats().StreamEvents != 0 {
 		t.Fatalf("a failed write was counted: %d", s.Stats().StreamEvents)
+	}
+}
+
+// fake-stream-bytewise 真的一个字节一个字节地写：事件的每个字节一次写，前面的都写在计数之前，最后一个字节写的时候已经计上；
+// 写到一半失败（例如对方断开）的事件不计数。
+func TestStreamBytewiseWritesOneByteAtATime(t *testing.T) {
+	s := New()
+	w := &writeLog{s: s}
+	st := &streamer{s: s, w: w, ctx: context.Background(), model: "fake-stream-bytewise"}
+	if !st.event("abc") || s.Stats().StreamEvents != 1 {
+		t.Fatalf("counted %d", s.Stats().StreamEvents)
+	}
+	const size = len("data: abc\n\n")
+	want := make([][2]int64, size)
+	for i := range want {
+		want[i] = [2]int64{1, 0}
+	}
+	want[size-1] = [2]int64{1, 1}
+	if !slices.Equal(w.writes, want) {
+		t.Fatalf("writes (length, count) = %v, want %d one-byte writes, the last one counted", w.writes, size)
+	}
+	s = New()
+	w = &writeLog{s: s, failAt: 5}
+	st = &streamer{s: s, w: w, ctx: context.Background(), model: "fake-stream-bytewise"}
+	if st.event("abc") || s.Stats().StreamEvents != 0 || len(w.writes) != 4 {
+		t.Fatalf("the 5th byte failed: event counted %d after %d writes", s.Stats().StreamEvents, len(w.writes))
 	}
 }
 

@@ -42,7 +42,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 
 | span | 属性 |
 |---|---|
-| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游。导出成一个字符串，写法是 JSON 数组，例如 `["fake-a"]`）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有）、`qf.cache`（开了缓存的嵌入请求：`hit`、`coalesced`、`miss`、`bypass`、`error`）、`qf.cached_from`（缓存命中时原来那次的调用号） |
+| 根 | `http.request.method`、`http.route`、`http.response.status_code`（写回了才有）、`qf.request_id`（调用号，就是响应头 `x-request-id`）、`qf.endpoint`、`qf.model_alias` 和 `qf.upstream`（查到模型、选到目标之后才有；换过上游时是最后那个）、`qf.failover_from`（换过上游时才有：之前试过、确定没收到请求的上游。导出成一个字符串，写法是 JSON 数组，例如 `["fake-a"]`）、`error.type`（错误码）、`qf.call_status`、`qf.outcome`、`qf.reserved_tokens`、`qf.replay_of`、`qf.usage.known` 和已知时的三个 token 数、`qf.client_disconnected`（客户端走了：流式和非流式都有，非流式是写回失败或者发出之后客户端已经断开，写超过期限的也算）、`qf.rate_limited_by`（例如 `key/rpm`）、`qf.call_id`（查询时被查的调用号）、`qf.stream`（流式才有，`true`）、`qf.stream.first_event_ms`（流式：从调用开始到收到上游第一个事件的毫秒数）、`qf.stream.write_timeout`（流式：客户端不读、写超过期限时才有）、`qf.cache`（开了缓存的嵌入请求：`hit`、`coalesced`、`miss`、`bypass`、`error`）、`qf.cached_from`（缓存命中时原来那次的调用号） |
 | `upstream` | `qf.upstream`、`http.request.method`、`http.response.status_code`（上游的） |
 | 出错的子 span | `error.type` |
 
@@ -112,7 +112,7 @@ GET /v1/calls/{id}             SERVER  调用状态查询
 | `qf_usage_outbox_unsent` | gauge | — | [用量事件](ledger.md#用量事件)的 outbox 里还没发出的条数（全部实例共用一张表）。配了用量事件的实例转发每轮更新；没配的实例也导出，值一直是 0 |
 | `qf_usage_outbox_oldest_age_seconds` | gauge | — | 其中最早写入的一条到现在的秒数，没有时为 0。没配用量事件的实例也导出，值一直是 0 |
 | `qf_usage_events_forwarded_total` | counter | — | 这个实例发到消息队列、标成已发出的事件数。没配用量事件的实例也导出，值一直是 0 |
-| `qf_usage_events_consumed_total` | counter | `result`（applied、duplicate、malformed） | 消费者进程：写进汇总的、按调用号去重跳过的、格式不对跳过的。带标签，没计过数就没有序列，QF 实例上没有它 |
+| `qf_usage_events_consumed_total` | counter | `result`（applied、duplicate、malformed） | 消费者进程：写进汇总的、按调用号去重跳过的、格式不对跳过的。消费者一启动就把三个 `result` 各计 0（重启之后第一个事件让序列从 0 变成 1，`increase()` 看得到，`QFUsageConsumerStalled` 不误报）；QF 实例上没有它 |
 | `qf_usage_event_delay_seconds` | histogram | — | 消费者进程：从调用结清到写进汇总。QF 实例也导出，次数一直是 0 |
 | `qf_trace_export_errors_total` | counter | — | 追踪 SDK 报的错误，主要是导出失败 |
 | `qf_db_*` | gauge、counter | — | 账本连接池：`open`、`in_use`、`idle`、`max_open` 的连接数，等连接的次数和总时长 |

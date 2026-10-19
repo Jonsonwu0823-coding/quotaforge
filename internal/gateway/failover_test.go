@@ -63,11 +63,11 @@ func (h *harness) state(up string) circuit {
 	return b.state
 }
 
-// limitUpstream 给 harness 配置里的上游设 TPM 限额（配置里没写）。在发请求之前调。
-func (h *harness) limitUpstream(name string, tpm int64) {
+// limitUpstream 给 harness 配置里的上游设 RPM、TPM 限额（配置里没写，0 是不限）。在发请求之前调。
+func (h *harness) limitUpstream(name string, rpm, tpm int64) {
 	for _, u := range h.cfg.Upstreams() {
 		if u.Name == name {
-			u.TPM = tpm
+			u.RPM, u.TPM = rpm, tpm
 		}
 	}
 }
@@ -235,8 +235,8 @@ func (l deadlineLimiter) Admit(ctx context.Context, bs []ratelimit.Bucket) (*rat
 func TestFailoverStepsShareDeadline(t *testing.T) {
 	d := &stepDeadlines{}
 	h := newHarnessLimited(t, deadlineLedger{Ledger: newAllowAll(), d: d}, deadlineLimiter{stubLimiter: &stubLimiter{}, d: d})
-	h.limitUpstream("dead", 9000)
-	h.limitUpstream("fake-b", 8000)
+	h.limitUpstream("dead", 0, 9000)
+	h.limitUpstream("fake-b", 0, 8000)
 	rec := &deadlineRecorder{next: h.g.client.Transport}
 	h.g.client.Transport = rec
 	if r := h.chat(t, `{"model":"fo-dead-b"}`); r.status != http.StatusOK {
@@ -261,8 +261,8 @@ func TestFailoverMovesUpstreamBucket(t *testing.T) {
 	lim := &stubLimiter{}
 	l := newAllowAll()
 	h := newHarnessLimited(t, &rated{Ledger: l, key: bothRates}, lim)
-	h.limitUpstream("dead", 9000)
-	h.limitUpstream("fake-b", 8000)
+	h.limitUpstream("dead", 0, 9000)
+	h.limitUpstream("fake-b", 0, 8000)
 	r := h.chat(t, `{"model":"fo-dead-b"}`)
 	if r.status != http.StatusOK {
 		t.Fatalf("got %d %s", r.status, r.body)
@@ -322,8 +322,8 @@ func TestFailoverDeniedByRateLimit(t *testing.T) {
 		lim := &denyUpstream{stubLimiter: &stubLimiter{}, id: "fake-b", err: admitErr}
 		l := newAllowAll()
 		h := newHarnessLimited(t, l, lim)
-		h.limitUpstream("dead", 9000)
-		h.limitUpstream("fake-b", 8000)
+		h.limitUpstream("dead", 0, 9000)
+		h.limitUpstream("fake-b", 0, 8000)
 		r := h.chat(t, `{"model":"fo-dead-b"}`)
 		if r.status != http.StatusBadGateway || errorCode(t, r) != "upstream_unavailable" {
 			t.Fatalf("%v: got %d %s", admitErr, r.status, r.body)
@@ -353,8 +353,8 @@ func TestFailoverDeniedByRateLimit(t *testing.T) {
 // 下一次选目标还能探测它。
 func TestFailoverDeniedReturnsProbe(t *testing.T) {
 	h := newHarnessLimited(t, newAllowAll(), &denyUpstream{stubLimiter: &stubLimiter{}, id: "fake-b"})
-	h.limitUpstream("dead", 9000)
-	h.limitUpstream("fake-b", 8000)
+	h.limitUpstream("dead", 0, 9000)
+	h.limitUpstream("fake-b", 0, 8000)
 	clk := h.useClock()
 	b := h.g.router.breakers["fake-b"]
 	b.mu.Lock()
@@ -393,8 +393,8 @@ func TestFailoverRerouteFails(t *testing.T) {
 		lim := &stubLimiter{}
 		l := newAllowAll()
 		h := newHarnessLimited(t, rerouteFails{Ledger: l, err: err}, lim)
-		h.limitUpstream("dead", 9000)
-		h.limitUpstream("fake-b", 8000)
+		h.limitUpstream("dead", 0, 9000)
+		h.limitUpstream("fake-b", 0, 8000)
 		r := h.chat(t, `{"model":"fo-dead-b"}`)
 		if r.status != http.StatusBadGateway || errorCode(t, r) != "upstream_unavailable" {
 			t.Fatalf("%v: got %d %s", err, r.status, r.body)

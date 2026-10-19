@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/fakeupstream"
@@ -212,6 +214,57 @@ func TestBackgroundLoop(t *testing.T) {
 	// 这个测试里没有请求等过连接，所以没有 db_pool 这一行
 	if !strings.Contains(logs.String(), `"msg":"background"`) || strings.Contains(logs.String(), "_error") || strings.Contains(logs.String(), "db_pool") {
 		t.Fatalf("background log: %s", logs.String())
+	}
+	dbtest.Verify(t, store)
+}
+
+// 回收按结局分开计数：释放的 RESERVED 记 released，标成未知的 IN_FLIGHT 记 marked_unknown，指标和日志各一份。
+// 回收是全局的，所以用 24 小时的上界：先回收一遍，清掉测试库里前几天留下、早就过了 24 小时的调用；再把自己的两条 RESERVED、
+// 一条 IN_FLIGHT 拨到 24 小时之外，第二遍的结果正好是这三条（个数不一样，两类计反了看得出来）。包里的测试不并行，各包靠 dbtest 的锁依次用库，
+// 别的测试只把调用拨到 37 秒左右，这一轮里没有别的调用越过上界。
+func TestRoundCountsReleasedAndMarkedUnknownApart(t *testing.T) {
+	ctx := context.Background()
+	store, admin := dbtest.Store(t), dbtest.Admin(t)
+	key := dbtest.Key(t, store, dbtest.Account(t, store, 1_000_000))
+	const after = 24 * time.Hour
+	m := telemetry.NewMetrics(store.Stats)
+	if _, failed, _ := round(ctx, store, after, time.Minute, false, m); failed {
+		t.Fatal("the round that clears old leftovers failed")
+	}
+	reserve := func() ledger.Reservation {
+		r := ledger.Reservation{CallID: "qf-" + rand.Text(), AccountID: key.AccountID, KeyID: key.ID, Purpose: "chat",
+			Alias: "m", Upstream: "u", UpstreamModel: "um", EstInput: 5, EstOutput: 5}
+		if _, err := store.Reserve(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	stale, stale2, inFlight := reserve(), reserve(), reserve()
+	if err := store.MarkSent(ctx, inFlight); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec("UPDATE calls SET created_at = UTC_TIMESTAMP(6) - INTERVAL 25 HOUR WHERE id IN (?, ?, ?)",
+		stale.CallID, stale2.CallID, inFlight.CallID); err != nil {
+		t.Fatal(err)
+	}
+	count := func(result string) float64 { return testutil.ToFloat64(m.Reclaimed.WithLabelValues(result)) }
+	released, unknown := count("released"), count("marked_unknown")
+	attrs, failed, busy := round(ctx, store, after, time.Minute, false, m)
+	if failed || !busy {
+		t.Fatalf("round: failed %v, busy %v", failed, busy)
+	}
+	if r, u := count("released")-released, count("marked_unknown")-unknown; r != 2 || u != 1 {
+		t.Fatalf("qf_background_reclaimed_total grew by released %v, marked_unknown %v; want 2, 1", r, u)
+	}
+	logged := map[string]int64{}
+	for _, a := range attrs {
+		logged[a.Key] = a.Value.Int64()
+	}
+	if logged["released"] != 2 || logged["marked_unknown"] != 1 {
+		t.Fatalf("log attributes %v, want released 2, marked_unknown 1", attrs)
+	}
+	if s, s2, u := callStatus(t, admin, stale.CallID), callStatus(t, admin, stale2.CallID), callStatus(t, admin, inFlight.CallID); s != "CANCELLED" || s2 != "CANCELLED" || u != "USAGE_UNKNOWN" {
+		t.Fatalf("statuses %s, %s, %s", s, s2, u)
 	}
 	dbtest.Verify(t, store)
 }

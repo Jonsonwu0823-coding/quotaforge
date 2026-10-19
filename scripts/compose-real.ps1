@@ -4,18 +4,22 @@ param(
     [switch]$Stream,
     [switch]$Stop,
     [string]$UpstreamBaseUrl,
-    [string]$Reconcile
+    [string]$Reconcile,
+    [switch]$NoCache,
+    [long]$AccountLimit = 1000000
 )
 
 # 本机用（Windows PowerShell 5.1 起）：以真实上游（百炼）起 QF 和它的账本数据库，接入外部网络 qs-qf，
-# 用 qfctl 给 QS 建账户、发一把 QF Key。
+# 用 qfctl 给 QS 建账户、发一把 QF Key。嵌入缓存默认开着（见下面的 -NoCache）。
 #
 #   .\scripts\compose-real.ps1           输入百炼地址和 Key，起 QF，QF Key 放进这个窗口的环境变量 QUERYSHIELD_MODEL_API_KEY
 #   .\scripts\compose-real.ps1 -Check    同上，再经 QF 发一次聊天、一次嵌入（花费很少），只显示状态码、模型名、usage、x-request-id，
 #                                        出错时显示状态码和错误码；聊天带一个新生成的 Idempotency-Key，再用同一个键发一遍，
-#                                        显示第二次是重放、已消费没有增加（不多花钱）；最后显示这个账户的额度（上限、已消费、剩余），
-#                                        以及这把 Key 和账户的限流限额（每分钟的请求数和 token 数）。
-#                                        任何一次请求不是 2xx，或者重放的核对不成立（x-request-id、正文和第一次不同，或者已消费变了），
+#                                        显示第二次是重放、已消费没有增加（不多花钱）；同一个嵌入再发一遍，显示第二次命中嵌入缓存
+#                                        （Cache-Status: quotaforge; hit、正文和第一次相同、调用状态 CACHED、已消费没有增加，不调上游）；
+#                                        带 -NoCache 时不发第二次，改成核对嵌入的响应没有 Cache-Status 头（缓存确实关着）。
+#                                        最后显示这个账户的额度（上限、已消费、剩余）和缓存命中的次数，以及这把 Key 和账户的限流限额
+#                                        （每分钟的请求数和 token 数）。任何一次请求不是 2xx，或者重放、缓存的核对不成立，
 #                                        就在额度那一行之后报错退出（throw）；QF 还开着，QUERYSHIELD_MODEL_API_KEY 仍然设着
 #   .\scripts\compose-real.ps1 -Stream   同上，再经 QF 发三次流式聊天（花费很少），只显示流的结构，不显示内容：
 #                                        1. 不带 stream_options：事件数、data 行数、最后一个是不是 [DONE]、choices 为空的事件数（QF 去掉了
@@ -33,8 +37,15 @@ param(
 # -UpstreamBaseUrl 显式指定上游地址，不再询问。用来把“真实”上游指向别的 OpenAI 兼容服务
 # （例如 QF 自己的假上游），在不花钱的情况下检查脚本流程。
 #
+# -AccountLimit <tokens> 是给 QS 建的账户的额度上限，默认 1,000,000；长评测（例如几十段对话的多轮评测）建议给 2000000。
+#
+# 嵌入缓存默认开着：只影响不带 Idempotency-Key 的嵌入请求（QS 建知识索引的那批），带键的请求（run 里的）不查缓存。
+# 缓存放在单独的 qf-redis-cache 里（不持久化），和账本的库一样每次启动都是新的，停止时一起删掉。
+# -NoCache 关掉它：QF 用的配置是 deploy\config.real.json 去掉 embedding_cache 那一行（写进临时目录），和开缓存之前的配置
+# 逐字节相同，也不起 qf-redis-cache。容器里仍有 QF_REDIS_CACHE_URL 这个环境变量，但没有配置指向它，QF 不读。
+#
 # 百炼 Key 只放在本进程的环境变量里，经 Compose secrets 挂成容器里的文件；不打印、不写文件，
-# 脚本结束时恢复这三个环境变量。QF Key 只放进当前 PowerShell 进程的环境变量 QUERYSHIELD_MODEL_API_KEY（不显示，不写文件，
+# 脚本结束时恢复它设过的环境变量（$envNames 里的几个）。QF Key 只放进当前 PowerShell 进程的环境变量 QUERYSHIELD_MODEL_API_KEY（不显示，不写文件，
 # 库里只有它的哈希），脚本结束后留着，给同一个窗口里随后运行的 QS 的 compose-real-demo.ps1 读取（它在网关模式下先读这个变量，
 # 有值就不提示）；-Stop 清掉。再次启动时新 Key 直接覆盖旧值；-Reconcile 不碰它。
 #
@@ -47,6 +58,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue' # 5.1 的 Invoke-WebRequest 进度条写回窗口顶部几行时会弄乱中文（-Check 用到）；只在本脚本的作用域里生效
 $summaryPath = $null
+if ($AccountLimit -lt 1) { throw "-AccountLimit 要是正整数（tokens），现在是 $AccountLimit。" }
 if ($PSBoundParameters.ContainsKey('Reconcile')) {
     if ($Check -or $Stream -or $Stop) { throw '-Reconcile 不能和 -Check、-Stream、-Stop 一起用。' }
     if (-not $Reconcile -or -not (Test-Path -LiteralPath $Reconcile -PathType Leaf)) { throw "找不到 QS 的摘要文件：$Reconcile" }
@@ -56,10 +68,9 @@ if ($PSBoundParameters.ContainsKey('Reconcile')) {
 $qfDir = Split-Path -Parent $PSScriptRoot
 $tempDir = Join-Path ([IO.Path]::GetTempPath()) 'quotaforge-real'
 $dbDir = Join-Path $tempDir 'db'
-$envNames = @('QF_UPSTREAM_API_KEY', 'QF_UPSTREAM_BASE_URL', 'QF_DB_SECRETS_DIR')
+$envNames = @('QF_UPSTREAM_API_KEY', 'QF_UPSTREAM_BASE_URL', 'QF_DB_SECRETS_DIR', 'QF_REAL_CONFIG', 'COMPOSE_IGNORE_ORPHANS')
 $account = 'queryshield'
 $project = 'quotaforge' # compose.yaml 里的 name:，所有 docker compose 命令靠它找到这套栈
-$accountLimit = 1000000
 # 限流限额（每分钟）：远高于演示的用量（3 分钟 54 次请求，单次聊天的估算最多约 17,300 tokens）。
 $accountRate = @('-rpm', '600', '-tpm', '2000000')
 $keyRate = @('-rpm', '300', '-tpm', '1000000')
@@ -108,7 +119,24 @@ function New-DatabaseSecrets {
     return $dbDir.Replace('\', '/')
 }
 
+# -NoCache 用的配置：deploy\config.real.json 去掉 embedding_cache 那一行（连同它前面的逗号），其余逐字节不变，
+# 也就是开缓存之前的配置。核对正好删掉一处、一行，否则报错：配置被改过时，不悄悄生成一份半开半关的。返回给 Compose 用的路径（正斜杠）。
+function New-NoCacheConfig {
+    $text = [IO.File]::ReadAllText((Join-Path (Join-Path $qfDir 'deploy') 'config.real.json'))
+    $pattern = ',\s*"embedding_cache":\s*\{[^}]*\}'
+    $found = [regex]::Matches($text, $pattern).Count
+    $result = [regex]::Replace($text, $pattern, '')
+    $removedLines = ($text -split "`n").Count - ($result -split "`n").Count
+    if ($found -ne 1 -or $removedLines -ne 1 -or $result.Contains('embedding_cache')) {
+        throw "deploy\config.real.json 里 embedding_cache 应当正好是一行（找到 $found 处，删掉 $removedLines 行），没有生成关掉缓存的配置。"
+    }
+    $path = Join-Path $tempDir 'config.real.json'
+    [IO.File]::WriteAllText($path, $result, (New-Object Text.UTF8Encoding $false))
+    return $path.Replace('\', '/')
+}
+
 # 删掉容器、数据卷（数据库的数据）和临时目录。-Stop 和发现上一次的残留时都用它。
+# 只带主文件：qf-redis-cache 只在 compose.real.yaml 里，这里算孤儿，由 --remove-orphans 删掉（它的 /data 是 tmpfs，没有卷）。
 function Remove-Previous {
     Invoke-Native 'docker compose down' { Invoke-Compose @('down', '-v', '--remove-orphans') }
     Remove-Item -Recurse -Force $tempDir -ErrorAction SilentlyContinue
@@ -168,7 +196,9 @@ function Invoke-QF {
     $json = $response.Content | ConvertFrom-Json
     $replayed = ''
     if ($response.Headers['Idempotent-Replayed']) { $replayed = "，重放（Idempotent-Replayed: $($response.Headers['Idempotent-Replayed'])）" }
-    Write-Host "  ${Path}：状态 $([int]$response.StatusCode)，模型 $($json.model)，usage $($json.usage | ConvertTo-Json -Compress)，x-request-id $($response.Headers['x-request-id'])$replayed"
+    $cache = ''
+    if ($response.Headers['Cache-Status']) { $cache = "，Cache-Status: $($response.Headers['Cache-Status'])" }
+    Write-Host "  ${Path}：状态 $([int]$response.StatusCode)，模型 $($json.model)，usage $($json.usage | ConvertTo-Json -Compress)，x-request-id $($response.Headers['x-request-id'])$replayed$cache"
     return $response
 }
 
@@ -278,6 +308,9 @@ $previousLocation = Get-Location
 $previousEnv = @{}
 foreach ($name in $envNames) { $previousEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
 Set-Location $qfDir
+# 只带主文件的命令（qfctl、ps、down）会把 compose.real.yaml 里的 qf-redis-cache 当成孤儿，每次都警告一行；关掉这个警告。
+# 不影响清理：down 带着 --remove-orphans，照样删掉它。
+$env:COMPOSE_IGNORE_ORPHANS = 'true'
 try {
     docker info --format '{{.ServerVersion}}' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Docker 没有运行：请先启动 Docker Desktop。' }
@@ -308,16 +341,27 @@ try {
     if (-not $env:QF_UPSTREAM_API_KEY) { throw '百炼 Key 为空。' }
 
     $env:QF_DB_SECRETS_DIR = New-DatabaseSecrets
+    $services = @('quotaforge', 'qf-redis-cache')
+    if ($NoCache) {
+        $env:QF_REAL_CONFIG = New-NoCacheConfig
+        $services = @('quotaforge')
+    }
 
     Invoke-Native '构建 QF 镜像' { Invoke-Compose @('build', 'quotaforge', 'qfctl') }
-    Invoke-Native '启动 QF' { Invoke-Compose @('-f', 'compose.yaml', '-f', 'compose.real.yaml', 'up', '-d', '--wait', 'quotaforge') }
-    Invoke-Qfctl (@('account', 'create', '-name', $account, '-limit', "$accountLimit") + $accountRate) | Out-Null
+    Invoke-Native '启动 QF' { Invoke-Compose (@('-f', 'compose.yaml', '-f', 'compose.real.yaml', 'up', '-d', '--wait') + $services) }
+    Invoke-Qfctl (@('account', 'create', '-name', $account, '-limit', "$AccountLimit") + $accountRate) | Out-Null
     $issued = Invoke-Qfctl (@('key', 'issue', '-account', $account, '-models', 'qwen-plus,text-embedding-v4') + $keyRate)
     $qfKey = ($issued | Where-Object { $_ -like 'key: *' }) -replace '^key: ', ''
     if (-not $qfKey) { throw 'qfctl key issue 的输出格式不对' }
     $env:QUERYSHIELD_MODEL_API_KEY = $qfKey # 不在 $envNames 里：脚本结束时不恢复，留给同一个窗口里的 QS 脚本
     Write-Host 'QF 已启动：本机 http://127.0.0.1:8080/v1，qs-qf 网络上 http://quotaforge:8080/v1。'
-    Write-Host "账户 $account 的额度上限 $accountLimit tokens。"
+    Write-Host "账户 $account 的额度上限 $AccountLimit tokens（-AccountLimit 可改）。"
+    if ($NoCache) {
+        Write-Host '嵌入缓存关着（-NoCache）：QF 用的配置去掉了 embedding_cache，和开缓存之前的配置逐字节相同；没有起 qf-redis-cache。'
+    }
+    else {
+        Write-Host '嵌入缓存开着（qf-redis-cache，每次启动都是新的）：只影响不带 Idempotency-Key 的嵌入请求；-NoCache 关掉。'
+    }
     Write-Host 'QF Key 已放进这个窗口的环境变量 QUERYSHIELD_MODEL_API_KEY（不显示，只在这个窗口里有效）。在同一个窗口里运行 QS 的 compose-real-demo.ps1，它会直接读取，不用粘贴；-Stop 时清掉。'
     Write-Host 'quotaforge 容器里的代理变量（只显示设没设）：'
     Show-ProxyVariables
@@ -325,9 +369,10 @@ try {
     if ($Check) {
         Write-Host '经 QF 各发一次聊天和嵌入（聊天带一个新的 Idempotency-Key）：'
         $chatBody = '{"model":"qwen-plus","messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}'
+        $embeddingBody = '{"model":"text-embedding-v4","input":["ok"]}'
         $idempotencyKey = "real-check-$([guid]::NewGuid().ToString('N'))"
         $first = Invoke-QF -Path '/v1/chat/completions' -Key $qfKey -Body $chatBody -IdempotencyKey $idempotencyKey
-        $embedding = Invoke-QF -Path '/v1/embeddings' -Key $qfKey -Body '{"model":"text-embedding-v4","input":["ok"]}'
+        $embedding = Invoke-QF -Path '/v1/embeddings' -Key $qfKey -Body $embeddingBody
         $checkPassed = [bool]$first -and [bool]$embedding # 任何一次请求不是 2xx 就没通过（Invoke-QF 返回 $null）
         if ($first) {
             # 同一个键、同样的请求体再发一遍：QF 重放第一次的响应，不调上游、不扣额度。
@@ -343,10 +388,31 @@ try {
                 $checkPassed = $checkPassed -and $sameId -and $sameBody
             }
         }
-        # qfctl usage 的第二行：account limit reserved consumed remaining 和各状态的调用数，以制表符分隔
+        if ($embedding -and $NoCache) {
+            # Cache-Status 只在开着缓存时才加：没有它，说明这次运行确实没查缓存。
+            $noHeader = -not $embedding.Headers['Cache-Status']
+            Write-Host "嵌入缓存关着（-NoCache）：嵌入的响应没有 Cache-Status 头 $noHeader"
+            $checkPassed = $checkPassed -and $noHeader
+        }
+        elseif ($embedding) {
+            # 同样的嵌入（不带 Idempotency-Key）再发一遍：命中嵌入缓存，不调上游、不扣额度，记一条 CACHED。
+            $consumedBefore = Get-Consumed
+            Write-Host '同一个嵌入再发一遍（应当命中嵌入缓存）：'
+            $again = Invoke-QF -Path '/v1/embeddings' -Key $qfKey -Body $embeddingBody
+            $consumedAfter = Get-Consumed
+            $checkPassed = $checkPassed -and [bool]$again -and ($consumedAfter -eq $consumedBefore)
+            if ($again) {
+                $hit = "$($again.Headers['Cache-Status'])" -eq 'quotaforge; hit'
+                $sameBody = $again.Content -eq $embedding.Content
+                $status = (Get-QFCall -Key $qfKey -Id "$($again.Headers['x-request-id'])").status
+                Write-Host "  命中：Cache-Status 是 quotaforge; hit $hit，正文和第一次相同 $sameBody，调用状态 $status；已消费 $consumedBefore → $consumedAfter"
+                $checkPassed = $checkPassed -and $hit -and $sameBody -and ($status -eq 'CACHED')
+            }
+        }
+        # qfctl usage 的第二行：account limit reserved consumed remaining、各状态的调用数、限流限额，最后一列是 CACHED，以制表符分隔
         $row = (Invoke-Qfctl @('usage', '-account', $account) | Select-Object -Skip 1 -First 1) -split "`t"
-        Write-Host "账户 $account 的额度：上限 $($row[1])，已消费 $($row[3])，剩余 $($row[4]) tokens"
-        # 限流限额是 qfctl key list、usage 的最后两列：rpm_limit、tpm_limit（0 表示不限）
+        Write-Host "账户 $account 的额度：上限 $($row[1])，已消费 $($row[3])，剩余 $($row[4]) tokens；嵌入缓存命中（CACHED）$($row[12]) 次"
+        # 限流限额（0 表示不限）：qfctl key list 的第 5、6 列，usage 的第 11、12 列（rpm_limit、tpm_limit）
         $keyRow = (Invoke-Qfctl @('key', 'list', '-account', $account) | Select-Object -Skip 1 -First 1) -split "`t"
         Write-Host "限流（每分钟）：这把 Key 最多 $($keyRow[4]) 个请求、$($keyRow[5]) tokens；账户最多 $($row[10]) 个请求、$($row[11]) tokens"
         if (-not $checkPassed) {
