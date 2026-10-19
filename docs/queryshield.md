@@ -4,13 +4,13 @@
 
 和 QS 公开仓库的网关模式一致：
 
-- **网络**：外部网络 `qs-qf`，两边都按 external 引用。用前先建：`docker network create qs-qf`，已存在就跳过。`qs-qf` 上只有 `quotaforge`；`qf-mysql`、`qfctl`、`qf-redis-cache` 不接。
+- **网络**：外部网络 `qs-qf`，两边都按 external 引用。用前先建：`docker network create qs-qf`，已存在就跳过。`qs-qf` 上只有 `quotaforge`；`qf-mysql`、`qfctl`、`qf-redis`、`qf-redis-cache` 不接。两边的服务怎么部署，见[架构说明](architecture.md#部署)的部署图。
 - **地址**：QF 在 `qs-qf` 上的服务名是 `quotaforge`，端口 8080。QS 的 `base_url` 是 `http://quotaforge:8080/v1`，chat 和 embeddings 都用它。
 - **Key**：起 QF 之后用 `qfctl` 给 QS 建账户、发一把 Key，交给 QS（`QUERYSHIELD_MODEL_API_KEY`）。PowerShell 脚本把 Key 放进当前窗口的环境变量 `QUERYSHIELD_MODEL_API_KEY`（不显示，不经剪贴板；`-Stop` 清掉），QS 的 `compose-real-demo.ps1` 在网关模式下先读这个变量，有值就不提示；bash 的做法是把 Key 留在当前 shell 的变量里，不要 echo。
 - **配置**：`deploy/config.qs-fake.json`（chat 和 embeddings 两个别名都是 `qs-fake-upstream-v1`，上游 `http://fake-upstream:8000/v1`）、`deploy/config.real.json`（`qwen-plus`、`text-embedding-v4`）。都是静态文件，没有要替换的占位符。
 - **嵌入缓存**：两套栈（假上游、真实上游）都开着（行为见[接口](api.md#嵌入缓存)，运维见[嵌入缓存](operations.md#嵌入缓存)）。
   - 只影响**不带 `Idempotency-Key` 的嵌入请求**，也就是 QS 第一次检索时建知识索引的那批；run 里的请求都带键，不查也不写缓存，按 run 对账不受影响。
-  - QS 看得见的：这些请求的响应多一个 `Cache-Status` 头；命中时正文和原来那次逐字节相同（包括上游给的 `id` 和 `usage`），`x-request-id` 是新的调用号，QF 不扣这次的额度，调用状态查询是 `CACHED`；同一个实例里同时到的相同请求合并成一次回源；缓存出错当作没命中。命中不占上游那一层的 RPM（见[限流](rate-limiting.md)）。
+  - QS 看得见的：这些请求的响应多一个 `Cache-Status` 头；命中时正文和原来那次逐字节相同（包括上游给的 `id` 和 `usage`），`x-request-id` 是新的调用号，QF 不扣这次的额度，调用状态查询是 `CACHED`；同一个实例里同时到的相同请求合并成一次回源；缓存出错当作没命中。命中在准入时照样占着上游那一层的 1 个 RPM，收尾时退回（见[限流](rate-limiting.md#限流redis)）。
   - 缓存放在单独的 `qf-redis-cache`（不持久化，64 MB，满了按 LRU 淘汰），不接 `qs-qf`，不和限流共用 `qf-redis`。缓存的键里有账户号；真实栈每次启动都是新的账本库和新的 `qf-redis-cache`。
   - 一个 QS 进程只建一次索引，所以要 QS 重新起来、第一次检索重建索引时才会命中（例如同一个 QF 窗口里再跑一遍 QS 的演示，见下面“真实演示”的第 3 步）。
   - **怎么关**：真实栈用 `compose-real.ps1 -NoCache`。这时 QF 用的配置是 `deploy/config.real.json` 去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`；容器里还留着 `QF_REDIS_CACHE_URL` 这个环境变量，但没有配置指向它，QF 不读。假上游的栈没有开关（联调靠它验证缓存），要关就删掉 `deploy/config.qs-fake.json` 里 `embedding_cache` 那一行（连同前一行末尾的逗号）。
@@ -175,7 +175,7 @@ Windows PowerShell（5.1 起；需要 Docker Desktop 和 Python 3.10 起）：
    .\scripts\compose-real.ps1 -Stop
    ```
 
-`-Reconcile` 不启动也不清理任何东西（也不碰 `QUERYSHIELD_MODEL_API_KEY`），只要求第 1 步起的 QF 还在运行；不能和 `-Check`、`-Stop` 一起用。它调用 `scripts/check_qs_runs.py`（真实模式），再跑一次 `qfctl verify`。找不到 Python 3.10 或更新的版本时会提示安装（核对脚本只用标准库）。退出码：0 全部对上；1 有对不上的 run、账本校验没通过，或脚本自己报错（QF 没在运行、找不到 Python 等，错误信息在输出里）；2 核对脚本跑不了（摘要不合法、读不了账本）。
+`-Reconcile` 不启动也不清理任何东西（也不碰 `QUERYSHIELD_MODEL_API_KEY`），只要求第 1 步起的 QF 还在运行；不能和 `-Check`、`-Stream`、`-Stop` 一起用。它调用 `scripts/check_qs_runs.py`（真实模式），再跑一次 `qfctl verify`。找不到 Python 3.10 或更新的版本时会提示安装（核对脚本只用标准库）。退出码：0 全部对上；1 有对不上的 run、账本校验没通过，或脚本自己报错（QF 没在运行、找不到 Python 等，错误信息在输出里）；2 核对脚本跑不了（摘要不合法、读不了账本）。
 
 怎么读输出（每条一行，只有题号、`run_id`、次数和用量数）：
 

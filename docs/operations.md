@@ -20,18 +20,21 @@
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
 | `compose.observability.two.yaml` | 再叠加在 `compose.two.yaml` 之后：`quotaforge-b` 也打开追踪和指标，Prometheus 也抓它 |
 | `compose.failover.yaml` | 叠加在主文件上：第二个假上游 `qf-fake-upstream-b`（同一个镜像），`quotaforge` 换成两个上游的配置 `deploy/config.failover.json`、打开指标（只在 Compose 的网络里），见[多个上游](#多个上游) |
+| `compose.cache.yaml` | 叠加在主文件上：缓存专用的 `qf-redis-cache`（64 MB、`allkeys-lru`、不持久化）和第二个假上游 `qf-fake-upstream-b`，`quotaforge` 换成 `deploy/config.cache.json`（条目 5 秒过期，演示过期用）；给 QS 用的两个覆盖文件用 `extends` 共用这里的 `qf-redis-cache`，见[嵌入缓存](#嵌入缓存) |
 | `compose.usage.yaml` | 再叠加在 `compose.cache.yaml` 之后：[用量事件](ledger.md#用量事件)的演示。`qf-kafka`（Kafka 单节点）、消费者 `qf-usage-consumer`（镜像目标 `usage-consumer`），`quotaforge` 换成 `deploy/config.usage.json`；命令行工具的容器 `qf-kafka-tools` 在 profile `tools` 里，见[用量事件](#用量事件) |
 | `compose.qs-e2e.yaml` | 只给端到端联调（`scripts/compose-qs-e2e.sh`）用，叠在 `compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml` 之后：`qf-jaeger` 接进 `qs-qf`（QS 的 span 也发到这个 Jaeger），`quotaforge-b` 也接进 `qs-qf`、带网络别名 `quotaforge`，见[接 QueryShield](queryshield.md) |
 
+这些服务之间的关系见[架构说明](architecture.md#部署)的部署图。
+
 - **启动顺序**：`qf-mysql` 健康（初始化完成）→ `qfctl` 迁移并成功退出 → `quotaforge` 启动（版本不对会拒绝启动）；`quotaforge` 也等 `qf-redis` 健康。仍是一条命令 `docker compose up -d --build --wait`。
-- **`qf-redis`**：`redis:8`，不持久化（`--save '' --appendonly no`），不发布端口，不接入 `qs-qf`，健康检查是 `redis-cli ping`。不叫 `redis`，理由和 `qf-mysql` 一样。`quotaforge` 经环境变量 `QF_REDIS_URL=redis://qf-redis:6379/0` 连它（三份 `deploy/` 配置的 `redis.url_env` 都指向这个变量）；它只在 Compose 的内部网络上，不设密码。两个覆盖文件不用改，会继承这些设置。
+- **`qf-redis`**：`redis:8`，不持久化（`--save '' --appendonly no`），不发布端口，不接入 `qs-qf`，健康检查是 `redis-cli ping`。不叫 `redis`，理由和 `qf-mysql` 一样。`quotaforge` 经环境变量 `QF_REDIS_URL=redis://qf-redis:6379/0` 连它（`deploy/` 下每份配置的 `redis.url_env` 都指向这个变量）；它只在 Compose 的内部网络上，不设密码。覆盖文件不用改，会继承这些设置。
 - **`qf-mysql`**：`mysql:8.4`，不发布端口，不接入 `qs-qf`；数据在匿名卷里，`down -v` 时删掉。首次初始化时 `deploy/mysql-init.sh` 建 `qf_migrate`（库内全部权限，只给 `qfctl`）和 `qf_app`（只有增删改查，给 QF）两个账号。
 - **数据库密码只有一份**，在三个 secret 文件里：`root_password`、`migrate_dsn`、`app_dsn`。初始化脚本从两个连接串里取用户名和密码；`qfctl` 挂 `migrate_dsn`，QF 挂 `app_dsn`。都不进环境变量和 `docker inspect`。
   - 默认用 `deploy/test-only-db/` 下写明“仅测试”的文件（单独运行、联调）；
   - 设了 `QF_DB_SECRETS_DIR` 就从那个目录读（真实模式由脚本每次随机生成，见下）。
 - 管理命令：`docker compose run --rm -T --no-deps qfctl <命令>`。
 
-单独运行的命令见 [README 的快速开始](../README.md#快速开始)。
+单独运行的命令见 [README 的快速开始](../README.zh-CN.md#快速开始)。
 
 - 端口只发布在 `127.0.0.1:8080`。
 - `stop_grace_period` 是 40 秒，比 QF 的关闭上限（默认 36 秒）加上冲刷 span 的 2 秒长：`docker compose stop` 时，进行中的请求能处理完、收尾记进账本，之后还没导出的 span 也有时间发完。调大上游超时时，它也要跟着大于这两者之和。
@@ -50,7 +53,7 @@ scripts/compose-qs-fake-check.sh  # 联调覆盖文件的连通检查（Compose 
 
 - `compose-smoke.sh`：
   - 从空环境 `up --build --wait`，`qfctl` 迁移成功；用 `qfctl` 建账户、现发一把 Key（只在脚本变量里）；
-  - 安全设置：`quotaforge` 的 9 项，`qfctl` 镜像里只有 `/qfctl`，`qf-mysql` 不发布端口、只在默认网络上，两个容器的环境变量里没有数据库密码；
+  - 安全设置：`quotaforge` 的 8 项（以 65532 运行、根文件系统只读、去掉所有 capability、`no-new-privileges`、端口只发布在 127.0.0.1、镜像带健康检查、停止宽限期长于关闭上限、镜像里只有程序和 CA 证书），`qfctl` 镜像里只有 `/qfctl`，`qf-mysql` 不发布端口、只在默认网络上，两个容器的环境变量里没有数据库密码，`compose.real.yaml` 渲染出的配置里没有上游 Key；
   - 依次发聊天、带 `tools` 的聊天、嵌入、无效 Key、不存在的模型，查状态码、`x-request-id`、上游给的 `model` 和 `usage`；
   - 账本：三次调用都结算，已消费等于上游报的用量；把上限改成已消费后，下一次请求 429 `quota_exhausted`、`Retry-After: 25`；
   - 幂等键：同一个键、同样的请求体发两次，第二次 200、`Idempotent-Replayed: true`、`x-request-id` 和正文都和第一次相同，账本只多一次结算；请求体不同 422；慢请求进行中（账本里是 `IN_FLIGHT`）再发 409 `idempotency_in_progress`，结束后重放；不合法的键 400；`qfctl idempotency purge` 能执行；
@@ -66,7 +69,7 @@ scripts/compose-qs-fake-check.sh  # 联调覆盖文件的连通检查（Compose 
     - TPM 的退还：Key 的 TPM 1500，请求带 `max_tokens: 1000`（估算约 1100，脚本核对估算在 1000 到 1200 之间），第一次结算后退回“估算 − 实际”，第二次才放得进；没有退还的话要等约 28 秒。对照组先发用量未知的请求（不退），第二次 429，日志里是 `key/tpm`；
     - `docker compose stop qf-redis`：请求 503 `rate_limiter_unavailable`、不带 `Retry-After`、日志有 Redis 的错误、账本里没有它；`start` 之后等到健康，不重启 QF，第一个请求就是 200；`qfctl verify` 通过，日志里没有这些 Key 和正文；
   - 最后 `down -v`。
-- `compose-qs-fake-check.sh`：在 `qs-qf` 上起一个临时替身（QF 的假上游镜像，网络别名 `fake-upstream`，端口 8000），用 `compose.qs-fake.yaml` 起 QF，现发 Key，经别名 `qs-fake-upstream-v1` 各发一次聊天和嵌入；检查只有 `quotaforge` 在 `qs-qf` 上，`qf-mysql`、`qfctl`、`qf-redis` 不在。
+- `compose-qs-fake-check.sh`：在 `qs-qf` 上起一个临时替身（QF 的假上游镜像，网络别名 `fake-upstream`，端口 8000），用 `compose.qs-fake.yaml` 起 QF，现发 Key，经别名 `qs-fake-upstream-v1` 发一次聊天和一次嵌入，同样的嵌入再发一次：第一次没命中、第二次命中嵌入缓存、正文相同，账本里两次结算、一条 `CACHED`；检查只有 `quotaforge` 在 `qs-qf` 上，`qf-mysql`、`qfctl`、`qf-redis`、`qf-redis-cache` 不在，没有起 QF 自己的假上游。
   - 账户、Key 和上游都配了远高于用量的限流限额（账户 rpm 6000、tpm 100,000,000；Key rpm 3000、tpm 50,000,000），每个请求都经过准入和修正；最后核对日志里没有被限流、也没有限流器不可用的请求。端到端联调脚本也一样。
   - 替身只在脚本里，不在 Compose 文件里：和 QS 约定：QF 自己的假上游不能叫 `fake-upstream`（这是 QS 的假上游在 `qs-qf` 上的名字）。
   - 这只验证网络和配置是通的，不是 QS 端到端。
@@ -307,7 +310,7 @@ QF 默认监听 `127.0.0.1:8080`，用环境变量 `QUOTAFORGE_ADDR` 改。镜�
 - 带 `-Check` 时，经 QF 发一次短聊天（`qwen-plus`）和一次短嵌入（`text-embedding-v4`），花费在 0.01 元以内；同一个嵌入再发一次，应当命中嵌入缓存（不调上游，不花钱）；之后显示这个账户的额度（上限、已消费、剩余）和缓存命中的次数，以及这把 Key 和账户的限流限额。
 - 嵌入缓存默认开着（`qf-redis-cache`，和账本的库一样每次启动都是新的）；`-NoCache` 关掉：QF 用的配置去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`。见[接 QS](queryshield.md#接-qs)。
 - 账户的额度上限默认 1,000,000 tokens，`-AccountLimit <tokens>` 可改（正整数）。
-- 限流限额远高于演示的用量（真实演示 3 分钟 54 次请求，单次聊天的估算最多约 17,300 tokens）：账户每分钟 600 个请求、2,000,000 tokens，Key 每分钟 300 个请求、1,000,000 tokens。
+- 限流限额远高于演示的用量（2026-10-15 那次真实演示一共 56 次调用：40 次聊天，其中 1 次是 `-Check` 的重放；16 次嵌入；单次聊天的估算最多约 17,300 tokens）：账户每分钟 600 个请求、2,000,000 tokens，Key 每分钟 300 个请求、1,000,000 tokens。
 - `deploy/config.real.json` 里上游 `bailian` 的限额是保守的示例值：每分钟 600 个请求、2,000,000 tokens。**要以百炼控制台上这把 Key 的实际限额为准**改它；百炼的限额实际是按模型的，QF 现在只按上游限。
   - 聊天带一个新生成的 `Idempotency-Key`，再用同一个键发一遍：显示第二次是重放（`Idempotent-Replayed: true`，`x-request-id` 和正文都和第一次相同），已消费没有增加。这演示了“重试不重复计费”，不多花钱。
 - `deploy/config.real.json` 里 `qwen-plus` 的 `default_max_tokens` 是 32768。依据（2026-10-08 查百炼文档）：稳定版 `qwen-plus` 最大输出 32,768 个 token、上下文 1,000,000；OpenAI 兼容接口里不写 `max_tokens` 时，默认就是模型的最大输出长度。百炼文档还说 `max_tokens` 将废弃、改用 `max_completion_tokens`；QF 只读 `max_tokens`，客户端改用新字段时 QF 按默认值预留，只会多留、不会少留。
@@ -328,6 +331,7 @@ PowerShell（Windows PowerShell 5.1 起；需要 Docker Desktop）：
 ```
 
 - 不带 `-Check` 就只启动。`-NoCache` 关掉嵌入缓存，`-AccountLimit 2000000` 改账户的额度上限，可以和别的参数一起用。
+- `-Stream`：再经 QF 发三次流式聊天（花费很少），只显示流的结构、不显示内容：不带 `stream_options` 的（事件数、最后是不是 `[DONE]`、QF 替客户端要的 usage 事件没有转发、调用结算了）；带 `include_usage: true` 的（usage 事件照转发，调用的用量等于它的数）；读 2 秒就断开的（等一会儿查调用状态，应是 `SETTLED`）。可以和 `-Check` 一起用，任何一项不成立就报错退出。还没在百炼上跑过（见[还没做的验证](evidence.md#还没做的验证)）。
 - `-Stop` 和“上一次没停”的清理只带主文件跑 `docker compose down -v --remove-orphans`：`qf-redis-cache` 只在 `compose.real.yaml` 里，这时算孤儿，由 `--remove-orphans` 删掉（它的 `/data` 是 tmpfs，没有要删的卷）。脚本设了 `COMPOSE_IGNORE_ORPHANS`，只带主文件的命令不再每次提示孤儿。
 - QF Key 只放进运行脚本的这个 PowerShell 进程的环境变量 `QUERYSHIELD_MODEL_API_KEY`，不显示、不写文件、不经剪贴板（剪贴板谁都能读，还会进 Windows 的剪贴板历史）；脚本结束后变量留着，给同一个窗口里随后运行的 QS 脚本读，`-Stop` 时清掉（不管原来有没有值）。再次启动时新 Key 直接覆盖旧值；`-Reconcile` 不碰它。
 - `-UpstreamBaseUrl <地址>` 会显式指定上游、不再询问。可以先用它指向 QF 的假上游，不花钱地走一遍流程：在 `qs-qf` 上起一个假上游容器 `docker run -d --name fake-bailian --network qs-qf quotaforge-fakeupstream:local -addr 0.0.0.0:8081`（先 `docker compose build qf-fake-upstream`），地址填 `http://fake-bailian:8081/v1`，用完 `docker rm -f fake-bailian`。

@@ -319,6 +319,40 @@ func TestEmbeddingCacheHitFreesUpstreamRPM(t *testing.T) {
 	}
 }
 
+// 合并的跟随者结局也是 CACHED，同样退回上游那一层的 RPM：10 个相同请求并发，1 个领头的回源，
+// 9 个跟随的拿它的结果。上游那一层只留领头的 1 个；Key 那一层 10 个都算。
+func TestEmbeddingCacheCollapsedFollowersFreeUpstreamRPM(t *testing.T) {
+	lim, rdb := redisLimiter(t)
+	h := newCacheHarness(t, &rated{Ledger: newAllowAll(), key: ledger.Rate{RPM: 1000}}, lim, newMemCache())
+	h.limitUpstream("fake", 50, 0)
+	const n = 10
+	replies := h.embAsync(h.clientCtx, clientKey, `{"model":"emb-hold","input":["collapsed"]}`, n)
+	waitFor(t, func() bool { return h.fake.Stats().Held == 1 && h.waiting() == n-1 })
+	h.fake.Release()
+	groups := byCacheStatus(collect(t, replies, n, 5*time.Second))
+	if len(groups[statusMiss]) != 1 || len(groups[statusCollapsed]) != n-1 {
+		t.Fatalf("%d miss, %d collapsed; want 1, %d", len(groups[statusMiss]), len(groups[statusCollapsed]), n-1)
+	}
+	for _, r := range groups[statusCollapsed] {
+		if l := h.logLine(t, requestID(t, r)); l["call_status"] != "CACHED" { // 日志在修正之后写
+			t.Fatalf("follower log %v", l)
+		}
+	}
+	tokens := func(layer, id string) float64 {
+		v, err := rdb.HGet(context.Background(), lim.Key(ratelimit.Bucket{Layer: layer, ID: id, Metric: "rpm"}), "tokens").Float64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	if v := tokens("upstream", "fake"); v < 49 || v >= 49.5 {
+		t.Fatalf("upstream/rpm holds %v tokens, want about 49: only the leader counts, every follower gets its token back", v)
+	}
+	if v := tokens("key", "1"); v < 990 || v >= 990.5 {
+		t.Fatalf("key/rpm holds %v tokens, want about 990: all ten requests count", v)
+	}
+}
+
 // 隔离：别的账户、同一上游的别的上游模型名、别的上游、请求体不同都不命中；别名不同但目标相同、
 // 只差空白和键的顺序的请求体会命中。键是“账户 id:64 位十六进制”，没有明文。
 func TestEmbeddingCacheIsolation(t *testing.T) {

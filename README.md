@@ -1,84 +1,155 @@
 # QuotaForge
 
-QuotaForge（QF）是给 Agent 用的大模型网关，用 Go 写成。Agent 和应用经它调用 OpenAI 兼容的上游模型。QF 负责每个账户能用多少、用得多快；重试不重复计费；调用结果不明时，事后能把账对清。
+English | [中文](README.zh-CN.md)
 
-- **OpenAI 兼容转发**：`/v1/chat/completions`（含 tools）和 `/v1/embeddings`。只把模型别名换成上游的模型名，其余字节原样转发；上游的响应原样返回。
-- **额度账本**：每个账户一个 token 上限。每次调用先在 MySQL 里按估算预留，结束后按上游报的用量结算。额度只以 MySQL 为准：并发预留不会超扣，`qfctl verify` 随时可以校验账本的不变量。
-- **幂等**：请求带 `Idempotency-Key` 时，同一个键的重试不会多扣额度。结算过的调用原样重放；结果未知的调用不会重新执行。
-- **未知用量的恢复和对账**：上游超时、进程被杀时，用量不补 0，记成“未知”，继续占着预留。后台回收接手卡住的调用；运维拿上游的账单或 QF 的日志结清。
-- **共享限流**：Key、账户、上游三层，每层限每分钟的请求数和 token 数。令牌桶放在 Redis 里，由 Lua 脚本原子地扣，多个实例共享同一组桶。
-- **多个实例**：实例之间不共享内存状态，同时跑也不会超扣、不会重复执行同一个键、不会重复回收。附带跨实例的检查脚本和压测数据。
-- **嵌入缓存**（可选）：同一个账户的相同嵌入请求直接用之前结算过的响应，不调上游、不扣额度，账本里记一条 `CACHED`。缓存放在单独的 Redis 里；同一个实例里并发的相同请求只回源一次，过期时间加随机抖动；缓存坏了只算没命中。
-- **用量事件**（可选）：调用结清时，在同一个数据库事务里写一行 outbox；后台转发到 Kafka（至少一次），消费者按调用号去重、按账户按天汇总，`qfctl usage-reconcile` 拿汇总和账本对账。Kafka 挂了请求照常，事件留在 outbox 里，恢复后补发。
+QuotaForge (QF) is an LLM gateway for agents, written in Go. Agents and applications call OpenAI-compatible upstream models through it. QF controls how much each account may use and how fast; retries are never billed twice; and when the outcome of a call is unknown, the books can still be reconciled afterwards. It is an optional model gateway for [QueryShield](https://github.com/Jonsonwu0823-coding/queryshield) (a controlled agent for asking business-data questions in natural language), and it also works on its own.
+
+## What it does
+
+- **OpenAI-compatible forwarding**: `/v1/chat/completions` (including tools) and `/v1/embeddings`. For non-streaming requests only the model alias is replaced with the upstream model name and every other byte is forwarded as is; for streaming, QF also asks the upstream to include usage (exceptions in [streaming](docs/api.md#流式), Chinese). The upstream's 2xx response is returned as is.
+- **Quota ledger**: each account has a token limit. Every call first reserves its estimate in MySQL and is settled with the usage the upstream reports. MySQL is the only authority on quota: concurrent reservations never overspend, and `qfctl verify` checks the ledger's invariants at any time.
+- **Idempotency**: with an `Idempotency-Key`, retries of the same key are not charged again. A settled call is replayed byte for byte; a call whose outcome is unknown is never executed again.
+- **Recovery and reconciliation of unknown usage**: the intent to send is recorded before the request goes out. When the upstream times out or the process is killed, usage is recorded as unknown instead of 0, and the reservation stays held. A background loop reclaims stuck calls; operators settle them with the upstream's bill or QF's own log.
+- **Shared rate limiting**: three layers (key, account, upstream), each limiting requests and tokens per minute. Token buckets live in Redis and are charged atomically by a Lua script, so all instances share the same buckets.
+- **Multiple instances**: instances share no in-memory state. Running several at once never overspends, never executes the same key twice and never reclaims a call twice. Cross-instance checks and benchmark data are included.
+- **Streaming**: SSE events are forwarded one by one and billed from the usage in the stream; a client that disconnects mid-stream is still settled as usual.
+- **Multiple upstreams and circuit breaking**: one alias can have several weighted targets (canary, primary/standby); QF switches upstream only when the connection could not be made, and breaks the circuit per upstream.
+- **Embedding cache** (optional): identical embedding requests from the same account reuse a previously settled response, without calling the upstream or using quota; the ledger records a `CACHED` call. Concurrent identical requests in one instance go upstream once; a broken cache only counts as a miss.
+- **Usage events** (optional): when a call is resolved, an outbox row is written in the same database transaction; a background loop forwards it to Kafka (at least once), a consumer de-duplicates by call ID and aggregates per account per day, and `qfctl usage-reconcile` reconciles the totals with the ledger.
+- **Observability**: OpenTelemetry tracing (one span tree per call, accepting W3C `traceparent`), Prometheus metrics, SLOs and alert rules, and logs correlated by call ID and `trace_id`.
+
+## Architecture overview
 
 ```mermaid
-flowchart LR
-    client["Agent / 应用<br/>（例如 QueryShield）"]
-    subgraph qf["QuotaForge（一个或多个实例）"]
-        direction TB
-        check["鉴权、解析、估算"] --> admit["限流准入"] --> cache["嵌入缓存<br/>（命中就记 CACHED、不预留）"] --> reserve["预留额度<br/>（幂等判断）"] --> intent["发送意图"] --> forward["转发<br/>（只换模型名）"] --> settle["收尾结算"]
-        bg["后台：回收卡住的调用、<br/>清理过期的幂等记录"]
-        fwd["转发用量事件<br/>（outbox → Kafka）"]
+flowchart TB
+    client["Agent / application<br/>(e.g. QueryShield's model adapter)"]
+    subgraph qf["QuotaForge (one or more instances)"]
+        check["Auth, parse, estimate"] --> admit["Rate-limit admission"] --> cache["Embedding cache lookup<br/>(hit: record CACHED)"] --> reserve["Reserve quota<br/>(idempotency check)"] --> intent["Record intent to send"] --> forward["Forward<br/>(model name only; switch upstream if unreachable)"] --> settle["Settle"]
+        bg["Background: reclaim stuck calls,<br/>purge expired idempotency records, forward usage events"]
     end
-    client -- "OpenAI 兼容接口<br/>Bearer QF Key" --> check
-    forward -- "上游 Key" --> upstream["上游模型<br/>（OpenAI 兼容）"]
-    admit --> redis[("Redis<br/>共享令牌桶")]
-    cache --> rcache[("Redis（单独的）<br/>嵌入缓存")]
-    reserve --> mysql[("MySQL<br/>额度、账本、调用、幂等记录、outbox")]
+    client -- "OpenAI-compatible HTTP<br/>QF-issued key, X-Run-Id, X-Client-Request-Id,<br/>Idempotency-Key, traceparent" --> check
+    forward -- "upstream key, X-Client-Request-Id" --> upstream["Upstream model<br/>(OpenAI-compatible)"]
+    admit --> redis[("Redis<br/>shared token buckets")]
+    cache --> rcache[("Redis (separate)<br/>embedding cache")]
+    reserve --> mysql[("MySQL<br/>quota, ledger, calls, idempotency records, outbox")]
     intent --> mysql
     settle --> mysql
     bg --> mysql
-    mysql -- "outbox" --> fwd --> kafka[("Kafka<br/>用量事件")] --> consumer["消费者<br/>去重、按天汇总"] --> mysql
-    qfctl["qfctl<br/>迁移、账户、Key、对账"] --> mysql
+    bg --> kafka[("Kafka<br/>usage events")] --> consumer["Consumer<br/>de-duplicate, daily totals"] --> mysql
+    qf -. "spans, /metrics" .-> obs["Jaeger, Prometheus"]
+    qfctl["qfctl<br/>migrations, accounts, keys, reconciliation"] --> mysql
 ```
 
-## 已经完成
+MySQL is the only authority on quota; Redis is used only for rate limiting and caching, so losing it can at most let a few extra requests through or cause a few extra upstream calls. Components, the sequence of one request, call states and deployment are in the [architecture document](docs/architecture.md) (Chinese).
 
-| 里程碑 | 内容 |
-|---|---|
-| M1 转发 | OpenAI 兼容的聊天和嵌入转发，QF 自己发的 Key，每次调用一行 JSON 日志；Docker 镜像和 Compose；和 QueryShield 端到端联调（[接口](docs/api.md#接口)、[接 QueryShield](docs/queryshield.md)） |
-| M2 额度和幂等 | MySQL 额度账本（预留、结算、释放，`qfctl verify` 校验不变量）；`Idempotency-Key` 的重放、422、409（[额度和账本](docs/ledger.md#额度和账本)、[幂等](docs/api.md#幂等idempotency-key)） |
-| M3 未知用量 | 发送意图、后台回收、调用状态查询 `GET /v1/calls/{id}`，凭账单或日志用 `qfctl reconcile` 对账（[调用状态、回收和对账](docs/ledger.md#调用状态回收和对账未知用量)） |
-| M4 限流和多实例 | Redis 共享令牌桶（Key、账户、上游三层的 RPM、TPM）；两个实例的跨进程检查和压测（[限流](docs/rate-limiting.md)、[两个实例和压测](docs/scaling.md)） |
-| M5 可观测 | OpenTelemetry 追踪（一次调用一棵 span 树，接收 W3C `traceparent`）、Prometheus 指标、SLO 和告警规则、日志按调用号和 `trace_id` 关联；Jaeger 加 Prometheus 的演示环境（[可观测](docs/observability.md)） |
+## Quick start
 
-进行中（M6）：流式转发已经可用：SSE 逐个转发、按流里的 usage 结算、中途断开照常结算（[流式](docs/api.md#流式)）。多上游与熔断已经可用：一个别名多个目标、按权重分流（灰度、主备），连不上时换上游，按上游熔断（[多个上游](docs/operations.md#多个上游)）。Embedding 缓存已经可用：按账户隔离的精确缓存、并发的相同请求只回源一次、过期时间加抖动、命中记 `CACHED`（[嵌入缓存](docs/api.md#嵌入缓存)）。用量事件已经可用：结清时同一个事务写 outbox、转发到 Kafka、消费者去重并按天汇总、和账本对账（[用量事件](docs/ledger.md#用量事件)）。
-
-## 快速开始
-
-要 Docker（带 Compose）和 curl。在项目根目录下运行。以下命令起 QF、账本数据库、Redis 和 QF 自己的假上游，不调用任何付费模型：
+You need Docker (with Compose) and curl. Run from the project root. These commands start QF, the ledger database, Redis and QF's own fake upstream; no paid model is called:
 
 ```bash
-docker compose up -d --build --wait   # 等到健康为止
+docker compose up -d --build --wait   # wait until healthy
 docker compose run --rm -T --no-deps qfctl account create -name local -limit 100000
 KEY=$(docker compose run --rm -T --no-deps qfctl key issue -account local -models qs-fake-upstream-v1,fake-tool-call | sed -n 's/^key: //p')
 curl -sS http://127.0.0.1:8080/healthz
 curl -sS -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"qs-fake-upstream-v1","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
-docker compose run --rm -T --no-deps qfctl usage -account local   # 已消费就是上面那次调用的 usage
+  -d '{"model":"qs-fake-upstream-v1","messages":[{"role":"user","content":"hello"}],"max_tokens":64}'
+docker compose run --rm -T --no-deps qfctl usage -account local   # consumed equals the usage of the call above
 docker compose down -v
 ```
 
-- 端口只发布在 `127.0.0.1:8080`。账本数据库用 `deploy/test-only-db/` 下写明“仅测试”的密码；接真实上游时，脚本每次随机生成数据库密码（见[运行和运维](docs/operations.md)）。
-- 更多请求的写法（带 tools 的聊天、嵌入、PowerShell）见[用 curl 调用](docs/api.md#用-curl-调用)。
+- The port is published on `127.0.0.1:8080` only. The ledger database uses the passwords marked "test only" under `deploy/test-only-db/`; with a real upstream, the script generates fresh random database passwords each time (see [operations](docs/operations.md), Chinese).
+- More request examples (chat with tools, embeddings, streaming, PowerShell) are in [calling with curl](docs/api.md#用-curl-调用) (Chinese). The demo script for each feature is listed in the [evidence list](docs/evidence.md#记录的结果) (Chinese).
 
-## 和 QueryShield 的关系
+## Milestones
 
-[QueryShield](https://github.com/Jonsonwu0823-coding/queryshield)（QS）是一个查询 Agent，QF 是它的模型出口：QS 的聊天和嵌入都经 QF 调上游，一次 run 里的调用带上 run 编号（`X-Run-Id`）和幂等键。两边的联调脚本跑 QS 的整套演示，再拿 QF 的账本逐个 run 核对调用次数和用量，见[接 QueryShield](docs/queryshield.md)。
+All seven milestones are complete.
 
-## 文档
-
-| 文档 | 内容 |
+| Milestone | Contents |
 |---|---|
-| [接口和幂等](docs/api.md) | 接口、错误码、流式、嵌入缓存、用 curl 调用、`Idempotency-Key` |
-| [额度、账本和未知用量](docs/ledger.md) | 估算、预留、结算，锁的顺序，账本的不变量；调用状态、回收、对账、调用状态查询；数据库和迁移；用量事件（outbox、Kafka、按天汇总和对账）；用量导出 |
-| [限流](docs/rate-limiting.md) | 三层令牌桶、Lua 脚本、TPM 的修正、Redis 不可用时的行为 |
-| [运行和运维](docs/operations.md) | Docker Compose、冒烟脚本、环境变量、配置文件、多个上游和熔断、嵌入缓存、用量事件、`qfctl`、不用 Docker 时怎么起、真实上游冒烟 |
-| [两个实例和压测](docs/scaling.md) | 两个实例怎么共享状态、跨实例的检查、压测方法和结果 |
-| [可观测](docs/observability.md) | span 树、日志关联、指标清单、SLO 和告警、Jaeger 加 Prometheus 的演示环境 |
-| [接 QueryShield](docs/queryshield.md) | 网络和配置、端到端联调、经 QS 的真实演示和对账 |
-| [开发和测试](docs/development.md) | Go 版本和依赖、跑测试、测试库和测试用的 Redis、Kafka |
+| M1 Forwarding | OpenAI-compatible chat and embedding forwarding, QF-issued keys, one JSON log line per call; Docker image and Compose; end-to-end integration with QueryShield ([API](docs/api.md#接口), [QueryShield](docs/queryshield.md)) |
+| M2 Quota and idempotency | MySQL quota ledger (reserve, settle, release; `qfctl verify` checks invariants); `Idempotency-Key` replay, 422, 409 ([quota and ledger](docs/ledger.md#额度和账本), [idempotency](docs/api.md#幂等idempotency-key)) |
+| M3 Unknown usage | Intent to send, background reclaim, call status lookup `GET /v1/calls/{id}`, reconciliation with a bill or log via `qfctl reconcile` ([call states, reclaim and reconciliation](docs/ledger.md#调用状态回收和对账未知用量)) |
+| M4 Rate limiting and multiple instances | Shared Redis token buckets (RPM and TPM for key, account and upstream); cross-process checks with two instances and benchmarks ([rate limiting](docs/rate-limiting.md), [two instances and benchmarks](docs/scaling.md)) |
+| M5 Observability | OpenTelemetry tracing, Prometheus metrics, SLOs and alert rules, logs correlated by call ID and `trace_id`; a Jaeger and Prometheus demo environment ([observability](docs/observability.md)) |
+| M6 Streaming, multiple upstreams, cache, usage events | SSE streaming and billing ([streaming](docs/api.md#流式)); multiple upstreams, weighted routing, failover and circuit breaking ([multiple upstreams](docs/operations.md#多个上游)); embedding cache ([embedding cache](docs/api.md#嵌入缓存)); usage events, Kafka and daily totals ([usage events](docs/ledger.md#用量事件)) |
+| M7 Integration, review, docs | End-to-end integration with QueryShield (five scenarios, cross-service traces); full code review and simplification; architecture, evidence list and retrospective ([architecture](docs/architecture.md), [evidence](docs/evidence.md), [retrospective](docs/retrospective.md)) |
 
-## 许可证
+All linked documents are in Chinese.
+
+## Relationship with QueryShield
+
+[QueryShield](https://github.com/Jonsonwu0823-coding/queryshield) (QS) is a controlled agent for asking business-data questions in natural language, and QF is its optional model gateway (QS can also call the upstream directly). When QS uses QF, all of its chat and embedding calls go through QF: every request carries `traceparent`, and the calls in one run also carry the run ID (`X-Run-Id`) and an idempotency key. The integration script runs QS's full demo, then checks the number of calls and the usage of every run against QF's ledger, and checks the cross-service traces in one Jaeger; see [QueryShield integration](docs/queryshield.md) (Chinese).
+
+## Verification and evidence
+
+- **Tests**: 725 tests (including subtests) in the full `go test -race` run with MySQL, Redis and Kafka; all passed in the public CI on `a56cd4b` on 2026-10-19.
+- **Demo scripts**: nine, each starting from an empty environment, all run in CI. The QS integration has five scenarios with 40, 4, 25, 27 and 43 checks, 139 in total; the smoke test has 147.
+- **Real upstream**: on a local Windows machine, QS's real demo called Alibaba Cloud Model Studio through QF and was reconciled run by run: on 2026-10-15 (`a7847c0`) all 13 runs matched with 0 failures; on 2026-10-19 (`a56cd4b`, embedding cache on) two demos in the same QF both passed, and the 4 embeddings that rebuilt the knowledge index in the second demo all hit the cache.
+- **Benchmarks**: two machines and two instances; results and bottleneck analysis in [two instances and benchmarks](docs/scaling.md#压测) (Chinese).
+
+The [evidence list](docs/evidence.md) maps every capability to its code, tests, commands and recorded results; problems found during development and how they were fixed are in the [retrospective](docs/retrospective.md) (both in Chinese).
+
+## Known limitations
+
+- **Quota**: one token limit per account, with no periodic reset, no money-based billing and no per-model weighting ([quota and ledger](docs/ledger.md#额度和账本)).
+- **Unknown usage without evidence keeps its reservation**: Model Studio provides no per-call bill, so a call that timed out on the real upstream has no evidence and stays `USAGE_UNKNOWN` ([call states, reclaim and reconciliation](docs/ledger.md#调用状态回收和对账未知用量)).
+- **Conservative estimates**: input is estimated from the request body's bytes and output from `max_tokens`, so reservations are often much larger than actual usage ([rate limiting](docs/rate-limiting.md#限流redis)).
+- **Hot accounts**: all requests of one account queue on the same quota row, about 150 requests per second on the test machine ([benchmarks](docs/scaling.md#压测)).
+- **Single-node Redis only**, no Redis Cluster; upstream rate limits are per upstream, not per model ([rate limiting](docs/rate-limiting.md#限流redis)).
+- **Embedding cache** is exact-match, and request coalescing is per instance; if the upstream silently swaps the model behind a name, old vectors are served for at most one TTL ([embedding cache](docs/api.md#嵌入缓存)).
+- **Streaming calls cannot be replayed**: a key is still executed at most once, but a retry gets 409 ([idempotency](docs/api.md#幂等idempotency-key)).
+- **Circuit breaking** counts consecutive failures, and each instance keeps its own state ([multiple upstreams](docs/operations.md#多个上游)).
+- **No HTTP admin API**: accounts, keys and reconciliation use `qfctl`, which connects to the database directly ([qfctl](docs/operations.md#qfctl)).
+- **Model Studio is the only real upstream tested**; streaming on a real upstream and failover between two real upstreams are not yet verified ([not yet verified](docs/evidence.md#还没做的验证)).
+
+All linked documents are in Chinese.
+
+## Repository layout
+
+```text
+cmd/
+  quotaforge/     the server (plus subcommands healthcheck, usage-consumer, usage-export)
+  qfctl/          admin tool: migrations, accounts, keys, usage, verification, reconciliation
+  fakeupstream/   QF's own fake upstream (for tests and demos)
+  qfbench/        load and burst tool
+internal/
+  gateway/        HTTP gateway: auth, admission, reservation, forwarding, settlement, streaming, cache, logs
+  ledger/         MySQL quota ledger, idempotency, reclaim, reconciliation, outbox, migrations
+  ratelimit/      Redis token buckets (Lua script)
+  embcache/       Redis client for the embedding cache
+  redisconn/      settings shared by the two Redis clients
+  usageevents/    forwarding and consuming usage events (Kafka)
+  telemetry/      tracing (OTLP/JSON exporter) and Prometheus metrics
+  config/         loading and validating the config file
+  apikey/         key generation and hashing
+  fakeupstream/   the fake upstream's implementation
+  dbtest/         database, Redis and Kafka helpers shared by tests
+deploy/           configs for Compose, MySQL init script, Prometheus rules, test-only database passwords
+scripts/          demo and check scripts (bash), the real-upstream PowerShell script, the integration checker (Python)
+bench/            benchmark results and raw data
+docs/             documentation (Chinese)
+compose*.yaml     the main Compose file and overlays
+vendor/           dependencies (no network access needed to build)
+```
+
+## Documentation
+
+All documents are in Chinese.
+
+| Document | Contents |
+|---|---|
+| [Architecture](docs/architecture.md) | Overview, components, sequence of one request, embedding cache coalescing, call states, deployment, design trade-offs |
+| [Evidence list](docs/evidence.md) | Code, tests, commands and recorded results for each capability; what is not yet verified |
+| [Retrospective](docs/retrospective.md) | Twelve problems found during development: symptom, root cause, fix, verification, lesson |
+| [API and idempotency](docs/api.md) | Endpoints, error codes, streaming, embedding cache, calling with curl, `Idempotency-Key` |
+| [Quota, ledger and unknown usage](docs/ledger.md) | Estimates, reservation, settlement, lock order, ledger invariants; call states, reclaim, reconciliation, call status lookup; database and migrations; usage events; usage export |
+| [Rate limiting](docs/rate-limiting.md) | Three layers of token buckets, the Lua script, TPM correction, behavior when Redis is unavailable |
+| [Operations](docs/operations.md) | Docker Compose, smoke scripts, environment variables, config file, multiple upstreams and circuit breaking, embedding cache, usage events, `qfctl`, running without Docker, real-upstream smoke test |
+| [Two instances and benchmarks](docs/scaling.md) | How two instances share state, cross-instance checks, benchmark method and results |
+| [Observability](docs/observability.md) | Span tree, log correlation, metrics, SLOs and alerts, the Jaeger and Prometheus demo environment |
+| [QueryShield integration](docs/queryshield.md) | Network and config, end-to-end integration, real demo through QS and reconciliation |
+| [Development and testing](docs/development.md) | Go version and dependencies, running tests, test database, Redis and Kafka for tests |
+
+## License
 
 [MIT](LICENSE)

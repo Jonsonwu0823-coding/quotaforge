@@ -17,7 +17,7 @@ QF 有三个出口：每次调用一行 JSON 日志（一直有）、OpenTelemet
 
 ### 一次调用一棵树
 
-根是服务端 span，名字是方法加路由；每次对外部依赖的调用（账本、Redis、上游）是它的直接子 span。没执行的步骤没有 span：没有限流桶就没有 `admit`、`adjust`；额度不足就停在 `reserve`。解析、估算、指纹这些不碰外部的步骤算在根里。
+根是服务端 span，名字是方法加路由（这些步骤的先后见[架构说明](architecture.md#一次请求)的时序图）；每次对外部依赖的调用（账本、Redis、上游）是它的直接子 span。没执行的步骤没有 span：没有限流桶就没有 `admit`、`adjust`；额度不足就停在 `reserve`。解析、估算、指纹这些不碰外部的步骤算在根里。
 
 ```text
 POST /v1/chat/completions      SERVER  整个请求，起点是请求进来的时间（和日志的 duration_ms 同一个总耗时）
@@ -31,7 +31,7 @@ POST /v1/chat/completions      SERVER  整个请求，起点是请求进来的�
 ├── (admit, reroute, upstream) 换上游时：新上游的准入、账本改道、发给新上游（见下面的“多个上游和熔断”）
 ├── finish                     INTERNAL  账本收尾
 ├── cache_store                INTERNAL  嵌入缓存：结算了的响应写进缓存（没命中、可以缓存时）
-└── adjust                     INTERNAL  修正 TPM 桶（有 TPM 桶时）
+└── adjust                     INTERNAL  修正限流的桶：TPM 按结局修正，嵌入缓存命中退回上游那一层的 1 个 RPM（有要修正的桶时）
 
 GET /v1/calls/{id}             SERVER  调用状态查询
 ├── authenticate
