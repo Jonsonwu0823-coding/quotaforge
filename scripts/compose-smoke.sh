@@ -28,7 +28,9 @@ readonly RETRY_AFTER=25
 readonly SUMMARY=evidence/compose-smoke-summary.txt
 
 work=$(mktemp -d)
-marker="smoke-marker-$(date +%s%N)"
+# 一次运行里不重复的标记。不用 date 的 %N：那是 GNU date 的扩展，BSD 的 date 不认。
+unique() { echo "$(date +%s)-$$-$RANDOM"; }
+marker="smoke-marker-$(unique)"
 failures=0
 mkdir -p evidence
 : >"$SUMMARY"
@@ -56,10 +58,10 @@ trap cleanup EXIT
 post() {
   local name=$1 path=$2 key=$3 body=$4 crid idem=()
   if [ $# -ge 5 ]; then idem=(-H "Idempotency-Key: $5"); fi
-  crid="smoke-$name-$(date +%s%N)"
+  crid="smoke-$name-$(unique)"
   echo "$crid" >"$work/$name.crid"
   curl -sS -o "$work/$name.body" -D "$work/$name.headers" -w '%{http_code}' \
-    -H "Authorization: Bearer $key" -H 'Content-Type: application/json' -H "X-Client-Request-Id: $crid" "${idem[@]}" \
+    -H "Authorization: Bearer $key" -H 'Content-Type: application/json' -H "X-Client-Request-Id: $crid" ${idem[@]+"${idem[@]}"} \
     --data-binary "$body" "$BASE$path" >"$work/$name.status" || echo 000 >"$work/$name.status"
 }
 status_is() { [ "$(cat "$work/$1.status")" = "$2" ]; }
@@ -129,11 +131,14 @@ check "settings: published ports only on 127.0.0.1" \
   [ "$(container '.HostConfig.PortBindings | [.[][].HostIp] | length > 0 and all(. == "127.0.0.1")')" = true ]
 check "settings: image has the healthcheck" [ "$(image .Config.Healthcheck.Test)" = '["CMD","/quotaforge","healthcheck"]' ]
 check "settings: stop_grace_period longer than the ${SHUTDOWN_CAP_SECONDS}s shutdown cap" [ "$grace" -gt "$SHUTDOWN_CAP_SECONDS" ]
-# 只看镜像自己的普通文件；.dockerenv、etc/hosts 这类是 docker create 生成的空文件。
+# 只看镜像自己的非空普通文件；.dockerenv、etc/hosts 这类是 docker create 生成的空文件。
+# 解开再用 find 列：tar -tv 的列序 GNU tar 和 macOS 的 bsdtar 不一样。
 image_files() {
-  local c
+  local c dir
   c=$(docker create "$1")
-  docker export "$c" | tar -tv | awk '$1 ~ /^-/ && $3 > 0 { print $6 }' | sort | tr '\n' ' '
+  dir=$(mktemp -d "$work/image.XXXXXX")
+  docker export "$c" | tar -x -C "$dir"
+  (cd "$dir" && find . -type f -size +0 | sed 's|^\./||' | sort | tr '\n' ' ')
   docker rm "$c" >/dev/null
 }
 check "settings: image holds only /quotaforge and the CA bundle" [ "$(image_files quotaforge:local)" = "etc/ssl/certs/ca-certificates.crt quotaforge " ]
@@ -211,7 +216,7 @@ qfctl account set-limit -name "$ACCOUNT" -limit 1000000 >/dev/null
 
 say "== idempotency key"
 idem_body='{"model":"qs-fake-upstream-v1","messages":[{"role":"user","content":"'"$marker"'-idem"}]}'
-idem_key="smoke-idem-$(date +%s%N)"
+idem_key="smoke-idem-$(unique)"
 settled_before=$(usage_field SETTLED)
 consumed_before=$(usage_field consumed)
 post idem_first /v1/chat/completions "$KEY" "$idem_body" "$idem_key"
@@ -228,7 +233,7 @@ post idem_reused /v1/chat/completions "$KEY" '{"model":"qs-fake-upstream-v1","me
 check "idempotency: same key, different body: 422 idempotency_key_reused" body_ok idem_reused '.error.code == "idempotency_key_reused"'
 check "idempotency: 422 status" status_is idem_reused 422
 # 处理中：先在后台发一个慢请求，等账本里出现这次已经落了发送意图的调用（IN_FLIGHT，确定的事件，不靠睡眠），再用同一个键发。
-slow_key="smoke-idem-slow-$(date +%s%N)"
+slow_key="smoke-idem-slow-$(unique)"
 slow_body='{"model":"fake-slow-5000","messages":[{"role":"user","content":"slow idem"}]}'
 post idem_slow /v1/chat/completions "$KEY" "$slow_body" "$slow_key" &
 idem_slow_pid=$!
@@ -260,7 +265,7 @@ check "lookup: another account's call and a missing one look the same" cmp -s "$
 say "== bounded settlement (the client leaves first)"
 # 客户端 1 秒就走，上游 5 秒才回答：请求已经发出，QF 照常等到回答、结算，只是不写回。客户端拿不到 x-request-id，
 # 按它发的 X-Client-Request-Id 在日志里找到这一行（写完日志才算处理完，确定的事件）。
-bounded_crid="smoke-bounded-$(date +%s%N)"
+bounded_crid="smoke-bounded-$(unique)"
 client_left() {
   ! curl -sS -o /dev/null --max-time 1 -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -H "X-Client-Request-Id: $bounded_crid" \
     --data-binary '{"model":"fake-slow-5000","messages":[{"role":"user","content":"bounded"}]}' "$BASE/v1/chat/completions" 2>/dev/null
@@ -362,7 +367,7 @@ one_line_per_call() {
   local name=$1 id
   id=$(request_id "$name")
   [ "$(call_lines | jq -c --arg id "$id" --arg crid "$(cat "$work/$name.crid")" --argjson st "$(cat "$work/$name.status")" \
-    'select(.request_id == $id and .client_request_id == $crid and .status == $st)' | wc -l)" = 1 ]
+    'select(.request_id == $id and .client_request_id == $crid and .status == $st)' | wc -l)" -eq 1 ]
 }
 for name in "${calls[@]}"; do
   check "log: one line for $name with its client request id and status" one_line_per_call "$name"
@@ -370,15 +375,15 @@ done
 # 重放的行：replay_of 是原来的调用号，没有 usage
 one_replay_line() {
   [ "$(call_lines | jq -c --arg id "$(request_id "$1")" --arg crid "$(cat "$work/$1.crid")" \
-    'select(.replay_of == $id and .client_request_id == $crid and .status == 200 and (has("usage") | not))' | wc -l)" = 1 ]
+    'select(.replay_of == $id and .client_request_id == $crid and .status == 200 and (has("usage") | not))' | wc -l)" -eq 1 ]
 }
 for name in "${replays[@]}"; do
   check "log: one replay line for $name with replay_of and no usage" one_replay_line "$name"
 done
 # 有界结算的那一次另外核对过（没有 status）；被杀的那一次没有日志行。查询的行是 lookup，不算调用。
-check "log: $((${#calls[@]} + ${#replays[@]} + 1)) call lines in total" [ "$(call_lines | wc -l)" = "$((${#calls[@]} + ${#replays[@]} + 1))" ]
-check "log: no line for the killed call" [ "$(call_lines | jq -c --arg id "$killed_id" 'select(.request_id == $id)' | wc -l)" = 0 ]
-check "log: lookups are not call lines" [ "$(jq -R -c 'fromjson? | select(.msg == "lookup")' "$work/qf.log" | wc -l)" = 5 ]
+check "log: $((${#calls[@]} + ${#replays[@]} + 1)) call lines in total" [ "$(call_lines | wc -l)" -eq "$((${#calls[@]} + ${#replays[@]} + 1))" ]
+check "log: no line for the killed call" [ "$(call_lines | jq -c --arg id "$killed_id" 'select(.request_id == $id)' | wc -l)" -eq 0 ]
+check "log: lookups are not call lines" [ "$(jq -R -c 'fromjson? | select(.msg == "lookup")' "$work/qf.log" | wc -l)" -eq 5 ]
 not_in_log() { ! grep -qF -- "$1" "$work/qf.log"; }
 check "log: no QF key" not_in_log "$KEY"
 docker compose logs --no-log-prefix qfctl qf-mysql >"$work/other.log" 2>&1

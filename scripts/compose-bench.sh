@@ -84,17 +84,23 @@ new_key() {
 }
 new_key bench-1 >"$work/acct1.keys"
 for i in $(seq 1 16); do new_key "bench-16-$i" >>"$work/acct16.keys"; done
-[ "$(wc -l <"$work/acct16.keys")" = 16 ] && [ "$(wc -c <"$work/acct1.keys")" = 48 ]
+[ "$(wc -l <"$work/acct16.keys")" -eq 16 ] && [ "$(wc -c <"$work/acct1.keys")" -eq 48 ]
 
+# 机器信息：CPU 型号和内存没有各平台通用的命令，有 /proc 就读 /proc，没有就试 sysctl，都没有写“未知”。
+cpu=$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true)
+[ -n "$cpu" ] || cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 未知)
+mem=$(awk '/^MemTotal/ { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo 2>/dev/null || true)
+[ -n "$mem" ] || mem=$(sysctl -n hw.memsize 2>/dev/null | awk '{ printf "%.1f GiB", $1 / 1073741824 }' || true)
+os=$(sed -n 's/^PRETTY_NAME="\(.*\)"$/\1/p' /etc/os-release 2>/dev/null || true)
 {
   echo "# 压测环境"
   echo
   echo "- 时间（UTC）：$(date -u '+%Y-%m-%d %H:%M')"
   echo "- QF 提交：$(git rev-parse HEAD)$(git diff --quiet HEAD -- . && echo '' || echo '（工作区有改动）')"
   echo "- 命令：\`scripts/compose-bench.sh ${1}\`，QF_BENCH_SCENARIOS='${wanted}' QF_BENCH_RUNS=$RUNS QF_BENCH_WARMUP=$WARMUP QF_BENCH_DURATION=$DURATION QF_BENCH_MYSQL_GLOBALS='${QF_BENCH_MYSQL_GLOBALS:-}'"
-  echo "- CPU：$(awk -F': ' '/^model name/ { print $2; exit }' /proc/cpuinfo)，$(nproc) 个逻辑核"
-  echo "- 内存：$(awk '/^MemTotal/ { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo)"
-  echo "- 系统：$(sed -n 's/^PRETTY_NAME="\(.*\)"$/\1/p' /etc/os-release)，内核 $(uname -r)"
+  echo "- CPU：${cpu}，$(getconf _NPROCESSORS_ONLN) 个逻辑核"
+  echo "- 内存：${mem:-未知}"
+  echo "- 系统：${os:+${os}，}$(uname -sr)"
   echo "- Docker：$(docker version --format '{{.Server.Version}}')，Compose：$(docker compose version --short)"
   echo "- Go（构建镜像）：$(sed -n 's/^FROM golang:\([^@ ]*\).*/\1/p' Dockerfile)"
   echo "- MySQL：$(sql 'SELECT VERSION()')；$(sql "SELECT CONCAT('innodb_flush_log_at_trx_commit=', @@innodb_flush_log_at_trx_commit, ', sync_binlog=', @@sync_binlog, ', log_bin=', @@log_bin, ', innodb_buffer_pool_size=', @@innodb_buffer_pool_size, ', max_connections=', @@max_connections)")"

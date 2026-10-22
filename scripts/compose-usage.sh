@@ -109,7 +109,7 @@ dc --progress plain up -d --build --wait
 say "up --build --wait: $(($(date +%s) - start))s"
 account usage-a
 account usage-b
-check "setup: issued two keys" [ "$(cat "$work"/usage-*.key | wc -c)" = 96 ]
+check "setup: issued two keys" [ "$(cat "$work"/usage-*.key | wc -c)" -eq 96 ]
 check "setup: QF turned usage events on at startup" [ "$(sql 'SELECT enabled_at IS NOT NULL FROM usage_events')" = 1 ]
 check "setup: qf-kafka is the native image, pinned" [ "$(docker inspect -f '{{.Config.Image}}' "$(dc ps -q qf-kafka)")" = apache/kafka-native:4.3.1 ]
 

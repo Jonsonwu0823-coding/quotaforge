@@ -40,7 +40,7 @@
 - `stop_grace_period` 是 40 秒，比 QF 的关闭上限（默认 36 秒）加上冲刷 span 的 2 秒长：`docker compose stop` 时，进行中的请求能处理完、收尾记进账本，之后还没导出的 span 也有时间发完。调大上游超时时，它也要跟着大于这两者之和。
 - `quotaforge`、`qfctl` 的根文件系统只读。只有 `compose.real.yaml` 放开了 `quotaforge` 的，因为 Compose 要把来自环境变量的 secret 复制进容器。
 
-### 冒烟脚本（bash，Linux 和 CI 用）
+### 冒烟脚本（bash，Linux、macOS 和 CI 用）
 
 ```bash
 # 在项目根目录下运行
@@ -184,7 +184,7 @@ base URL 只接受 http 和 https，必须有主机名，不能带账号密码�
   - 没有请求时熔断不会去探测：上游恢复之后，要有一个请求来才会关上。
 - 指标、日志和告警见[可观测](observability.md#多个上游和熔断)。
 
-演示（bash，Linux 和 CI 用；两个假上游，约 2 分钟）：
+演示（bash，Linux、macOS 和 CI 用；两个假上游，约 2 分钟）：
 
 ```bash
 # 在项目根目录下运行
@@ -212,7 +212,7 @@ scripts/compose-failover.sh   # Compose 项目名 qf-failover，叠加 compose.f
 - **清空或恢复数据库时，同时清空缓存的 Redis**（例如 `docker compose restart qf-redis-cache`：它不持久化）。缓存的键按账户编号隔离，账户编号会从 1 重新开始，旧条目可能落到新的同号账户上；`CACHED` 记的原来那次的调用也不在了（`qfctl verify` 会报 `cached`）。
 - 指标和日志见[可观测](observability.md#嵌入缓存)。
 
-演示（bash，Linux 和 CI 用；约 1 分钟，构建镜像另算）：
+演示（bash，Linux、macOS 和 CI 用；约 1 分钟，构建镜像另算）：
 
 ```bash
 # 在项目根目录下运行
@@ -239,7 +239,7 @@ docker compose -f compose.yaml -f compose.cache.yaml -f compose.usage.yaml run -
 
 - **Kafka**：单节点 KRaft（同一个进程既是 broker 也是 controller），镜像 `apache/kafka-native:4.3.1`（GraalVM 编译，起得快、占内存小；Apache 标为实验性的，生产用 JVM 版的 `apache/kafka` 或托管的 Kafka，代码不用改）。主题由 QF 第一次发送时自动创建，分区数和保留期取 broker 的设置：演示的覆盖文件里显式写了 3 个分区（`KAFKA_NUM_PARTITIONS`）、保留 168 小时（`KAFKA_LOG_RETENTION_HOURS`，和 Kafka 的默认值相同）。不做集群、副本和 Schema Registry。
 - **主题的保留期不能短于 outbox 的保留期（7 天）**：短了的话，消费者停了一阵子，还没读到的事件先在 Kafka 里过期，outbox 那一行发出满 7 天之后也被清理，对账就只能把这些调用报成 `LOST`（两边都找不到了）。自己建主题或者用托管的 Kafka 时，主题的 `retention.ms` 至少 7 天。
-- **不依赖它启动**：`quotaforge` 不等 `qf-kafka`。Kafka 没起来、停了，请求照常，事件留在 outbox 里，恢复之后补发。消费者等 `qf-kafka` 健康才起。
+- **不依赖它启动**：`quotaforge` 不等 `qf-kafka`。Kafka 没起来、停了，请求照常，事件留在 outbox 里，恢复之后补发。消费者等 `qf-kafka` 健康才起。native 镜像启动时约 1% 段错误退出（GraalVM 程序跑在 Alpine 加 libgcompat 上，栈在 `getpwuid`），所以 `qf-kafka` 设了 `restart: on-failure:3`：崩了 Docker 再起它，最多 3 次；`docker compose stop` 是手动停，不触发重启。
 - **消费者**：用和 QF 同一份配置文件（整份配置照样要校验通过），连账本的库用只能增删改查的账号；指标在 `QUOTAFORGE_METRICS_ADDR`（演示里是 9465，只在 Compose 的网络里）。没有 HTTP 接口，Compose 里关掉了镜像自带的健康检查。退出时做完手上的一条、提交位点、离开消费组，Compose 默认的 10 秒宽限期够用。
 - **两个镜像都写死版本**：`apache/kafka-native:4.3.1`（broker）和 `apache/kafka:4.3.1`（只当命令行工具，重置位点、读主题）。
 

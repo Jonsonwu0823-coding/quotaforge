@@ -125,8 +125,8 @@ func (g *gateway) observe(c *call, endpoint string, d time.Duration) {
 	if c.stream && c.upstreamStatus >= 200 && c.upstreamStatus < 300 { // 上游开始了流的调用
 		m.Streams.WithLabelValues(streamResult(c), streamClient(c)).Inc()
 	}
-	if c.firstEvent != 0 {
-		m.StreamFirstEvent.WithLabelValues(endpoint).Observe(c.firstEvent.Seconds())
+	if !c.firstEventAt.IsZero() {
+		m.StreamFirstEvent.WithLabelValues(endpoint).Observe(c.firstEventAt.Sub(c.start).Seconds())
 	}
 	if c.outcome == ledger.Settled { // 结算的一定有用量；未知用量的不计成 0，数在 qf_calls_total 里
 		up := c.target.Upstream.Name
@@ -208,8 +208,8 @@ func rootAttrs(c *call, endpoint string) []attribute.KeyValue {
 	if c.stream {
 		attrs = append(attrs, attrStream.Bool(true))
 	}
-	if c.firstEvent != 0 {
-		attrs = append(attrs, attrFirstEventMS.Int64(c.firstEvent.Milliseconds()))
+	if !c.firstEventAt.IsZero() {
+		attrs = append(attrs, attrFirstEventMS.Int64(c.firstEventAt.Sub(c.start).Milliseconds()))
 	}
 	if c.stream && c.writeTimeout { // 属性名带 stream：非流式的写超时只在日志里
 		attrs = append(attrs, attrWriteTimeout.Bool(true))

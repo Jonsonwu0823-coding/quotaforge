@@ -123,7 +123,9 @@ func TestKafkaRoundTrip(t *testing.T) {
 	}
 }
 
-// Kafka 不可用时，一批最多等 sendTimeout 就报错，不会一直挂着（转发的这一轮结束，下一轮再来）。
+// Kafka 不可用时 Send 会报错，不会一直挂着（转发的这一轮结束，下一轮再来）。这里是从没连上过、连接被拒：每次拨号立刻
+// 出错，到期之后的第一次出错就让这一批失败，所以正好在 sendTimeout 左右。broker 在途中不见了时要等下一次元数据刷新，
+// 会更久（见 Producer）。
 func TestSendGivesUpWhenKafkaIsDown(t *testing.T) {
 	p, err := NewProducer([]string{"127.0.0.1:1"}, "qf-test-down")
 	if err != nil {

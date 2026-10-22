@@ -57,7 +57,7 @@ wait_for() {
 }
 key() { cat "$work/stream.key"; }
 chat_body() { echo "{\"model\":\"$1\",\"stream\":${2:-true}${3:+,$3},\"messages\":[{\"role\":\"user\",\"content\":\"$REQ_MARKER\"}]}"; }
-# stream <名字> <请求体> [curl 参数…]：读一个流，每行前面加上到达的毫秒时间戳，存进 $work/<名字>.events；响应头存进 .headers。
+# stream <名字> <请求体> [curl 参数…]：读一个流，每行前面加上到达的时刻（秒），存进 $work/<名字>.events；响应头存进 .headers。
 stream() {
   local name=$1 body=$2
   shift 2
@@ -65,7 +65,7 @@ stream() {
     --data-binary "$body" "$@" "$QF/v1/chat/completions" 2>/dev/null || true; } |
     while IFS= read -r line; do
       line=${line%$'\r'}
-      [ -z "$line" ] || printf '%s %s\n' "$(date +%s%3N)" "$line"
+      [ -z "$line" ] || printf '%s %s\n' "$(date +%s)" "$line"
     done >"$work/$name.events"
 }
 data_lines() { grep -c ' data: ' "$work/$1.events" || true; }
@@ -92,18 +92,18 @@ say "up --build --wait: $(($(date +%s) - start))s"
 qfctl account create -name stream -limit 100000000 >/dev/null
 qfctl key issue -account stream -models qs-fake-upstream-v1,fake-no-usage,fake-stream-slow-300,fake-stream-cut,fake-stream-slow-2500 |
   sed -n 's/^key: //p' >"$work/stream.key"
-check "setup: issued a key" [ "$(wc -c <"$work/stream.key")" = 48 ]
+check "setup: issued a key" [ "$(wc -c <"$work/stream.key")" -eq 48 ]
 
 say "== 1. a normal stream (the client did not ask for usage)"
 stream normal "$(chat_body fake-stream-slow-300)"
 id=$(request_id normal)
 first=$(grep ' data: ' "$work/normal.events" | head -n 1 | cut -d' ' -f1)
 last=$(grep ' data: ' "$work/normal.events" | tail -n 1 | cut -d' ' -f1)
-say "events: $(data_lines normal), first to last: $((last - first)) ms"
+say "events: $(data_lines normal), first to last: $((last - first)) s"
 check "normal: 200 text/event-stream with x-request-id" \
   [ "$(head -n 1 "$work/normal.headers" | tr -d '\r' | cut -d' ' -f2)/$(header normal content-type)/${id:0:3}" = "200/text/event-stream; charset=utf-8/qf-" ]
 check "normal: $CLIENT_EVENTS events, the last is [DONE]" [ "$(data_lines normal)/$(last_data normal)" = "$CLIENT_EVENTS/data: [DONE]" ]
-check "normal: events arrive one by one (first to last >= 2 s; the upstream sends one every 300 ms)" [ $((last - first)) -ge 2000 ]
+check "normal: events arrive one by one (first to last >= 2 s; the upstream sends one every 300 ms)" [ $((last - first)) -ge 2 ]
 check "normal: the usage event QF asked for is not forwarded; the other events keep \"usage\":null" \
   [ "$(grep -c '"choices":\[\]' "$work/normal.events" || true)/$(grep -c '"usage":null' "$work/normal.events")" = "0/12" ]
 wait_for 10 call_is "$id" SETTLED
@@ -166,7 +166,7 @@ plain=$(curl -sS -H "Authorization: Bearer $(key)" -H 'Content-Type: application
   "$QF/v1/chat/completions" | jq -r '[.object, .usage.completion_tokens] | map(tostring) | join("/")')
 check "non-streaming: a JSON answer as before" [ "$plain" = "chat.completion/10" ]
 dc logs --no-log-prefix quotaforge >"$work/qf.log" 2>&1
-check "logs: one call line per stream, all with stream: true" [ "$(jq -c 'select(.msg == "call" and .stream == true)' "$work/qf.log" | wc -l | tr -d ' ')" = 7 ]
+check "logs: one call line per stream, all with stream: true" [ "$(jq -c 'select(.msg == "call" and .stream == true)' "$work/qf.log" | wc -l)" -eq 7 ]
 leaks=0
 for s in "$(key)" Bearer "$REQ_MARKER" "$STREAM_MARKER" test-only-upstream-key; do
   leaks=$((leaks + $(grep -cF -- "$s" "$work/qf.log" || true)))

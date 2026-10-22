@@ -213,17 +213,16 @@ docker compose -f compose.yaml -f compose.observability.yaml -f compose.two.yaml
 
 - QF 的指标端口 9464 和 Jaeger 的 OTLP 端口 4318 都只在 Compose 的网络里。
 - 抓哪些实例由 `deploy/prometheus/targets/` 下挂进去的文件决定：单实例只挂 `quotaforge.json`，两个实例再挂 `quotaforge-b.json`，两种叠法下都没有一直抓不到的目标。两个实例的 span 用资源属性 `service.instance.id`（`quotaforge`、`quotaforge-b`）区分，指标用 Prometheus 的 `instance` 标签区分。
-- 按调用号找 trace（Jaeger 的查询 API v3，回答是 OTLP/JSON）：
+- 按调用号找 trace（Jaeger 的查询 API v3，回答是 OTLP/JSON）。时间窗取固定的宽窗：这个 Jaeger 是演示自己起的，只存内存。
 
 ```bash
 curl -sS -G http://127.0.0.1:16686/api/v3/traces --data-urlencode query.service_name=quotaforge \
   --data-urlencode 'query.attributes={"qf.request_id":"<x-request-id>"}' \
-  --data-urlencode "query.start_time_min=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)" \
-  --data-urlencode "query.start_time_max=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  --data-urlencode query.start_time_min=2000-01-01T00:00:00Z --data-urlencode query.start_time_max=2100-01-01T00:00:00Z
 curl -sS http://127.0.0.1:16686/api/v3/traces/<trace id>
 ```
 
-`scripts/compose-observability.sh`（bash，CI 也跑）起单实例的演示环境，发成功、重放、额度不足、上游不可用、查询、401 几种请求，然后核对：
+`scripts/compose-observability.sh`（bash，Linux、macOS 和 CI 用）起单实例的演示环境，发成功、重放、额度不足、上游不可用、查询、401 几种请求，然后核对：
 
 - 带 `traceparent` 的调用在 Jaeger 里按 trace id 和调用号都查得到，span 的名字和父子关系是上面那棵树，根 span 的父 span 是请求里给的那个；日志行的 `trace_id`、`span_id` 和它相同；401 没有 trace；
 - Prometheus 抓到的计数和发的请求对得上，规则都加载了，`promtool` 检查配置、跑规则的单元测试；

@@ -70,7 +70,7 @@ emb() {
   local extra=()
   if [ $# -ge 5 ]; then extra=(-H "$5"); fi
   curl -sS -o "$work/$1.body" -D "$work/$1.headers" -w '%{http_code}' -H "Authorization: Bearer $(cat "$work/$2.key")" \
-    -H 'Content-Type: application/json' "${extra[@]}" --max-time 40 \
+    -H 'Content-Type: application/json' ${extra[@]+"${extra[@]}"} --max-time 40 \
     --data-binary "{\"model\":\"$3\",\"input\":[\"$REQ_MARKER $4\"],\"dimensions\":4}" \
     "$QF/v1/embeddings" >"$work/$1.status" || echo 000 >"$work/$1.status"
   sent=$((sent + 1))
@@ -115,7 +115,7 @@ start=$(date +%s)
 dc --progress plain up -d --build --wait
 say "up --build --wait: $(($(date +%s) - start))s"
 for a in cache-a cache-b cache-c cache-e; do account "$a" 100000000; done
-check "setup: issued four keys" [ "$(cat "$work"/cache-*.key | wc -c)" = 192 ]
+check "setup: issued four keys" [ "$(cat "$work"/cache-*.key | wc -c)" -eq 192 ]
 check "setup: qf-redis-cache has a memory limit and evicts by LRU" \
   [ "$(rcache config get maxmemory | tail -1)/$(rcache config get maxmemory-policy | tail -1)" = "67108864/allkeys-lru" ]
 check "setup: qf-redis (rate limits) has no memory limit and evicts nothing" \
@@ -203,14 +203,15 @@ say "cache back: the first hit came $(($(date +%s) - start))s after the cache wa
 
 say "== 7. expiry"
 e0=$(embeddings qf-fake-upstream)
-ms() { echo $(($(date +%s%N) / 1000000)); }
+# 毫秒的钟用缓存 Redis 的 TIME（秒和微秒两行）：不靠 GNU date 的 %N，也和条目的过期时间是同一个钟。
+ms() { rcache time | tr -d '\r' | awk 'NR == 1 { s = $1 } NR == 2 { printf "%d\n", s * 1000 + int($1 / 1000) }'; }
 t0=$(ms)
 emb exp1 cache-e cache-emb eight
 keys_of cache-e >"$work/exp.keys"
 ttl=$(rcache pttl "$(head -1 "$work/exp.keys")")
 elapsed=$(($(ms) - t0)) # 从发请求到读出剩余时间：写入时的过期时长在 [剩余, 剩余 + 这段时间] 之间
 say "expiry: the entry expires in ${ttl}ms, read ${elapsed}ms after the request was sent (written with 5000 ms ±10%)"
-ttl_ok() { [ "$(wc -l <"$work/exp.keys" | tr -d ' ')" = 1 ] && [ "$ttl" -le 5500 ] && [ $((ttl + elapsed)) -ge 4500 ]; }
+ttl_ok() { [ "$(wc -l <"$work/exp.keys")" -eq 1 ] && [ "$ttl" -le 5500 ] && [ $((ttl + elapsed)) -ge 4500 ]; }
 check "expiry: one key for the account, written to expire in 4500-5500 ms" ttl_ok
 check "expiry: the entry is gone after its TTL" wait_for 15 no_keys cache-e
 emb exp2 cache-e cache-emb eight
@@ -220,7 +221,7 @@ check "expiry: then a miss that goes upstream again, then a hit" \
 
 say "== 8. logs, cache keys and ledger"
 dc logs --no-log-prefix quotaforge >"$work/qf.log" 2>&1
-check "logs: one call line per request ($sent)" [ "$(jq -c 'select(.msg == "call")' "$work/qf.log" | wc -l | tr -d ' ')" = "$sent" ]
+check "logs: one call line per request ($sent)" [ "$(jq -c 'select(.msg == "call")' "$work/qf.log" | wc -l)" -eq "$sent" ]
 leaks=0
 for s in $(cat "$work"/cache-*.key) Bearer "$REQ_MARKER" test-only-upstream-key "$CACHE_URL" redis://; do
   leaks=$((leaks + $(grep -cF -- "$s" "$work/qf.log" || true)))

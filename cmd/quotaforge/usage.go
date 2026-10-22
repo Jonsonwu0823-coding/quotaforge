@@ -21,8 +21,8 @@ const enableTimeout = 10 * time.Second
 
 // startForwarding 在配置里有 usage_events 时打开用量事件的开关（只开不关），并起转发循环；返回等它停下的函数。
 // 没配时什么都不做：不碰开关、不连消息队列。转发不在请求路径上，消息队列不可用时请求照常，积压留在 outbox。
-// ctx 取消时转发在两批之间停下（正在发的一批最多等 Kafka 5 秒、标记一次账本操作），和 HTTP 排空同时进行，
-// 所以退出的上限不变。
+// ctx 取消时转发在两批之间停下（正在发的一批 Kafka 不可用时 10 秒左右返回，再加标记、放锁各一次账本操作），
+// 和 HTTP 排空同时进行，远小于排空的上限，所以退出的上限不变。
 func startForwarding(ctx context.Context, cfg *config.Config, store *ledger.Store, log *slog.Logger, m *telemetry.Metrics) (wait func(), err error) {
 	ue := cfg.UsageEvents()
 	if ue == nil {

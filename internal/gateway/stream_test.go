@@ -3,10 +3,12 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +27,7 @@ import (
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/config"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/dbtest"
 	"github.com/Jonsonwu0823-coding/quotaforge/internal/ledger"
+	"github.com/Jonsonwu0823-coding/quotaforge/internal/telemetry"
 )
 
 // 流式的测试不靠睡眠判对错：等确定的事件（假上游已经发出第 n 个事件、客户端已经读到第 n 个事件、日志行出现），
@@ -886,7 +889,8 @@ func TestStreamTelemetry(t *testing.T) {
 		t.Fatalf("root attributes %v", root.Attributes())
 	}
 	up := children[slices.IndexFunc(children, func(c sdktrace.ReadOnlySpan) bool { return c.Name() == "upstream" })]
-	if d := up.EndTime().Sub(up.StartTime()); d < chatTimeout {
+	// 两个时间戳各取一次时钟，粗的时钟（约 1 毫秒一跳）上相减可能比超时短不到一跳：留 2 毫秒。
+	if d := up.EndTime().Sub(up.StartTime()); d < chatTimeout-2*time.Millisecond {
 		t.Fatalf("the upstream span lasted %v, shorter than the stream", d)
 	}
 	m := h.metrics
@@ -902,6 +906,37 @@ func TestStreamTelemetry(t *testing.T) {
 		if !strings.Contains(text, series+"\n") {
 			t.Errorf("/metrics lacks %s", series)
 		}
+	}
+}
+
+// 第一个事件和调用开始落在单调时钟的同一跳里（时长为 0）：照样算收到了，指标、根 span 的属性、日志字段都记 0。
+func TestStreamFirstEventAtTheStart(t *testing.T) {
+	m := telemetry.NewMetrics(func() sql.DBStats { return sql.DBStats{} })
+	g := &gateway{tel: telemetry.Disabled(m)}
+	start := time.Now()
+	c := &call{start: start, stream: true, firstEventAt: start}
+	g.observe(c, "chat", 0)
+	if n := testutil.CollectAndCount(m.StreamFirstEvent); n != 1 {
+		t.Errorf("qf_stream_first_event_seconds has %d series, want 1", n)
+	}
+	if attrs := rootAttrs(c, "chat"); !slices.Contains(attrs, attrFirstEventMS.Int64(0)) {
+		t.Errorf("root attributes %v lack qf.stream.first_event_ms=0", attrs)
+	}
+	if attrs := clientLogAttrs(nil, c); !slices.ContainsFunc(attrs, func(a slog.Attr) bool { return a.Equal(slog.Int64("first_event_ms", 0)) }) {
+		t.Errorf("log attributes %v lack first_event_ms=0", attrs)
+	}
+}
+
+// first_event_ms 是第一个事件的时刻，不被后面的事件覆盖：stream-quick 每个事件之前等 20 毫秒，第一个事件之后
+// 至少还有 12 个间隔（240 毫秒）才结束，所以整个调用的时长比 first_event_ms 至少长 200 毫秒。
+func TestStreamFirstEventIsTheFirst(t *testing.T) {
+	h := newHarness(t)
+	s := h.openStream(t, clientKey, streamOf("stream-quick"))
+	s.rest(t)
+	line := h.logLine(t, s.resp.Header.Get("x-request-id"))
+	first, total := line["first_event_ms"].(float64), line["duration_ms"].(float64)
+	if total-first < 200 {
+		t.Fatalf("first_event_ms %v, duration_ms %v: the first event's time was overwritten by a later one", first, total)
 	}
 }
 

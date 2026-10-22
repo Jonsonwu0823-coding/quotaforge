@@ -123,6 +123,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Shellcheck
         run: shellcheck scripts/*.sh deploy/mysql-init.sh
+      # macOS 自带的 bash 3.2 在 UTF-8 下把 0x80 以上的字节当成字母：$x 后面紧跟中文或全角标点时，那个字节被算进变量名
+      # （set -u 下报 unbound variable）。这样的地方要写成 ${x}。注释行不查。
+      - name: No non-ASCII byte right after a $name
+        run: |
+          if LC_ALL=C grep -nP '^(?![ \t]*#).*\$[A-Za-z_][A-Za-z0-9_]*[\x80-\xff]' scripts/*.sh deploy/mysql-init.sh; then
+            echo 'a non-ASCII byte right after $name: write ${name} (macOS bash 3.2 reads the byte as part of the name)' >&2
+            exit 1
+          fi
       - name: Standalone smoke
         run: scripts/compose-smoke.sh
       - name: qs-fake override with a stand-in upstream

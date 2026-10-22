@@ -14,7 +14,7 @@
 #      没有出错（也就没有 1213）。两个实例不是同时起来的，每一轮最多做 3 次，“两边都动过”3 次里有一次成立即可。
 # 每项后面都 qfctl verify。任何一项失败都以非 0 退出。
 # 用自己的 Compose 项目名 qf-two：开头和结尾的 down -v 只拆自己的项目。8080、8081 被占就不跑。
-# 时间范围只用 Redis TIME；等待事件用 wait_for 轮询，不靠睡眠的长短判对错。
+# 时间范围只用 Redis TIME 和 Docker 记的时刻，不用宿主机的钟；等待事件用 wait_for 轮询，不靠睡眠的长短判对错。
 # 摘要写到 evidence/compose-two-instances-summary.txt：只有检查结果，没有 Key、密码和正文。
 # jq、awk 的过滤式写在单引号里正是为了不让 shell 展开。
 # shellcheck disable=SC2016
@@ -68,9 +68,11 @@ new_account() {
   shift 2
   qfctl account create -name "$name" -limit "$limit" >/dev/null
   qfctl key issue -account "$name" -models qs-fake-upstream-v1,fake-slow-1000,fake-billed-hang "$@" | sed -n 's/^key: //p' >"$work/$name.key"
-  [ "$(wc -c <"$work/$name.key")" = 48 ] # 47 个字符加换行
+  [ "$(wc -c <"$work/$name.key")" -eq 48 ] # 47 个字符加换行
 }
 verify_ok() { [ "$(qfctl verify)" = "ledger ok" ]; }
+# 一次运行里不重复的标记。不用 date 的 %N：那是 GNU date 的扩展，BSD 的 date 不认。
+unique() { echo "$(date +%s)-$$-$RANDOM"; }
 # 原始数据的列：1 seq，2 start_us，3 target，4 status，5 code，6 latency_us，7 warmup，8 request_id，9 replayed，10 retry_after，11 client_error
 rows() { tail -n +3 "$1"; }
 # count <文件> [awk 的 -v 参数…] <条件>：满足条件的行数
@@ -96,7 +98,7 @@ post() {
   local name=$1 base=$2 keyfile=$3 body=$4 idem=()
   if [ $# -ge 5 ]; then idem=(-H "Idempotency-Key: $5"); fi
   curl -sS -o "$work/$name.body" -D "$work/$name.headers" -w '%{http_code}' -H "Authorization: Bearer $(cat "$keyfile")" \
-    -H 'Content-Type: application/json' "${idem[@]}" --data-binary "$body" "$base/v1/chat/completions" >"$work/$name.status" ||
+    -H 'Content-Type: application/json' ${idem[@]+"${idem[@]}"} --data-binary "$body" "$base/v1/chat/completions" >"$work/$name.status" ||
     echo 000 >"$work/$name.status"
 }
 # answered <名字> <状态码> <error.code>
@@ -145,7 +147,7 @@ check "overspend: qfctl verify passes" verify_ok
 
 say "== 2. the same Idempotency-Key on both instances"
 new_account two-idem 10000000
-idem_key="two-same-$(date +%s%N)"
+idem_key="two-same-$(unique)"
 idem_body='{"model":"fake-slow-1000","messages":[{"role":"user","content":"same key"}]}'
 bill_before=$(fake_bill | wc -l)
 bench burst -target "$A" -target "$B" -body "$idem_body" -n 20 -idem-key "$idem_key" <"$work/two-idem.key" >"$work/idem.csv"
@@ -154,20 +156,20 @@ check "same key: exactly one request executed" [ "$(count "$work/idem.csv" '$4 =
 check "same key: the others are 409 idempotency_in_progress or replays of that call" \
   [ "$(count "$work/idem.csv" -v id="$first_id" '($4 == 409 && $5 == "idempotency_in_progress") || ($4 == 200 && $9 == 1 && $8 == id)')" = 19 ]
 say "same key: $(count "$work/idem.csv" '$4 == 409') in progress, $(count "$work/idem.csv" '$9 == 1') replays"
-check "same key: the upstream billed exactly one call" \
-  [ "$(fake_bill | wc -l)/$(fake_bill | awk -F, -v id="$first_id" '$1 == id' | wc -l)" = "$((bill_before + 1))/1" ]
+billed_once() { [ "$(fake_bill | wc -l)" -eq $((bill_before + 1)) ] && [ "$(fake_bill | awk -F, -v id="$first_id" '$1 == id' | wc -l)" -eq 1 ]; }
+check "same key: the upstream billed exactly one call" billed_once
 check "same key: the ledger has one call for the key" \
   [ "$(sql -e "SELECT COUNT(*) FROM calls c JOIN accounts a ON a.id = c.account_id WHERE a.name = 'two-idem' AND c.idempotency_key = '$idem_key'")" = 1 ]
 bench burst -target "$B" -body "$idem_body" -n 1 -idem-key "$idem_key" <"$work/two-idem.key" >"$work/idem-after.csv"
 check "same key: afterwards it is a replay of the same call" \
   [ "$(count "$work/idem-after.csv" -v id="$first_id" '$4 == 200 && $9 == 1 && $8 == id')" = 1 ]
-diff_key="two-diff-$(date +%s%N)"
+diff_key="two-diff-$(unique)"
 bill_before=$(fake_bill | wc -l)
 bench burst -target "$A" -target "$B" -body "$idem_body" -body '{"model":"fake-slow-1000","messages":[{"role":"user","content":"other body"}]}' \
   -n 2 -idem-key "$diff_key" <"$work/two-idem.key" >"$work/diff.csv"
 check "same key, different bodies: one 200 and one 422 idempotency_key_reused" \
   [ "$(count "$work/diff.csv" '$4 == 200')/$(count "$work/diff.csv" '$4 == 422 && $5 == "idempotency_key_reused"')" = 1/1 ]
-check "same key, different bodies: the upstream billed one call" [ "$(fake_bill | wc -l)" = $((bill_before + 1)) ]
+check "same key, different bodies: the upstream billed one call" [ "$(fake_bill | wc -l)" -eq $((bill_before + 1)) ]
 check "same key: qfctl verify passes" verify_ok
 
 say "== 3. a shared rate limit"
@@ -190,7 +192,7 @@ check "rate: qfctl verify passes" verify_ok
 
 say "== 4. kill one instance, the other takes over"
 new_account two-kill 10000000
-kill_key="two-kill-$(date +%s%N)"
+kill_key="two-kill-$(unique)"
 kill_body='{"model":"fake-billed-hang","messages":[{"role":"user","content":"kill A"}]}'
 rows_before=$(fake_bill | wc -l)
 post killed "$HOST_A" "$work/two-kill.key" "$kill_body" "$kill_key" &
@@ -242,14 +244,18 @@ INSERT INTO accounts (name, created_at) WITH RECURSIVE s(n) AS (SELECT 0 UNION A
 INSERT INTO budgets (account_id, limit_tokens, updated_at) SELECT id, 0, UTC_TIMESTAMP(6) FROM accounts WHERE name LIKE 'two-race-p-%';
 SQL
 background_sum() { jq -R -s --arg f "$2" '[split("\n")[] | fromjson? | select(.msg == "background") | .[$f]] | add // 0' "$1"; }
-# race_start <日志名> <SQL>：停两个实例，执行 SQL，同时启动；之后两个实例的日志从启动前一刻（纳秒）开始取
+# race_start <日志名> <SQL>：停两个实例，执行 SQL，同时启动；之后每个实例的日志从它这次停下的时刻开始取：
+# Docker 记的 State.FinishedAt，纳秒，和日志的时间戳同一个钟。
 race_start() {
   dc stop quotaforge quotaforge-b >/dev/null 2>&1
+  since_a=$(docker inspect -f '{{.State.FinishedAt}}' "$cid_a") since_b=$(docker inspect -f '{{.State.FinishedAt}}' "$cid_b")
   sql <<<"$2"
-  race_since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
   dc up -d --no-recreate --wait quotaforge quotaforge-b >/dev/null 2>&1
 }
-race_logs() { for svc in quotaforge quotaforge-b; do dc logs --no-log-prefix --since "$race_since" "$svc" >"$work/$svc.$1.log"; done; }
+race_logs() {
+  dc logs --no-log-prefix --since "$since_a" quotaforge >"$work/quotaforge.$1.log"
+  dc logs --no-log-prefix --since "$since_b" quotaforge-b >"$work/quotaforge-b.$1.log"
+}
 # reclaimed <调用号前缀>、purged <键前缀>：这一批都处理完了
 reclaimed() { [ "$(sql -e "SELECT COUNT(*) FROM calls WHERE id LIKE '$1%' AND status IN ('RESERVED', 'IN_FLIGHT')")" = 0 ]; }
 purged() { [ "$(sql -e "SELECT COUNT(*) FROM idempotency_keys WHERE idem_key LIKE '$1%'")" = 0 ]; }

@@ -65,7 +65,7 @@ wait_for() {
 new_key() {
   qfctl account create -name "$1" -limit "$2" >/dev/null
   qfctl key issue -account "$1" -models qs-fake-upstream-v1 | sed -n 's/^key: //p' >"$work/$1.key"
-  [ "$(wc -c <"$work/$1.key")" = 48 ] # 47 个字符加换行
+  [ "$(wc -c <"$work/$1.key")" -eq 48 ] # 47 个字符加换行
 }
 # send <名字> <Key 文件> <路径> <请求体> [请求头…]：响应体、响应头、状态码存进 $work/<名字>.*
 send() {
@@ -74,7 +74,7 @@ send() {
   local headers=()
   for h in "$@"; do headers+=(-H "$h"); done
   curl -sS -o "$work/$name.body" -D "$work/$name.headers" -w '%{http_code}' -H "Authorization: Bearer $(cat "$keyfile")" \
-    -H 'Content-Type: application/json' "${headers[@]}" ${body:+--data-binary "$body"} "$QF$path" >"$work/$name.status" ||
+    -H 'Content-Type: application/json' ${headers[@]+"${headers[@]}"} ${body:+--data-binary "$body"} "$QF$path" >"$work/$name.status" ||
     echo 000 >"$work/$name.status"
 }
 status_of() { cat "$work/$1.status"; }
@@ -87,11 +87,11 @@ jaeger_trace() {
   curl -sS -o "$work/trace-$1.json" "$JAEGER/api/v3/traces/$1" &&
     [ "$(jq '[.result.resourceSpans[]?.scopeSpans[].spans[]] | length' "$work/trace-$1.json" 2>/dev/null)" -gt 0 ]
 }
-# jaeger_search <属性 JSON>：最近一小时里 quotaforge 的、带这些属性的 trace
+# jaeger_search <属性 JSON>：quotaforge 的、带这些属性的 trace。qf-jaeger 是这次运行自己起的、只在内存里存，
+# 里面只有这次的数据，所以时间窗取一个固定的宽窗，不用按当前时间算（BSD 的 date 不认 -d）。
 jaeger_search() {
   curl -sS -G "$JAEGER/api/v3/traces" --data-urlencode query.service_name=quotaforge --data-urlencode "query.attributes=$1" \
-    --data-urlencode "query.start_time_min=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)" \
-    --data-urlencode "query.start_time_max=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)" \
+    --data-urlencode query.start_time_min=2000-01-01T00:00:00Z --data-urlencode query.start_time_max=2100-01-01T00:00:00Z \
     --data-urlencode query.num_traces=1000
 }
 promql() { curl -sS -G "$PROM/api/v1/query" --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "none"'; }

@@ -61,10 +61,10 @@ type call struct {
 	clientDisconnected bool // 写回之前或写回时（流式：流结束之前）客户端已经断开
 	writeTimeout       bool // 客户端不读，写超过了期限（也算断开；见 writeTimeout）
 
-	stream     bool          // chat 带 stream: true
-	wantsUsage bool          // 流式：客户端自己写了 include_usage: true，usage 那个事件照转发
-	streamed   bool          // 流式：响应头已经写给客户端
-	firstEvent time.Duration // 流式：从调用开始到收到上游第一个事件；没收到时是 0
+	stream       bool      // chat 带 stream: true
+	wantsUsage   bool      // 流式：客户端自己写了 include_usage: true，usage 那个事件照转发
+	streamed     bool      // 流式：响应头已经写给客户端
+	firstEventAt time.Time // 流式：收到上游第一个事件的时刻；零值是没收到（和 start 相减可能是 0，所以不记时长）
 
 	upstreamCalled     bool
 	upstreamDuration   time.Duration // 等上游的时间：发请求到读完正文（流式是整个流）
@@ -245,8 +245,8 @@ func clientLogAttrs(attrs []slog.Attr, c *call) []slog.Attr {
 	if c.stream {
 		attrs = append(attrs, slog.Bool("stream", true))
 	}
-	if c.firstEvent != 0 {
-		attrs = append(attrs, slog.Int64("first_event_ms", c.firstEvent.Milliseconds()))
+	if !c.firstEventAt.IsZero() {
+		attrs = append(attrs, slog.Int64("first_event_ms", c.firstEventAt.Sub(c.start).Milliseconds()))
 	}
 	if c.writeTimeout {
 		attrs = append(attrs, slog.Bool("write_timeout", true))

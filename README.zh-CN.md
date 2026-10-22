@@ -121,7 +121,7 @@ internal/
   fakeupstream/   假上游的实现
   dbtest/         测试共用的数据库、Redis、Kafka 辅助函数
 deploy/           Compose 用的配置、MySQL 初始化脚本、Prometheus 规则、仅测试的数据库密码
-scripts/          演示和检查脚本（bash），真实上游的 PowerShell 脚本，联调的核对脚本（Python）
+scripts/          演示和检查脚本（bash；Linux 和 macOS），真实上游的 PowerShell 脚本，联调的核对脚本（Python）
 bench/            压测的结果和原始数据
 docs/             文档（中文）
 compose*.yaml     Compose 的主文件和覆盖文件

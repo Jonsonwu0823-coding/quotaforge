@@ -71,7 +71,7 @@ $dbDir = Join-Path $tempDir 'db'
 $envNames = @('QF_UPSTREAM_API_KEY', 'QF_UPSTREAM_BASE_URL', 'QF_DB_SECRETS_DIR', 'QF_REAL_CONFIG', 'COMPOSE_IGNORE_ORPHANS')
 $account = 'queryshield'
 $project = 'quotaforge' # compose.yaml 里的 name:，所有 docker compose 命令靠它找到这套栈
-# 限流限额（每分钟）：远高于演示的用量（3 分钟 54 次请求，单次聊天的估算最多约 17,300 tokens）。
+# 限流限额（每分钟）：远高于演示的用量（2026-10-15 那次真实演示一共 56 次调用，单次聊天的估算最多约 17,300 tokens）。
 $accountRate = @('-rpm', '600', '-tpm', '2000000')
 $keyRate = @('-rpm', '300', '-tpm', '1000000')
 
@@ -219,7 +219,9 @@ function Find-Python {
     throw '找不到 Python 3.10 或更新的版本（python、python3、py 都不能用）。请先安装 Python；核对脚本只用标准库，不需要装包。'
 }
 
-# 发一次流式聊天：curl.exe 边收边写进 $tempDir 下的文件（Invoke-WebRequest 会攒到最后），返回 x-request-id 和流的原文。
+# 发一次流式聊天：curl 边收边写进 $tempDir 下的文件（Invoke-WebRequest 会攒到最后），返回 x-request-id 和流的原文。
+# 找真正的 curl 程序，不按系统判断：Windows 上是 curl.exe（5.1 里叫 curl 的是 Invoke-WebRequest 的别名，
+# -CommandType Application 把它排除），macOS、Linux 上是 curl。
 function Invoke-QFStream {
     param([string]$Key, [string]$Name, [string]$Body, [string[]]$Extra = @())
     $bodyFile = Join-Path $tempDir "$Name.json"
@@ -227,7 +229,9 @@ function Invoke-QFStream {
     $headerFile = Join-Path $tempDir "$Name.headers"
     [IO.File]::WriteAllText($bodyFile, $Body)
     # 只用 -s（不带 -S）：读 2 秒就断开那一次 curl 会以 28 退出，不往 stderr 写（5.1 下原生命令的 stderr 会变成 PowerShell 错误）。
-    & curl.exe -s -N -o $outFile -D $headerFile -H "Authorization: Bearer $Key" -H 'Content-Type: application/json' `
+    $curl = Get-Command curl.exe, curl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $curl) { throw '找不到 curl 程序：-Stream 要用它读流。' }
+    & $curl.Source -s -N -o $outFile -D $headerFile -H "Authorization: Bearer $Key" -H 'Content-Type: application/json' `
         --data-binary "@$bodyFile" @Extra 'http://127.0.0.1:8080/v1/chat/completions'
     $id = (Get-Content $headerFile | Where-Object { $_ -match '^x-request-id:' } | Select-Object -First 1) -replace '^x-request-id:\s*', ''
     $raw = if (Test-Path $outFile) { [IO.File]::ReadAllText($outFile) } else { '' }

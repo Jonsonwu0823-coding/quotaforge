@@ -16,6 +16,9 @@ services:
   # （和 outbox 的保留期一样，不能更短，见 docs/operations.md）。数据在容器里，stop、start 之后还在，down -v 时删掉。
   qf-kafka:
     image: apache/kafka-native:4.3.1
+    # native 镜像是 GraalVM 编出的 glibc 程序，跑在 Alpine 加 libgcompat 上，启动时约 1% 段错误退出（栈在 getpwuid）。
+    # 崩了 Docker 再起它，最多 3 次；docker compose stop 是手动停，不触发重启；手动 start 把计数清零。
+    restart: on-failure:3
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller

@@ -91,8 +91,8 @@ func (s *stream) pump(upCtx context.Context, body io.Reader) (*ledger.Usage, *ap
 		if err != nil {
 			return nil, streamReadError(upCtx, err)
 		}
-		if s.c.firstEvent == 0 {
-			s.c.firstEvent = time.Since(s.c.start)
+		if s.c.firstEventAt.IsZero() {
+			s.c.firstEventAt = time.Now()
 		}
 		ev, ok := s.c.recordEvent(raw)
 		if !ok {

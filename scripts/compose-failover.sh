@@ -110,7 +110,7 @@ log_lines() {
   dc logs --no-log-prefix quotaforge 2>/dev/null |
     jq -c --rawfile ids "$work/ids" 'select(.msg == "call" and (.request_id as $id | $ids | split("\n") | any(. == $id)))'
 }
-logged() { [ "$(log_lines "$1" "$2" | wc -l | tr -d ' ')" = "$2" ]; }
+logged() { [ "$(log_lines "$1" "$2" | wc -l)" -eq "$2" ]; }
 # log_of <前缀> <个数> <jq 过滤式>：这一批每个调用的日志行套上过滤式，去重计数。
 log_of() {
   wait_for 10 logged "$1" "$2" || true
@@ -134,7 +134,7 @@ dc --progress plain up -d --build --wait
 say "up --build --wait: $(($(date +%s) - start))s"
 qfctl account create -name failover -limit 100000000 >/dev/null
 qfctl key issue -account failover -models split,primary-b | sed -n 's/^key: //p' >"$work/demo.key"
-check "setup: issued a key" [ "$(wc -c <"$work/demo.key")" = 48 ]
+check "setup: issued a key" [ "$(wc -c <"$work/demo.key")" -eq 48 ]
 check "setup: both circuits start closed" [ "$(metric 'qf_upstream_circuit_state{upstream="fake-a"}')/$(metric 'qf_upstream_circuit_state{upstream="fake-b"}')" = 0/0 ]
 
 say "== 1. weights: split is 9:1 over fake-a and fake-b"
@@ -211,7 +211,7 @@ check "recovery: split goes to both again (100 together, each > 0)" [ "$(statuse
 
 say "== 6. logs and ledger"
 dc logs --no-log-prefix quotaforge >"$work/qf.log" 2>&1
-check "logs: one call line per request ($sent)" [ "$(jq -c 'select(.msg == "call")' "$work/qf.log" | wc -l | tr -d ' ')" = "$sent" ]
+check "logs: one call line per request ($sent)" [ "$(jq -c 'select(.msg == "call")' "$work/qf.log" | wc -l)" -eq "$sent" ]
 leaks=0
 for s in "$(cat "$work/demo.key")" Bearer "$REQ_MARKER" test-only-upstream-key; do
   leaks=$((leaks + $(grep -cF -- "$s" "$work/qf.log" || true)))

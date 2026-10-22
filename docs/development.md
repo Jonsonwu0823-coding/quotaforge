@@ -13,6 +13,14 @@ Go 1.27.1。直接依赖：
 
 - Linux（在项目根目录下运行）：`go vet ./... && go test -race ./...`
 - Windows（PowerShell，在项目根目录下运行）：`go vet ./...; go test -race ./...`（`-race` 需要 cgo 和 C 编译器）
+- macOS：命令和 Linux 一样；`-race` 不需要 C 编译器。
+
+macOS 上的其它几件：
+
+- `scripts/` 下的演示脚本用 macOS 自带的 bash（3.2）和命令行工具就能跑，先装 Docker Desktop（Apple 芯片版）和 `jq`。
+- QS 联调（`compose-qs-e2e.sh`）的核对脚本要 Python 3.10 以上；macOS 自带的 `python3` 是 3.9，不够，要另装。
+- 写脚本时，变量后面紧跟中文或全角标点要写成 `${变量}`：macOS 自带的 bash 3.2 在 UTF-8 下会把后面那个字的第一个字节算进变量名；CI 里有一步检查，`scripts/` 下的脚本出现这种写法就失败。
+- 真实上游的 `compose-real.ps1` 要 PowerShell 7。它只在 Linux 上的 PowerShell 7 里用假上游跑过，没在 macOS 上跑过，也没在 PowerShell 7 里对真实上游跑过。
 
 要 MySQL 的测试从两个环境变量读连接串（go-sql-driver 的格式）：
 
@@ -21,10 +29,10 @@ Go 1.27.1。直接依赖：
 | `QUOTAFORGE_TEST_MYSQL_MIGRATE_DSN` | 能建表（迁移、改坏数据做校验测试） |
 | `QUOTAFORGE_TEST_MYSQL_DSN` | 只能增删改查（QF 服务用的那种） |
 
-Redis、Kafka 的测试从另两个环境变量读地址：`QUOTAFORGE_TEST_REDIS_ADDR`（`主机:端口`，测试只用自己的键前缀，不清空库）、`QUOTAFORGE_TEST_KAFKA_ADDR`（`主机:端口`，每个测试用自己的主题和消费组，主题自动创建）。本机起一个单节点的 Kafka：
+Redis、Kafka 的测试从另两个环境变量读地址：`QUOTAFORGE_TEST_REDIS_ADDR`（`主机:端口`，测试只用自己的键前缀，不清空库）、`QUOTAFORGE_TEST_KAFKA_ADDR`（`主机:端口`，每个测试用自己的主题和消费组，主题自动创建）。本机起一个单节点的 Kafka（native 镜像启动时偶发段错误，`--restart on-failure:3` 让它自己起来）：
 
 ```bash
-docker run -d --name qf-test-kafka -p 127.0.0.1:19092:9092 -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+docker run -d --name qf-test-kafka --restart on-failure:3 -p 127.0.0.1:19092:9092 -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
   -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:19092 \
   -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
   -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \

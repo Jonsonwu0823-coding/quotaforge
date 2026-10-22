@@ -16,12 +16,13 @@
 # qfctl 的 stderr 写进临时目录，脚本失败时打印出来（Key 在 stdout，不在 stderr）。
 set -euo pipefail
 export MSYS_NO_PATHCONV=1 # Git Bash：不要把传给 docker 的容器内路径改写成 Windows 路径
-# 用第一个真能运行的：Windows 上的 python3 可能只是应用商店的占位程序（打印 Python was not found，退出 49）。
+# 用第一个真能运行、3.10 以上的（核对脚本要 3.10）：Windows 上的 python3 可能只是应用商店的占位程序
+# （打印 Python was not found，退出 49）；macOS 自带的 python3 是 3.9。
 PY=
 for candidate in python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys' >/dev/null 2>&1; then PY=$candidate; break; fi
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then PY=$candidate; break; fi
 done
-[ -n "$PY" ] || { echo "FAIL 找不到能运行的 Python（python3、python 都不行；Windows 上的 python3 可能只是应用商店的占位程序）" >&2; exit 1; }
+[ -n "$PY" ] || { echo "FAIL 找不到 Python 3.10 或更新的版本（python3、python 都不行；Windows 上的 python3 可能只是应用商店的占位程序）" >&2; exit 1; }
 # Windows 的 docker、git、python 看不懂 Git Bash 的 /tmp、/c/... 路径：有 cygpath 就转成 C:/... 写法。
 native() { cygpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
 QS_DIR=$(native "$(cd "${1:-${QS_DIR:?用法：$0 <QS 公开仓库的本地目录>}}" && pwd)")
@@ -188,7 +189,7 @@ checker() {
   "$PY" scripts/check_qs_runs.py --e2e --project "$QF_PROJECT" --account "$account" --jaeger "$JAEGER" "$@" >"$out" || rc=$?
   [ "$rc" != 2 ] || die "check_qs_runs.py 跑不了（原因见上面的 error）"
   # 没跑完（例如抛了没接住的异常，退出码 1、什么都没打印）也要停下，不能让整段核对悄悄消失
-  tail -n 1 "$out" | grep -qE '^check_qs_runs: [0-9]+ failed$' || die "check_qs_runs.py 没有跑完（退出码 $rc）"
+  tail -n 1 "$out" | grep -qE '^check_qs_runs: [0-9]+ failed$' || die "check_qs_runs.py 没有跑完（退出码 ${rc}）"
 }
 verify() {
   qfctl verify >"$work/verify.txt" || true
@@ -377,7 +378,7 @@ scenario_two() {
 
 echo "== 开始前：检查固定提交，以及有没有别人的东西挡路"
 qs_head=$(git -C "$QS_DIR" rev-parse HEAD 2>/dev/null) || die "读不到 QS 目录 $QS_DIR 的提交号（不是 git 检出？）"
-[ "$qs_head" = "$QS_COMMIT" ] || die "QS 目录在提交 $qs_head，不是固定提交 $QS_COMMIT"
+[ "$qs_head" = "$QS_COMMIT" ] || die "QS 目录在提交 ${qs_head}，不是固定提交 $QS_COMMIT"
 [ -z "$(git -C "$QS_DIR" status --porcelain)" ] || die "QS 目录有改动或多余的文件，请用干净的检出"
 for project in "$QF_PROJECT" "$QS_PROJECT"; do
   [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" ] || die "同名项目 $project 已有容器"

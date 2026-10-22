@@ -16,7 +16,8 @@ const (
 	Group = "quotaforge-usage-daily"
 )
 
-// sendTimeout 是一批事件等 Kafka 确认的上限：Kafka 不可用时，转发等这么久就放弃这一轮，下一轮再来。
+// sendTimeout 是一批事件开始可以被取消的时刻：到点之后 franz-go 在下一次元数据刷新或连接出错时让这一批失败，所以 Kafka
+// 不可用时一轮实际在 5 到 10 秒左右返回（见 Producer），转发放弃这一轮，下一轮再来。
 const sendTimeout = 5 * time.Second
 
 // pollMax 是消费者一次最多取的消息数。
@@ -26,9 +27,11 @@ const pollMax = 100
 // 确认级别是 all，生产者幂等（franz-go 的默认）：客户端自己的重试不会在分区里写出重复。但这只是让重复少一些，
 // 正确性靠消费者去重：发成功之后、标记之前死了照样会重发。
 //
-// 等待有上限（sendTimeout）：franz-go 默认不肯取消已经发给 broker、还没回音的幂等请求（取消了可能重复），broker 在
-// 请求途中停掉时 ProduceSync 会一直等，转发就卡住了、积压的指标也不更新。AllowIdempotentProduceCancellation 让 ctx
-// 到期时照样失败：代价是这一批下一轮重发时 Kafka 里可能多一份，由消费者去重。
+// 等待有上限：franz-go 默认不肯取消已经发给 broker、还没回音的幂等请求（取消了可能重复），broker 在请求途中停掉时
+// ProduceSync 会一直等，转发就卡住了、积压的指标也不更新。AllowIdempotentProduceCancellation 让 ctx 到期（sendTimeout）
+// 的批次可以失败：代价是这一批下一轮重发时 Kafka 里可能多一份，由消费者去重。失败不在到期的那一刻，而在之后 franz-go
+// 下一次元数据刷新（两次之间至少 5 秒）或连接出错的时候。实测 broker 停在两次发送之间（连接被拒）时 5.8 到 7.0 秒返回；
+// broker 在请求途中停掉、名字也解析不到（Compose 里停掉 qf-kafka）时，从停到这一轮报错 8.8 到 10.2 秒。
 // 主题不存在时自动创建（分区数和保留期由 broker 的默认值定）。
 type Producer struct{ cl *kgo.Client }
 
@@ -42,7 +45,7 @@ func NewProducer(brokers []string, topic string) (*Producer, error) {
 	return &Producer{cl: cl}, nil
 }
 
-// Send 同步发一批事件，都确认了才返回 nil；最多等 sendTimeout。
+// Send 同步发一批事件，都确认了才返回 nil；sendTimeout 之后可以被取消，Kafka 不可用时 5 到 10 秒左右返回。
 func (p *Producer) Send(ctx context.Context, events []ledger.UsageEvent) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	defer cancel()

@@ -29,7 +29,7 @@ QF_KEY=$(docker compose run --rm -T --no-deps qfctl key issue -account queryshie
 
 QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个场景：正常、跨服务 trace、额度耗尽、上游超时、两个实例。每个场景都用 QF 的账本、调用日志和 Jaeger 核对。不调用任何付费模型。
 
-- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `0ec8d76d09d8431f12afdff4083ee2666e6c9515`，目录任意；Docker、Python 3。
+- **前提**：QS 公开仓库（`https://github.com/Jonsonwu0823-coding/queryshield`）干净地检出在提交 `0ec8d76d09d8431f12afdff4083ee2666e6c9515`，目录任意；Docker、Python 3.10 起。
   `git clone https://github.com/Jonsonwu0823-coding/queryshield.git ../queryshield && git -C ../queryshield checkout 0ec8d76d09d8431f12afdff4083ee2666e6c9515`
 - **命令**：`scripts/compose-qs-e2e.sh ../queryshield`（也可以用环境变量 `QS_DIR`）。
   - 用时：约 3 分钟，其中上游超时的场景要等 QF 的 chat 超时 25 秒，接手的场景要等回收约 40 秒；QS 镜像要首次构建的话，再多几分钟。
@@ -125,7 +125,7 @@ QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个�
   - 有 QF 拒绝的请求时（场景 3），这次请求的 QF trace 里有失败的 `reserve`、没有 `upstream`。有 QF 等上游超时的调用时（场景 4），QF 的根 span 和 `upstream` 都以 `upstream_timeout` 失败，它挂在 QS 的一次尝试下，那次尝试记着 504 和 `upstream_timeout`。
   - `--served-by <run_id>=<实例>`（场景 5 的 run F）：这个 run 的 QF 根 span 都来自这个实例（`service.instance.id`）。
   - 场景 1 的预期：12 个 run 的 trace 里 QS 192 个、QF 352 个 span，44 个根 span 都挂在 QS 的尝试下，QS 没有 ERROR span。
-- **单元测试**：`python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'`（不需要 Docker）。
+- **单元测试**：`python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'`（不需要 Docker；要 Python 3.10 起）。
 - **数据从哪读**：
   - QF 的账本（`calls`、`budgets` 表）：`check_qs_runs.py` 按 Compose 的标签找到项目的 `qf-mysql` 容器，在里面用容器内的 secret 文件做只读查询，密码不出容器；
   - QF 的日志（`docker compose logs --no-log-prefix`）；
