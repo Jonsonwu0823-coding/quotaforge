@@ -17,7 +17,7 @@ services:
   qf-redis-cache:
     image: redis:8
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
-    # 镜像声明了 VOLUME /data 时，每个容器多一个匿名卷；只带 compose.yaml 的 down -v --remove-orphans（compose-real.ps1 停止时）
+    # 镜像声明了 VOLUME /data 时，每个容器多一个匿名卷；只带 compose.yaml 的 down -v --remove-orphans（compose-real.sh --stop 时）
     # 删得掉这个孤儿容器、删不掉它的匿名卷（实测）。挂成 tmpfs，镜像声明没声明都不建匿名卷；缓存本来就不往里写。
     tmpfs: [/data]
     healthcheck:

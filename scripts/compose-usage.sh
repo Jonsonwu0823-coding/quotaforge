@@ -14,6 +14,8 @@
 # jq 的过滤式写在单引号里正是为了不让 shell 展开。
 # shellcheck disable=SC2016
 set -euo pipefail
+# Windows 上 winget 装的 jq.exe 输出 CRLF：去掉 \r 再用。开着 pipefail，jq 的退出码照样传出来。
+jq() { command jq "$@" | tr -d '\r'; }
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME=qf-usage # 优先于 compose.yaml 里的 name
 

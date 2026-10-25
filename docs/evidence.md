@@ -60,7 +60,7 @@
 
 ### 真实上游
 
-都在本机（Windows，Windows PowerShell 5.1）运行，用 `scripts/compose-real.ps1` 起 QF，上游是阿里云百炼的 `qwen-plus`、`text-embedding-v4`，QS 用它自己的真实演示脚本经 QF 调模型，之后用 `compose-real.ps1 -Reconcile` 逐个 run 对账。
+下面几次都在本机（Windows，Windows PowerShell 5.1）运行，用当时的 PowerShell 脚本 `scripts/compose-real.ps1` 起 QF，上游是阿里云百炼的 `qwen-plus`、`text-embedding-v4`，QS 用它自己的真实演示脚本经 QF 调模型，之后用 `compose-real.ps1 -Reconcile` 逐个 run 对账。以后换成 bash 的 `scripts/compose-real.sh`（用法见[经 QS 的真实演示](queryshield.md#经-qs-的真实演示和对账本机会花钱)），它只在假上游上跑过，还没对真实上游跑过。
 
 - **2026-10-08、10-10、10-12**（公开之前和刚公开时的版本）：各跑过一次 `-Check`、经 QS 的演示和逐个 run 的对账，都通过。
 - **2026-10-15**（QF 是公开的 `a7847c0` 的代码）：`-Check` 通过；QS 的演示 14 题全部通过；13 个 run 逐个对上（聊天次数和三个用量数），`check_qs_runs: 0 failed`，`qfctl verify` 是 `ledger ok`。这次一共 56 次调用（40 次聊天，其中 1 次是 `-Check` 的重放；16 次嵌入），都是 200，没有被限流，没有熔断和换上游。
@@ -70,7 +70,7 @@
 ## 还没做的验证
 
 - **百炼以外的真实上游**：只在百炼上跑过。别的 OpenAI 兼容上游的 usage、错误码、流的格式可能不同。
-- **真实上游的流式**：`compose-real.ps1 -Stream` 写好了，还没在百炼上跑过；百炼的流中途出错时发什么，也没有找到文档（见[流式](api.md#流式)）。
+- **真实上游的流式**：`compose-real.sh --stream` 写好了，还没在百炼上跑过；百炼的流中途出错时发什么，也没有找到文档（见[流式](api.md#流式)）。
 - **两个真实上游之间的熔断和换上游**：只用两个假上游演示过；真实运行的配置里只有一个上游。
 - **真实上游上的两个实例**：两个实例只在假上游上验证过（检查脚本、压测、联调第 5 个场景）。
 - **长时间的稳定性**：没有做过几小时、几天的连续运行。

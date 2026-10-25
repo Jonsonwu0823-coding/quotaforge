@@ -312,7 +312,7 @@ flowchart TB
 | `scripts/compose-usage.sh` | `compose.yaml`、`compose.cache.yaml`、`compose.usage.yaml` |
 | `scripts/compose-qs-fake-check.sh` | `compose.yaml`、`compose.qs-fake.yaml` |
 | `scripts/compose-qs-e2e.sh` | QF：`compose.yaml`、`compose.qs-fake.yaml`、`compose.observability.yaml`、`compose.two.yaml`、`compose.observability.two.yaml`、`compose.qs-e2e.yaml`；QS：它自己的四个文件加 `deploy/compose.qs-e2e-qs.yaml` |
-| `scripts/compose-real.ps1`（本机，真实上游） | `compose.yaml`、`compose.real.yaml` |
+| `scripts/compose-real.sh`（本机，真实上游） | `compose.yaml`、`compose.real.yaml` |
 
 Compose 的细节见[用 Docker Compose 运行](operations.md#用-docker-compose-运行)。
 

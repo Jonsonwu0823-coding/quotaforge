@@ -97,6 +97,17 @@ jobs:
       # 联调和真实演示对账共用的核对脚本：纯标准库、不需要 Docker，几秒钟；放在 test 任务里，草稿 PR 也会跑。
       - name: check_qs_runs unit tests
         run: python3 -m unittest discover -s scripts -p 'test_check_qs_runs.py'
+      # Windows 上 winget 装的 jq.exe 输出 CRLF：scripts/ 下在宿主机上调用 jq 的脚本（不算注释行）都要定义去掉 \r 的那个 jq 函数，
+      # 一字不差（见 docs/development.md 写脚本的规矩）。几毫秒，草稿 PR 也会跑。
+      - name: Scripts that call jq define the CRLF-stripping jq function
+        run: |
+          want='jq() { command jq "$@" | tr -d '"'\\r'"'; }'
+          bad=$(for f in $(LC_ALL=C grep -lP '^(?![ \t]*#).*\bjq\b' scripts/*.sh); do grep -qxF "$want" "$f" || echo "$f"; done)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "these scripts call jq but do not define: $want (jq.exe on Windows prints CRLF)" >&2
+            exit 1
+          fi
       # 要 MySQL 的测试在这里不许跳过：缺连接串就失败。
       - run: go test -race ./...
         env:
@@ -153,6 +164,18 @@ jobs:
       # 用量事件：结清时同一个事务写 outbox、转发到 Kafka、消费者去重并按天汇总、和账本对账；停 Kafka、停消费者、位点重置到最早
       - name: Usage events
         run: scripts/compose-usage.sh
+      # 真实上游的脚本，上游换成 QF 的假上游（不花钱）：经 eval 起栈、--check、--stream；不 --stop 再起一次 --check --no-cache
+      # （先清掉上一次的残留）；最后 --stop。百炼 Key 从 stdin 喂一个假值；QF Key 只经 eval 进这一步的 shell，不进日志。
+      - name: Real-upstream script with the fake upstream
+        run: |
+          docker network inspect qs-qf >/dev/null 2>&1 || docker network create qs-qf >/dev/null
+          docker run -d --rm --name fake-bailian --network qs-qf --read-only --cap-drop ALL quotaforge-fakeupstream:local -addr 0.0.0.0:8081 >/dev/null
+          trap 'docker rm -f fake-bailian >/dev/null 2>&1 || true' EXIT
+          eval "$(echo test-only-upstream-key | scripts/compose-real.sh --upstream-base-url http://fake-bailian:8081/v1 --check --stream)"
+          [ "${#QUERYSHIELD_MODEL_API_KEY}" = 47 ]
+          eval "$(echo test-only-upstream-key | scripts/compose-real.sh --upstream-base-url http://fake-bailian:8081/v1 --check --no-cache)"
+          eval "$(scripts/compose-real.sh --stop)"
+          [ -z "${QUERYSHIELD_MODEL_API_KEY+x}" ]
       # QS 公开仓库按固定提交取（和 scripts/compose-qs-e2e.sh 里的 QS_COMMIT 一致，脚本会核对）。
       # QS 的镜像在这一步里照常构建（脚本只在镜像缺了时才构建，已有同名镜像时直接用）。
       - name: Check out QueryShield at the pinned commit

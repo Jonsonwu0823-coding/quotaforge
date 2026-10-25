@@ -14,7 +14,7 @@
 |---|---|
 | `compose.yaml` | 单独运行：`quotaforge`、账本数据库 `qf-mysql`、一次性的迁移服务 `qfctl`、限流用的 `qf-redis`、QF 的假上游 `qf-fake-upstream`，配置是 `deploy/config.compose.json`，不依赖 QS |
 | `compose.qs-fake.yaml` | 叠加在主文件上：`quotaforge` 接入外部网络 `qs-qf`，上游是 QS 的假上游 `http://fake-upstream:8000/v1`（配置 `deploy/config.qs-fake.json`）；开着嵌入缓存，另起 `qf-redis-cache` |
-| `compose.real.yaml` | 叠加在主文件上：`quotaforge` 接入 `qs-qf`，上游是百炼（配置 `deploy/config.real.json`），地址和 Key 来自当前 shell 的环境变量；开着嵌入缓存，`qf-redis-cache` 由脚本点名起（`-NoCache` 时不起） |
+| `compose.real.yaml` | 叠加在主文件上：`quotaforge` 接入 `qs-qf`，上游是百炼（配置 `deploy/config.real.json`），地址和 Key 来自当前 shell 的环境变量；开着嵌入缓存，`qf-redis-cache` 由脚本点名起（`--no-cache` 时不起） |
 | `compose.two.yaml` | 叠加在主文件上：第二个实例 `quotaforge-b`（`127.0.0.1:8081`）和压测工具 `qfbench`（只用 `run`），见[两个实例](scaling.md#两个实例) |
 | `compose.bench.yaml` | 再叠加在 `compose.two.yaml` 上：两个实例都换成压测配置 `deploy/config.bench.json`，见[压测](scaling.md#压测) |
 | `compose.observability.yaml` | 叠加在主文件上：Jaeger、Prometheus，`quotaforge` 打开追踪和指标，见[可观测](observability.md#演示环境) |
@@ -307,77 +307,37 @@ QF 默认监听 `127.0.0.1:8080`，用环境变量 `QUOTAFORGE_ADDR` 改。镜�
 
 - 用百炼当上游起 QF 和它的账本数据库，接入 `qs-qf`，用 `qfctl` 给 QS 建账户（上限 1,000,000 tokens）、发一把 QF Key。
 - 要真实的百炼 Key，会花一点钱（见下），CI 不跑这一步。
-- 带 `-Check` 时，经 QF 发一次短聊天（`qwen-plus`）和一次短嵌入（`text-embedding-v4`），花费在 0.01 元以内；同一个嵌入再发一次，应当命中嵌入缓存（不调上游，不花钱）；之后显示这个账户的额度（上限、已消费、剩余）和缓存命中的次数，以及这把 Key 和账户的限流限额。
-- 嵌入缓存默认开着（`qf-redis-cache`，和账本的库一样每次启动都是新的）；`-NoCache` 关掉：QF 用的配置去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`。见[接 QS](queryshield.md#接-qs)。
-- 账户的额度上限默认 1,000,000 tokens，`-AccountLimit <tokens>` 可改（正整数）。
-- 限流限额远高于演示的用量（2026-10-15 那次真实演示一共 56 次调用：40 次聊天，其中 1 次是 `-Check` 的重放；16 次嵌入；单次聊天的估算最多约 17,300 tokens）：账户每分钟 600 个请求、2,000,000 tokens，Key 每分钟 300 个请求、1,000,000 tokens。
+- 带 `--check` 时，经 QF 发一次短聊天（`qwen-plus`）和一次短嵌入（`text-embedding-v4`），花费在 0.01 元以内；同一个嵌入再发一次，应当命中嵌入缓存（不调上游，不花钱）；之后显示这个账户的额度（上限、已消费、剩余）和缓存命中的次数，以及这把 Key 和账户的限流限额。
+- 嵌入缓存默认开着（`qf-redis-cache`，和账本的库一样每次启动都是新的）；`--no-cache` 关掉：QF 用的配置去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`。见[接 QS](queryshield.md#接-qs)。
+- 账户的额度上限默认 1,000,000 tokens，`--account-limit <tokens>` 可改（正整数）。
+- 限流限额远高于演示的用量（2026-10-15 那次真实演示一共 56 次调用：40 次聊天，其中 1 次是 `--check` 的重放；16 次嵌入；单次聊天的估算最多约 17,300 tokens）：账户每分钟 600 个请求、2,000,000 tokens，Key 每分钟 300 个请求、1,000,000 tokens。
 - `deploy/config.real.json` 里上游 `bailian` 的限额是保守的示例值：每分钟 600 个请求、2,000,000 tokens。**要以百炼控制台上这把 Key 的实际限额为准**改它；百炼的限额实际是按模型的，QF 现在只按上游限。
   - 聊天带一个新生成的 `Idempotency-Key`，再用同一个键发一遍：显示第二次是重放（`Idempotent-Replayed: true`，`x-request-id` 和正文都和第一次相同），已消费没有增加。这演示了“重试不重复计费”，不多花钱。
 - `deploy/config.real.json` 里 `qwen-plus` 的 `default_max_tokens` 是 32768。依据（2026-10-08 查百炼文档）：稳定版 `qwen-plus` 最大输出 32,768 个 token、上下文 1,000,000；OpenAI 兼容接口里不写 `max_tokens` 时，默认就是模型的最大输出长度。百炼文档还说 `max_tokens` 将废弃、改用 `max_completion_tokens`；QF 只读 `max_tokens`，客户端改用新字段时 QF 按默认值预留，只会多留、不会少留。
 - 百炼 Key 只在当前进程的环境变量里，经 Compose secrets 挂成容器里的文件 `/run/secrets/upstream_api_key`：
   - 不出现在 `docker inspect`、`docker compose config` 和日志里；
   - 不写文件。
-- 数据库每次都是新的：每次启动随机生成三个数据库密码，写进系统临时目录下 `quotaforge-real\db` 的三个文件，经 `QF_DB_SECRETS_DIR` 交给 Compose 的 secrets。密码不进环境变量、`docker inspect` 和任何输出；`-Stop` 时连数据库的数据和这个目录一起删掉。
-- 上一次没有 `-Stop` 就再次启动时，脚本先提示一句，清掉上一次的容器、数据卷和临时文件，再重新开始（否则旧库里的密码和新生成的对不上）。
+- 数据库每次都是新的：每次启动随机生成三个数据库密码，写进系统临时目录下 `quotaforge-real/db` 的三个文件，经 `QF_DB_SECRETS_DIR` 交给 Compose 的 secrets。密码不进环境变量、`docker inspect` 和任何输出；`--stop` 时连数据库的数据和这个目录一起删掉。
+- 上一次没有 `--stop` 就再次启动时，脚本先提示一句，清掉上一次的容器、数据卷和临时文件，再重新开始（否则旧库里的密码和新生成的对不上）。
 - 脚本里的 `docker compose` 都带 `--progress plain --ansi never`：让 docker 的输出是逐行的纯文本，不带进度动画和颜色。
-- 脚本把 `$ProgressPreference` 设成 `SilentlyContinue`（只在脚本的作用域里生效）：Windows PowerShell 5.1 的 `Invoke-WebRequest` 默认画进度条，写回窗口顶部几行时会弄乱中文，`-Check` 会用到它。
 
-PowerShell（Windows PowerShell 5.1 起；需要 Docker Desktop）：
-
-```powershell
-# 在项目根目录下运行
-.\scripts\compose-real.ps1 -Check   # 输入百炼地址和 Key（隐藏输入），起 QF，QF Key 放进这个窗口的环境变量 QUERYSHIELD_MODEL_API_KEY，再各发一次聊天和嵌入（嵌入再发一次看缓存命中），显示额度
-.\scripts\compose-real.ps1 -Stop    # 停掉 QF，删掉数据库的数据和临时目录，清掉 QUERYSHIELD_MODEL_API_KEY
-```
-
-- 不带 `-Check` 就只启动。`-NoCache` 关掉嵌入缓存，`-AccountLimit 2000000` 改账户的额度上限，可以和别的参数一起用。
-- `-Stream`：再经 QF 发三次流式聊天（花费很少），只显示流的结构、不显示内容：不带 `stream_options` 的（事件数、最后是不是 `[DONE]`、QF 替客户端要的 usage 事件没有转发、调用结算了）；带 `include_usage: true` 的（usage 事件照转发，调用的用量等于它的数）；读 2 秒就断开的（等一会儿查调用状态，应是 `SETTLED`）。可以和 `-Check` 一起用，任何一项不成立就报错退出。还没在百炼上跑过（见[还没做的验证](evidence.md#还没做的验证)）。
-- `-Stop` 和“上一次没停”的清理只带主文件跑 `docker compose down -v --remove-orphans`：`qf-redis-cache` 只在 `compose.real.yaml` 里，这时算孤儿，由 `--remove-orphans` 删掉（它的 `/data` 是 tmpfs，没有要删的卷）。脚本设了 `COMPOSE_IGNORE_ORPHANS`，只带主文件的命令不再每次提示孤儿。
-- QF Key 只放进运行脚本的这个 PowerShell 进程的环境变量 `QUERYSHIELD_MODEL_API_KEY`，不显示、不写文件、不经剪贴板（剪贴板谁都能读，还会进 Windows 的剪贴板历史）；脚本结束后变量留着，给同一个窗口里随后运行的 QS 脚本读，`-Stop` 时清掉（不管原来有没有值）。再次启动时新 Key 直接覆盖旧值；`-Reconcile` 不碰它。
-- `-UpstreamBaseUrl <地址>` 会显式指定上游、不再询问。可以先用它指向 QF 的假上游，不花钱地走一遍流程：在 `qs-qf` 上起一个假上游容器 `docker run -d --name fake-bailian --network qs-qf quotaforge-fakeupstream:local -addr 0.0.0.0:8081`（先 `docker compose build qf-fake-upstream`），地址填 `http://fake-bailian:8081/v1`，用完 `docker rm -f fake-bailian`。
-- 脚本只显示状态码、模型名、usage 和 `x-request-id`。出错时显示状态码和 QF 的错误码，例如 `状态 502，错误码 upstream_auth_failed`（百炼 Key 错了）或 `upstream_unavailable`（地址连不上）。
-
-bash（同样的步骤）：
+bash（Linux、macOS 自带的 bash 3.2；Windows 走 Git Bash，还没在那里跑过；需要 Docker Desktop 或 Docker Engine、`jq`、`curl`，见[本机环境](development.md#本机环境)）：
 
 ```bash
 # 在项目根目录下运行
-docker network inspect qs-qf >/dev/null 2>&1 || docker network create qs-qf >/dev/null
-docker compose down -v --remove-orphans   # 清掉上一次的残留（qf-redis-cache 只在 compose.real.yaml 里，算孤儿，靠 --remove-orphans 删）
-read -rp '百炼 base URL（例如 https://dashscope.aliyuncs.com/compatible-mode/v1）：' QF_UPSTREAM_BASE_URL
-read -rsp '百炼 Key（输入不显示）：' QF_UPSTREAM_API_KEY; echo
-# 数据库密码：每次随机生成，只写进临时目录的三个 secret 文件
-QF_DB_SECRETS_DIR=$(mktemp -d)
-pw() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
-printf '%s\n' "$(pw)" >"$QF_DB_SECRETS_DIR/root_password"
-printf 'qf_migrate:%s@tcp(qf-mysql:3306)/quotaforge\n' "$(pw)" >"$QF_DB_SECRETS_DIR/migrate_dsn"
-printf 'qf_app:%s@tcp(qf-mysql:3306)/quotaforge\n' "$(pw)" >"$QF_DB_SECRETS_DIR/app_dsn"
-chmod 755 "$QF_DB_SECRETS_DIR"; chmod 644 "$QF_DB_SECRETS_DIR"/*   # 容器里是 UID 65532
-export QF_UPSTREAM_BASE_URL QF_UPSTREAM_API_KEY QF_DB_SECRETS_DIR
-# Key 为空时不启动：Compose 会因此不注入 secret，QF 报的是“找不到 Key 文件”，看不出原因。不用 exit，免得关掉终端。
-if [ -z "$QF_UPSTREAM_API_KEY" ]; then echo '百炼 Key 为空，没有启动 QF：重新执行上面的 read -rsp 那一行' >&2; else docker compose --progress plain -f compose.yaml -f compose.real.yaml up -d --build --wait quotaforge qf-redis-cache; fi
-unset QF_UPSTREAM_API_KEY
-docker compose run --rm -T --no-deps qfctl account create -name queryshield -limit 1000000
-QF_KEY=$(docker compose run --rm -T --no-deps qfctl key issue -account queryshield -models qwen-plus,text-embedding-v4 | sed -n 's/^key: //p')   # 交给 QS；不要 echo
-
-# 检查：各发一次聊天和嵌入，只显示状态码、x-request-id、是否重放、模型名和 usage。Key 经进程替换传给 curl，不进命令行。
-# 第三个参数是 Idempotency-Key（可选）。
-qf() {
-  curl -sS -o /tmp/qf-check.json -D - -H @<(printf 'Authorization: Bearer %s\n' "$QF_KEY") ${3:+-H "Idempotency-Key: $3"} \
-    -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:8080$1" |
-    tr -d '\r' | awk -v p="$1" 'NR == 1 { s = $2 } tolower($1) == "x-request-id:" { id = $2 } tolower($1) == "idempotent-replayed:" { r = " replayed" } END { print p, s, id r }'
-  jq -c '{model, usage}' /tmp/qf-check.json && rm -f /tmp/qf-check.json
-}
-IDEM_KEY="real-check-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-qf /v1/chat/completions '{"model":"qwen-plus","messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}' "$IDEM_KEY"
-qf /v1/embeddings '{"model":"text-embedding-v4","input":["ok"]}'
-docker compose run --rm -T --no-deps qfctl usage -account queryshield
-# 同一个键再发一遍：应当显示 replayed、x-request-id 和第一次相同，已消费不变
-qf /v1/chat/completions '{"model":"qwen-plus","messages":[{"role":"user","content":"Reply with one word: ok"}],"max_tokens":8}' "$IDEM_KEY"
-docker compose run --rm -T --no-deps qfctl usage -account queryshield
-
-# 停止：连数据库的数据、qf-redis-cache 和密码文件一起删掉
-docker compose down -v --remove-orphans && rm -rf "$QF_DB_SECRETS_DIR"
+eval "$(scripts/compose-real.sh --check)"   # 输入百炼地址和 Key（隐藏输入），起 QF，把 QF Key 设进当前终端的环境变量 QUERYSHIELD_MODEL_API_KEY，再各发一次聊天和嵌入（嵌入再发一次看缓存命中），显示额度
+eval "$(scripts/compose-real.sh --stop)"    # 停掉 QF，删掉数据库的数据和临时目录，清掉 QUERYSHIELD_MODEL_API_KEY
 ```
 
-- `read -rs` 读进来的 Key 不出现在命令行和 shell 历史里。
-- Key 为空（直接按了回车）时，`up` 那一行只提示原因、不启动 QF，也不会关掉当前终端。重新执行 `read -rsp` 那一行，再从 `export` 往下执行。
+- 要经 `eval`：脚本是子进程，它设的变量带不回调用它的终端。提示和结果都写到 stderr；stdout 只有一行 `export QUERYSHIELD_MODEL_API_KEY='qfk_…'`，由 `eval` 在当前终端执行（和 `eval "$(ssh-agent)"` 一样），屏幕上不出现 Key，也不写任何文件、不经剪贴板（剪贴板谁都能读，还会进 Windows 的剪贴板历史）。bash、zsh、Git Bash 都认这种写法。
+  - 忘了 `eval`（stdout 是终端，或者重定向到了文件）时，脚本一开始就停下，提示正确的写法，不起栈、不发 Key。写成 `| cat`、`| tee` 时分辨不出来（stdout 也是管道），Key 会显示出来。
+  - 脚本失败时 stdout 最后多一行 `false`，`eval` 就以 1 结束：`eval "$(…)" && 下一条命令` 会停在这里。`--check`、`--stream` 没通过时 Key 照样交出（QF 还开着，看完日志再 `--stop`）。
+  - 变量留在这个终端里，给随后运行的 QS 脚本读；再次启动时新 Key 直接覆盖旧值。`--stop` 输出 `unset QUERYSHIELD_MODEL_API_KEY`；没经 `eval` 时照样停栈，只是终端里的旧变量留着（库已经删了，那把 Key 也就没用了）。`--reconcile` 不碰它，也不用 `eval`。
+- 开头先查要用的东西：Docker 在运行、`docker compose`（v2）、`jq`、`curl`，`--reconcile` 再查 Python 3.10 起。缺哪个就停下，说在 macOS、Windows（Git Bash）、Linux 上各怎么装；这时还没起栈、没问 Key。
+- 不带 `--check` 就只启动。`--no-cache` 关掉嵌入缓存，`--account-limit 2000000` 改账户的额度上限，可以和别的参数一起用。
+- `--stream`：再经 QF 发三次流式聊天（花费很少），只显示流的结构、不显示内容：不带 `stream_options` 的（data 数、最后是不是 `[DONE]`、QF 替客户端要的 usage 事件没有转发、调用结算了）；带 `include_usage: true` 的（usage 事件照转发，调用的用量等于它的数）；读 2 秒就断开的（等一会儿查调用状态，应是 `SETTLED`）。流的原文写进临时目录（`--stop` 时删掉）。可以和 `--check` 一起用，任何一项不成立就报错退出。还没在百炼上跑过（见[还没做的验证](evidence.md#还没做的验证)）。
+- `--stop` 和“上一次没停”的清理只带主文件跑 `docker compose down -v --remove-orphans`：`qf-redis-cache` 只在 `compose.real.yaml` 里，这时算孤儿，由 `--remove-orphans` 删掉（它的 `/data` 是 tmpfs，没有要删的卷）。脚本设了 `COMPOSE_IGNORE_ORPHANS`，只带主文件的命令不再每次提示孤儿。
+- `--upstream-base-url <地址>` 会显式指定上游、不再询问。可以先用它指向 QF 的假上游，不花钱地走一遍流程，命令见[本机环境](development.md#本机环境)的自检。
+- 脚本只显示状态码、模型名、usage 和 `x-request-id`。出错时显示状态码和 QF 的错误码，例如 `状态 502，错误码 upstream_auth_failed`（百炼 Key 错了）或 `upstream_unavailable`（地址连不上）。
+- QF Key 经 curl 的配置从 stdin 交给 curl，不出现在命令行里。百炼 Key 只在 `up` 那一步的环境变量里，起好就从脚本的进程里删掉。
+- Windows 的 Git Bash：脚本设了 `MSYS_NO_PATHCONV=1`，交给 Docker、curl、jq、Python 的宿主机路径用 `cygpath -m` 转成 `C:/…` 写法（和 `compose-qs-e2e.sh` 一样）。这条路在云端测不了，还没在 Windows 上跑过。

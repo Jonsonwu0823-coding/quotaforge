@@ -294,7 +294,7 @@ def outside_lines(calls, chat_by_run, runs, e2e):
     """账本里不属于这些 run 的调用：联调要求严，真实模式只数出来。"""
     extra = sorted(run for run in chat_by_run if run not in runs)
     extra_calls = sum(len(chat_by_run[run]) for run in extra)
-    hint = "" if e2e else "; the ledger holds another demo's runs, restart with compose-real.ps1 (fresh ledger) and rerun"
+    hint = "" if e2e else "; the ledger holds another demo's runs, restart with compose-real.sh (fresh ledger) and rerun"
     if extra:
         out = [verdict(False, f"{extra_calls} ledger chat calls belong to {len(extra)} runs not in the summary ({', '.join(extra[:10])}){hint}")]
     else:

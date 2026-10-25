@@ -13,6 +13,8 @@
 # Key 只在临时目录里，不进输出；原始数据里没有 Key 和正文。用自己的 Compose 项目名 qf-bench，结束时 down -v。
 # shellcheck disable=SC2016
 set -euo pipefail
+# Windows 上 winget 装的 jq.exe 输出 CRLF：去掉 \r 再用。开着 pipefail，jq 的退出码照样传出来。
+jq() { command jq "$@" | tr -d '\r'; }
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME=qf-bench
 [ $# = 1 ] || { echo "usage: $0 <output directory>" >&2; exit 2; }

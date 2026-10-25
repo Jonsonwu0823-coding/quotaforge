@@ -30,8 +30,8 @@ const pollMax = 100
 // 等待有上限：franz-go 默认不肯取消已经发给 broker、还没回音的幂等请求（取消了可能重复），broker 在请求途中停掉时
 // ProduceSync 会一直等，转发就卡住了、积压的指标也不更新。AllowIdempotentProduceCancellation 让 ctx 到期（sendTimeout）
 // 的批次可以失败：代价是这一批下一轮重发时 Kafka 里可能多一份，由消费者去重。失败不在到期的那一刻，而在之后 franz-go
-// 下一次元数据刷新（两次之间至少 5 秒）或连接出错的时候。实测 broker 停在两次发送之间（连接被拒）时 5.8 到 7.0 秒返回；
-// broker 在请求途中停掉、名字也解析不到（Compose 里停掉 qf-kafka）时，从停到这一轮报错 8.8 到 10.2 秒。
+// 下一次元数据刷新（两次之间至少 5 秒）或连接出错的时候。实测 broker 停在两次发送之间（连接被拒）时约 6 到 7 秒返回；
+// broker 在请求途中停掉、名字也解析不到（Compose 里停掉 qf-kafka）时，从停到这一轮报错约 9 到 10.5 秒。
 // 主题不存在时自动创建（分区数和保留期由 broker 的默认值定）。
 type Producer struct{ cl *kgo.Client }
 

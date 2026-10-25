@@ -2,7 +2,7 @@
 # 接 QS 时叠加 compose.qs-fake.yaml 或 compose.real.yaml（见 docs/queryshield.md）。
 #
 # 数据库的密码只在三个 secret 文件里：root_password、migrate_dsn、app_dsn。默认用 deploy/test-only-db/ 下
-# 写明仅测试的文件；真实模式由 scripts/compose-real.ps1 每次随机生成，经 QF_DB_SECRETS_DIR 指过来。
+# 写明仅测试的文件；真实模式由 scripts/compose-real.sh 每次随机生成，经 QF_DB_SECRETS_DIR 指过来。
 name: quotaforge
 
 services:

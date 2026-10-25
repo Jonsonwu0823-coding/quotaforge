@@ -6,14 +6,14 @@
 
 - **网络**：外部网络 `qs-qf`，两边都按 external 引用。用前先建：`docker network create qs-qf`，已存在就跳过。`qs-qf` 上只有 `quotaforge`；`qf-mysql`、`qfctl`、`qf-redis`、`qf-redis-cache` 不接。两边的服务怎么部署，见[架构说明](architecture.md#部署)的部署图。
 - **地址**：QF 在 `qs-qf` 上的服务名是 `quotaforge`，端口 8080。QS 的 `base_url` 是 `http://quotaforge:8080/v1`，chat 和 embeddings 都用它。
-- **Key**：起 QF 之后用 `qfctl` 给 QS 建账户、发一把 Key，交给 QS（`QUERYSHIELD_MODEL_API_KEY`）。PowerShell 脚本把 Key 放进当前窗口的环境变量 `QUERYSHIELD_MODEL_API_KEY`（不显示，不经剪贴板；`-Stop` 清掉），QS 的 `compose-real-demo.ps1` 在网关模式下先读这个变量，有值就不提示；bash 的做法是把 Key 留在当前 shell 的变量里，不要 echo。
+- **Key**：起 QF 之后用 `qfctl` 给 QS 建账户、发一把 Key，交给 QS（`QUERYSHIELD_MODEL_API_KEY`）。真实上游的脚本 `scripts/compose-real.sh` 经 `eval` 把 Key 设进当前终端的环境变量 `QUERYSHIELD_MODEL_API_KEY`（不显示，不写文件，不经剪贴板；`--stop` 清掉），同一个终端里随后运行的 QS 演示由子进程继承这个变量：QS 的 `compose-real-demo.ps1` 在网关模式下先读它，有值就不提示。自己用 bash 起 QF 时，把 Key 留在当前 shell 的变量里，不要 echo。
 - **配置**：`deploy/config.qs-fake.json`（chat 和 embeddings 两个别名都是 `qs-fake-upstream-v1`，上游 `http://fake-upstream:8000/v1`）、`deploy/config.real.json`（`qwen-plus`、`text-embedding-v4`）。都是静态文件，没有要替换的占位符。
 - **嵌入缓存**：两套栈（假上游、真实上游）都开着（行为见[接口](api.md#嵌入缓存)，运维见[嵌入缓存](operations.md#嵌入缓存)）。
   - 只影响**不带 `Idempotency-Key` 的嵌入请求**，也就是 QS 第一次检索时建知识索引的那批；run 里的请求都带键，不查也不写缓存，按 run 对账不受影响。
   - QS 看得见的：这些请求的响应多一个 `Cache-Status` 头；命中时正文和原来那次逐字节相同（包括上游给的 `id` 和 `usage`），`x-request-id` 是新的调用号，QF 不扣这次的额度，调用状态查询是 `CACHED`；同一个实例里同时到的相同请求合并成一次回源；缓存出错当作没命中。命中在准入时照样占着上游那一层的 1 个 RPM，收尾时退回（见[限流](rate-limiting.md#限流redis)）。
   - 缓存放在单独的 `qf-redis-cache`（不持久化，64 MB，满了按 LRU 淘汰），不接 `qs-qf`，不和限流共用 `qf-redis`。缓存的键里有账户号；真实栈每次启动都是新的账本库和新的 `qf-redis-cache`。
   - 一个 QS 进程只建一次索引，所以要 QS 重新起来、第一次检索重建索引时才会命中（例如同一个 QF 窗口里再跑一遍 QS 的演示，见下面“真实演示”的第 3 步）。
-  - **怎么关**：真实栈用 `compose-real.ps1 -NoCache`。这时 QF 用的配置是 `deploy/config.real.json` 去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`；容器里还留着 `QF_REDIS_CACHE_URL` 这个环境变量，但没有配置指向它，QF 不读。假上游的栈没有开关（联调靠它验证缓存），要关就删掉 `deploy/config.qs-fake.json` 里 `embedding_cache` 那一行（连同前一行末尾的逗号）。
+  - **怎么关**：真实栈用 `compose-real.sh --no-cache`。这时 QF 用的配置是 `deploy/config.real.json` 去掉 `embedding_cache` 那一行，和开缓存之前的配置逐字节相同，也不起 `qf-redis-cache`；容器里还留着 `QF_REDIS_CACHE_URL` 这个环境变量，但没有配置指向它，QF 不读。假上游的栈没有开关（联调靠它验证缓存），要关就删掉 `deploy/config.qs-fake.json` 里 `embedding_cache` 那一行（连同前一行末尾的逗号）。
 
 接 QS 的假上游（QS 那边起 `app`、`fake-upstream` 并接入 `qs-qf`）：
 
@@ -136,46 +136,58 @@ QF 接 QS 的假上游，QS 的 `app` 经 QF 调模型。一条命令跑五个�
 
 QS 的真实演示（14 题、13 个 run）经 QF 调百炼的模型；跑完后把 QS 的 `demo-summary.json` 和 QF 的账本逐个 run 对一遍，看两边的聊天次数和用量是否一致。QS 那边的脚本和参数以 [QS 仓库](https://github.com/Jonsonwu0823-coding/queryshield) 的说明为准。
 
-Windows PowerShell（5.1 起；需要 Docker Desktop 和 Python 3.10 起）：
+前提（装法见[本机环境](development.md#本机环境)）：
 
-1. 在**同一个 PowerShell 窗口**里，一行命令先起 QF，再跑 QS 的真实演示。QF 的脚本顺带检查聊天、嵌入和重放（花费在 0.01 元以内），起好后把 QF Key 放进这个窗口的环境变量 `QUERYSHIELD_MODEL_API_KEY`；QS 的脚本在网关模式下读这个变量，不再提示输入，所以不用粘贴任何东西。**QS 的演示调用真实模型，整套约 1 元以内**：
+- QF 这边：bash（macOS 自带的 bash 3.2 或 zsh 都行；Windows 上是 Git Bash）、Docker Desktop、`jq`、`curl`，对账要 Python 3.10 起。
+- QS 换掉它的 PowerShell 入口之前，QS 的真实演示还是 PowerShell 脚本 `compose-real-demo.ps1`：Mac 上要装 PowerShell 7（`pwsh`）；Windows 上用自带的 Windows PowerShell 5.1（`powershell.exe`），从 Git Bash 里调。QS 的新入口公开之后，这里跟着换。
 
-   ```powershell
-   Set-Location '<QS 的 queryshield 目录>'; & '<QF 的 quotaforge 目录>\scripts\compose-real.ps1' -Check; .\scripts\compose-real-demo.ps1 -GatewayBaseUrl 'http://quotaforge:8080/v1' -GatewayNetwork 'qs-qf'
+1. 在**同一个终端**里，一行命令先起 QF，再跑 QS 的真实演示。QF 的脚本顺带检查聊天、嵌入和重放（花费在 0.01 元以内），起好后经 `eval` 把 QF Key 设进这个终端的环境变量 `QUERYSHIELD_MODEL_API_KEY`；QS 的脚本是这个终端的子进程，在网关模式下读这个变量，不再提示输入，所以不用粘贴任何东西。**QS 的演示调用真实模型，整套约 1 元以内**：
+
+   macOS（bash 或 zsh）：
+
+   ```bash
+   cd '<QS 的 queryshield 目录>' && eval "$('<QF 的 quotaforge 目录>/scripts/compose-real.sh' --check)" && pwsh -NoProfile -File scripts/compose-real-demo.ps1 -GatewayBaseUrl 'http://quotaforge:8080/v1' -GatewayNetwork 'qs-qf'
    ```
 
-   - 两个脚本必须在同一个窗口里运行：环境变量只在这个窗口里。
-   - `-Check` 还把同一个嵌入发两次：第二次应当命中嵌入缓存（`Cache-Status: quotaforge; hit`、正文和第一次相同、调用状态 `CACHED`、已消费不变），不调上游。带 `-NoCache` 时不发第二次，改成核对嵌入的响应没有 `Cache-Status` 头（缓存确实关着）。
-   - 账户的额度上限默认 1,000,000 tokens，`-AccountLimit <tokens>` 可改；长评测（例如几十段对话、近百轮的多轮评测）建议给 `-AccountLimit 2000000`。
-   - QF 的脚本失败（`throw`，例如 Docker 没开、没有输入 Key）时整行停下，QS 的演示不会启动。`-Check` 有一项没通过（任何一次请求不是 2xx，或者重放、缓存的核对不成立：`x-request-id`、正文和第一次不同，或者已消费变了）也会整行停下：脚本在打印完额度那一行之后报错退出，QS 的演示不会启动；QF 还开着，看完日志再运行 `-Stop`。不带 `-Check` 的启动照旧。
-   - QS 的脚本结束时把这个变量恢复成开始时的值，所以变量一直留到 `-Stop`。
+   Windows（Git Bash；目录写成 `/c/...` 或 `C:/...`。QF 的脚本还没在 Windows 上跑过）：
+
+   ```bash
+   cd '<QS 的 queryshield 目录>' && eval "$('<QF 的 quotaforge 目录>/scripts/compose-real.sh' --check)" && powershell.exe -NoProfile -File scripts/compose-real-demo.ps1 -GatewayBaseUrl 'http://quotaforge:8080/v1' -GatewayNetwork 'qs-qf'
+   ```
+
+   - 两个脚本必须在同一个终端里运行：环境变量只在这个终端和它的子进程里。
+   - `--check` 还把同一个嵌入发两次：第二次应当命中嵌入缓存（`Cache-Status: quotaforge; hit`、正文和第一次相同、调用状态 `CACHED`、已消费不变），不调上游。带 `--no-cache` 时不发第二次，改成核对嵌入的响应没有 `Cache-Status` 头（缓存确实关着）。
+   - 账户的额度上限默认 1,000,000 tokens，`--account-limit <tokens>` 可改；长评测（例如几十段对话、近百轮的多轮评测）建议给 `--account-limit 2000000`。
+   - QF 的脚本失败（例如 Docker 没开、没有输入 Key、缺了 `jq`）时整行停下，QS 的演示不会启动：脚本失败时交给 `eval` 的最后一行是 `false`，`eval` 以 1 结束，`&&` 后面的不跑。`--check` 有一项没通过（任何一次请求不是 2xx，或者重放、缓存的核对不成立：`x-request-id`、正文和第一次不同，或者已消费变了）也会整行停下：脚本在打印完额度那一行之后报错退出，QS 的演示不会启动；QF 还开着，看完日志再 `--stop`。不带 `--check` 的启动照旧。
+   - 忘了 `eval`（直接运行脚本，或者把输出重定向到文件）时，脚本一开始就停下、提示写法，不起栈、不发 Key。写成 `| cat`、`| tee` 时分辨不出来，Key 会显示出来。
+   - QS 的脚本结束时把这个变量恢复成开始时的值，所以变量一直留到 `--stop`。
    - 跑完 QS 会把摘要拷到 `queryshield/evidence/compose-gateway-<时间>/demo-summary.json`。
 
-2. 回到 QF 目录对账（`-Reconcile` 不碰这个变量）：
+2. 回到 QF 目录对账（`--reconcile` 不碰这个变量，也不用 `eval`）：
 
-   ```powershell
-   .\scripts\compose-real.ps1 -Reconcile '<QS 输出的证据目录>\demo-summary.json'
+   ```bash
+   cd '<QF 的 quotaforge 目录>' && scripts/compose-real.sh --reconcile '<QS 输出的证据目录>/demo-summary.json'
    ```
 
-3. （可选，再跑一遍演示，花费和第 1 步的演示差不多）在真实运行里看到嵌入缓存命中：QF 不停，在同一个窗口里再跑一遍 QS 的演示（第 1 步那行里 `compose-real-demo.ps1` 那一段），再回到 QF 目录对账一次。
+3. （可选，再跑一遍演示，花费和第 1 步的演示差不多）在真实运行里看到嵌入缓存命中：QF 不停，在同一个终端里再跑一遍 QS 的演示（第 1 步那行里 `pwsh` 或 `powershell.exe` 那一段，在 QS 目录下），再回到 QF 目录对账一次。
    - QS 的脚本每次都起一个新的 `app`，第一次检索时重建知识索引；请求和第一遍逐个相同，应当都命中。
-   - 看 `qfctl usage` 的 `CACHED` 列（最后一列），在 QF 目录：
+   - 看 `qfctl usage` 的 `CACHED` 列（最后一列），在 QF 目录（数据库的 secret 文件在系统临时目录下的 `quotaforge-real/db`；Git Bash 上转成 `C:/…` 写法交给 Docker）：
 
-     ```powershell
-     $env:QF_DB_SECRETS_DIR = (Join-Path ([IO.Path]::GetTempPath()) 'quotaforge-real\db').Replace('\', '/'); docker compose run --rm -T --no-deps qfctl usage -account queryshield
+     ```bash
+     db=${TMPDIR:-/tmp}/quotaforge-real/db; QF_DB_SECRETS_DIR=$(cygpath -m "$db" 2>/dev/null || echo "$db") docker compose run --rm -T --no-deps qfctl usage -account queryshield
      ```
 
      开着缓存时，Compose 会提示一行孤儿容器（`qf-redis-cache`：它只在 `compose.real.yaml` 里，这行命令只带主文件），不用管。
 
-     第二遍 `-Reconcile` 输出里 `embeddings without X-Run-Id` 那一行也数得到 `CACHED`。个数等于第一遍建索引的请求数，`-Check` 跑过的话再加 1。
-   - 第二遍的 `-Reconcile` 按设计会多**正好一行 FAIL**（退出码 1）：`… ledger chat calls belong to … runs not in the summary …`，因为账本里还有第一遍的 run，一次对账只对一遍演示。其余每行照常核对，应当都是 `ok`，`qfctl verify` 照常是 `ledger ok`。
+     第二遍 `--reconcile` 输出里 `embeddings without X-Run-Id` 那一行也数得到 `CACHED`。个数等于第一遍建索引的请求数，`--check` 跑过的话再加 1。
+   - 第二遍的 `--reconcile` 按设计会多**正好一行 FAIL**（退出码 1）：`… ledger chat calls belong to … runs not in the summary …`，因为账本里还有第一遍的 run，一次对账只对一遍演示。其余每行照常核对，应当都是 `ok`，`qfctl verify` 照常是 `ledger ok`。
 4. 看完结果后停掉 QF，连数据库的数据一起删掉，并清掉 `QUERYSHIELD_MODEL_API_KEY`：
 
-   ```powershell
-   .\scripts\compose-real.ps1 -Stop
+   ```bash
+   eval "$(scripts/compose-real.sh --stop)"
    ```
 
-`-Reconcile` 不启动也不清理任何东西（也不碰 `QUERYSHIELD_MODEL_API_KEY`），只要求第 1 步起的 QF 还在运行；不能和 `-Check`、`-Stream`、`-Stop` 一起用。它调用 `scripts/check_qs_runs.py`（真实模式），再跑一次 `qfctl verify`。找不到 Python 3.10 或更新的版本时会提示安装（核对脚本只用标准库）。退出码：0 全部对上；1 有对不上的 run、账本校验没通过，或脚本自己报错（QF 没在运行、找不到 Python 等，错误信息在输出里）；2 核对脚本跑不了（摘要不合法、读不了账本）。
+`--reconcile` 不启动也不清理任何东西（也不碰 `QUERYSHIELD_MODEL_API_KEY`），只要求第 1 步起的 QF 还在运行；不能和 `--check`、`--stream`、`--stop` 一起用。它调用 `scripts/check_qs_runs.py`（真实模式），再跑一次 `qfctl verify`。找不到 Python 3.10 或更新的版本时会提示安装（核对脚本只用标准库）。退出码：0 全部对上；1 有对不上的 run、账本校验没通过，或脚本自己报错（QF 没在运行、找不到 Python 等，错误信息在输出里）；2 核对脚本跑不了（摘要不合法、读不了账本）。
 
 怎么读输出（每条一行，只有题号、`run_id`、次数和用量数）：
 
@@ -189,7 +201,7 @@ check_qs_runs: 0 failed                                                     最�
 
 - **只对 `usage_total` 为 `known` 的 run 比次数和三个用量数**（只算聊天，嵌入不算）；`not_run` 的 run 要求账本里没有它的聊天。
 - **`skip`**：QS 说这个 run 的用量合计不完整（`unknown`），或者摘要里有 `run_id` 却没有 `usage_total`。不算失败，把 QS 的次数、QF 的次数和这些调用的状态列出来，方便看原因。常见原因是调用超过 25 秒：QF 的 chat 上游超时是 25 秒（QS 是 30 秒），超时的调用经 QF 会得到 504，没有用量，那个 run 就成了 `skip`；这是已约定的代价，不算 QF 的回归，出现时单独记下。
-- **`info`**：不带 `X-Run-Id` 的聊天（例如第 1 步 `-Check` 发的那一次）、带和不带 `X-Run-Id` 的嵌入（建知识索引的那批不带），只按状态数出来，不算失败。嵌入缓存命中的是 `CACHED`（`-Check` 的第二次嵌入、第二遍演示重建索引的那批）。
-- **账本里有摘要以外的 run**：算失败，提示用 `compose-real.ps1` 重新起一套（账本是新的）再跑。一次对账对应一次演示，不要拿一份摘要去对跑过两次演示的账本；第 3 步的第二遍对账就会多这一行 FAIL，是预期的，看其余各行。
+- **`info`**：不带 `X-Run-Id` 的聊天（例如第 1 步 `--check` 发的那一次）、带和不带 `X-Run-Id` 的嵌入（建知识索引的那批不带），只按状态数出来，不算失败。嵌入缓存命中的是 `CACHED`（`--check` 的第二次嵌入、第二遍演示重建索引的那批）。
+- **账本里有摘要以外的 run**：算失败，提示用 `compose-real.sh` 重新起一套（账本是新的）再跑。一次对账对应一次演示，不要拿一份摘要去对跑过两次演示的账本；第 3 步的第二遍对账就会多这一行 FAIL，是预期的，看其余各行。
 - 对不上的 run：把 `run_id` 和两边的数发给 QS，由 QS 查它那一边。
 - **一个 `known` 的 run 也没比到**（例如全是 `skip`，或者只有 `not_run`）：算失败，输出 `FAIL at least one run with known usage_total was compared (0); nothing was compared, see the skip lines above`。什么也没验证，不能显示通过；看上面的 `skip` 行找原因。

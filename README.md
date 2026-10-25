@@ -125,7 +125,7 @@ internal/
   fakeupstream/   the fake upstream's implementation
   dbtest/         database, Redis and Kafka helpers shared by tests
 deploy/           configs for Compose, MySQL init script, Prometheus rules, test-only database passwords
-scripts/          demo and check scripts (bash; Linux and macOS), the real-upstream PowerShell script, the integration checker (Python)
+scripts/          demo and check scripts (bash; run on Linux and macOS; the real-upstream compose-real.sh only on Linux so far; Git Bash on Windows not yet), the integration checker (Python)
 bench/            benchmark results and raw data
 docs/             documentation (Chinese)
 compose*.yaml     the main Compose file and overlays

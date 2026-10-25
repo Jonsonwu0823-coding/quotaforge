@@ -9,6 +9,8 @@
 # 用自己的 Compose 项目名 qf-qs-fake-check：down -v 只拆自己的项目，不碰默认项目 quotaforge。
 # qfctl 的 stderr 写进临时目录，脚本失败时打印出来（Key 在 stdout，不在 stderr）。
 set -euo pipefail
+# Windows 上 winget 装的 jq.exe 输出 CRLF：去掉 \r 再用。开着 pipefail，jq 的退出码照样传出来。
+jq() { command jq "$@" | tr -d '\r'; }
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME=qf-qs-fake-check # 优先于 compose.yaml 里的 name
 
